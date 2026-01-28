@@ -44,7 +44,7 @@
 //!     let server_config = ServerConfig::load()?;
 //!     let (certs, key) = server_config.load_certificates()?;
 //!     let data_dir = server_config.data_dir().ok().map(|p| p.to_string_lossy().to_string());
-//!     let config = Config { bind: server_config.bind, certs, key, data_dir };
+//!     let config = Config { bind: server_config.bind, certs, key, data_dir, relay: None };
 //!     let server = Server::new(config)?;
 //!     server.run().await
 //! }
@@ -63,4 +63,4 @@ pub use config::{ServerConfig, generate_self_signed_cert, load_pem_certificates}
 pub use persistence::{PersistedRoom, Persistence, RegisteredUser};
 pub use relay::{RelayConfig, RelayService, RelayTokenManager};
 pub use server::{Config, Server};
-pub use state::{ClientHandle, ServerState, StateData};
+pub use state::{ClientHandle, PeerCapabilitiesEntry, ServerState, StateData};

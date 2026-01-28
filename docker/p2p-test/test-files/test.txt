@@ -1,0 +1,2 @@
+Hello from P2P file transfer test!
+This file tests the rumble P2P protocol.

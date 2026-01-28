@@ -60,7 +60,8 @@ and address the **first** error shown (later errors are often cascading).
 - **backend**: Client library - QUIC connection, audio I/O (cpal), Opus codec, jitter buffers
 - **server**: Server binary - room management, user auth, message relay, persistence (sled)
 - **pipeline**: Pluggable audio processor framework (denoise, VAD, gain control)
-- **egui-test**: GUI client using egui with tree view for room hierarchy
+- **egui-test**: GUI client using egui with tree view for room hierarchy; also exports `TestHarness` for programmatic UI control
+- **harness-cli**: Daemon-based CLI for automated GUI testing with screenshots and input injection
 
 ## Key Architecture Patterns
 
@@ -101,6 +102,143 @@ Located in `vendor/`:
 - `rqbit` - BitTorrent client (for file sharing feature)
 - `torrust-tracker` - BitTorrent tracker
 
+## GUI Test Harness (for agents and automated testing)
+
+The `egui-test` crate is structured as both a library and binary, enabling programmatic control of the GUI for agents and integration tests.
+
+### Architecture
+
+```
+crates/egui-test/src/
+├── lib.rs           # Library exports: RumbleApp, TestHarness, Args
+├── main.rs          # Thin eframe wrapper (human-facing app)
+├── app.rs           # RumbleApp - core application logic
+├── settings.rs      # Persistent settings types
+├── key_manager.rs   # Ed25519 key management
+└── harness.rs       # TestHarness for programmatic control
+```
+
+The key separation: `RumbleApp` contains all UI logic and is independent of eframe. The desktop app wraps it in an eframe runner, while tests/agents use `TestHarness` directly.
+
+### Using TestHarness
+
+```rust
+use egui_test::{TestHarness, Args};
+
+// Create harness with default settings
+let mut harness = TestHarness::new();
+
+// Or with custom args
+let args = Args {
+    server: Some("127.0.0.1:5000".to_string()),
+    name: Some("test-bot".to_string()),
+    ..Default::default()
+};
+let mut harness = TestHarness::with_args(args);
+
+// Run frames to advance the UI
+harness.run_frame();       // Single frame
+harness.run_frames(10);    // Multiple frames
+
+// Inject input events
+harness.key_press(egui::Key::Space);   // Push-to-talk
+harness.key_release(egui::Key::Space);
+harness.click(egui::pos2(100.0, 200.0));
+harness.type_text("Hello, world!");
+
+// Introspect state
+let connected = harness.is_connected();
+let app = harness.app();  // Access RumbleApp directly
+let backend_state = app.backend().state();  // Full backend state
+```
+
+### RumbleApp API
+
+The core application exposes:
+
+```rust
+impl RumbleApp {
+    /// Create with egui context, tokio handle, and CLI args
+    pub fn new(ctx: egui::Context, runtime_handle: Handle, args: Args) -> Self;
+
+    /// Render one frame (called by runner each frame)
+    pub fn render(&mut self, ctx: &egui::Context);
+
+    /// Access the backend handle for state/commands
+    pub fn backend(&self) -> &BackendHandle;
+
+    /// Check connection status
+    pub fn is_connected(&self) -> bool;
+}
+```
+
+### Writing Agent Tests
+
+```rust
+#[test]
+fn test_agent_can_connect() {
+    let mut harness = TestHarness::with_args(Args {
+        server: Some("127.0.0.1:5000".to_string()),
+        name: Some("agent".to_string()),
+        trust_dev_cert: true,
+        ..Default::default()
+    });
+
+    // Run frames to let connection establish
+    harness.run_frames(100);
+
+    // Check connection state
+    assert!(harness.is_connected());
+
+    // Interact with rooms, chat, etc. via backend
+    let state = harness.app().backend().state();
+    assert!(!state.rooms.is_empty());
+}
+```
+
+## Harness CLI (for agent iteration loops)
+
+The `harness-cli` crate provides a daemon-based CLI for automated GUI testing. Agents can use it to iteratively develop UI changes with screenshot feedback.
+
+### Quick Start
+
+```bash
+# Start daemon
+cargo run -p harness-cli -- daemon start --background
+
+# Start server and create client
+cargo run -p harness-cli -- server start
+cargo run -p harness-cli -- client new --name agent --server 127.0.0.1:5000
+
+# Take screenshot
+cargo run -p harness-cli -- client frames 1 20
+cargo run -p harness-cli -- client screenshot 1 --output ui.png
+
+# Interact
+cargo run -p harness-cli -- client click 1 100 200
+cargo run -p harness-cli -- client type 1 "Hello"
+cargo run -p harness-cli -- client key-tap 1 enter
+
+# Get state
+cargo run -p harness-cli -- client state 1
+cargo run -p harness-cli -- client connected 1
+
+# Cleanup
+cargo run -p harness-cli -- daemon stop
+```
+
+### Agent Iteration Workflow
+
+```bash
+# After making code changes:
+rumble-harness client close 1
+cargo build -p egui-test
+rumble-harness client new --name agent --server 127.0.0.1:5000
+rumble-harness client screenshot 1 --output ui-v2.png
+```
+
+See [crates/harness-cli/README.md](crates/harness-cli/README.md) for full documentation.
+
 ## Audio: Opus decoder lifetime (important)
 
 Each remote peer must have a **long-lived Opus decoder instance** that persists across talk spurts.
@@ -108,3 +246,79 @@ It should only be dropped when the peer leaves the room/session (or after a very
 Re-initializing decoders per received packet/talkspurt will cause:
 - `backend::codec: codec: decoder initialized` spam
 - audible crackle/pop at start of speech (decoder state reset)
+
+## P2P NAT Traversal Testing
+
+Docker-based test environment for P2P connectivity with NAT simulation using libp2p.
+
+### Location
+
+```
+docker/p2p-test/
+├── src/
+│   ├── test_node.rs    # Test node with DCUtR hole punching
+│   └── relay_server.rs # Relay server for NAT traversal
+├── run-test.sh         # Test runner script
+├── docker-compose.yml  # Full NAT simulation environment
+└── docker-compose.simple.yml  # Simple direct/relay tests
+```
+
+### Running Tests
+
+```bash
+cd docker/p2p-test
+
+# Build Docker images
+./run-test.sh build
+
+# Run specific tests
+./run-test.sh direct      # Direct connection (no NAT)
+./run-test.sh relay       # Connection via relay circuit
+./run-test.sh holepunch   # NAT hole punching with DCUtR
+
+# Run all tests
+./run-test.sh all
+
+# Clean up containers
+./run-test.sh cleanup
+
+# Interactive mode (start relay, get instructions)
+./run-test.sh interactive
+```
+
+### Network Topology (holepunch test)
+
+```
+                    ┌─────────────────┐
+                    │     Relay       │
+                    │   10.99.0.10    │
+                    └────────┬────────┘
+                             │ public-net (10.99.0.0/24)
+            ┌────────────────┴────────────────┐
+            │                                 │
+     ┌──────┴──────┐                   ┌──────┴──────┐
+     │   NAT-A     │                   │   NAT-B     │
+     │ 10.99.0.20  │                   │ 10.99.0.30  │
+     │ 10.99.1.2   │                   │ 10.99.2.2   │
+     └──────┬──────┘                   └──────┴──────┘
+            │ private-a (10.99.1.0/24)        │ private-b (10.99.2.0/24)
+            │                                 │
+     ┌──────┴──────┐                   ┌──────┴──────┐
+     │   Node-A    │                   │   Node-B    │
+     │ 10.99.1.10  │                   │ 10.99.2.10  │
+     │ (sharer)    │                   │ (fetcher)   │
+     └─────────────┘                   └─────────────┘
+```
+
+### What the Tests Do
+
+1. **direct**: Node-A shares a file, Node-B connects directly (no NAT)
+2. **relay**: Node-A listens via relay circuit, Node-B fetches through relay
+3. **holepunch**: Both nodes behind NAT, DCUtR attempts hole punch, falls back to relay
+
+### Expected Behavior
+
+- With symmetric NAT (iptables MASQUERADE), hole punching will fail with "Connection refused"
+- This is expected - symmetric NAT creates destination-specific port mappings
+- The test succeeds via relay fallback: `FILE RECEIVED` with `HOLEPUNCH_FAILED`
+- Successful hole punch shows: `HOLEPUNCH_SUCCESS` (requires endpoint-independent NAT)

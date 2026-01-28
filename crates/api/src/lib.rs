@@ -160,6 +160,37 @@ pub fn compute_cert_hash(cert_der: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Compute a session identifier from an ephemeral session public key.
+/// Uses BLAKE3 over the raw 32-byte key to produce a stable 32-byte ID.
+pub fn compute_session_id(session_public_key: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(session_public_key);
+    hasher.finalize().into()
+}
+
+/// Build the payload that the user's long-term key signs to issue a session certificate.
+/// Layout (variable length due to optional device string):
+/// - session_public_key: 32 bytes
+/// - issued_ms: 8 bytes (big-endian)
+/// - expires_ms: 8 bytes (big-endian)
+/// - device length (u16 big-endian) + UTF-8 bytes (may be zero length)
+pub fn build_session_cert_payload(
+    session_public_key: &[u8; 32],
+    issued_ms: i64,
+    expires_ms: i64,
+    device: Option<&str>,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32 + 8 + 8 + 2 + device.map(|d| d.len()).unwrap_or(0));
+    buf.extend_from_slice(session_public_key);
+    buf.extend_from_slice(&issued_ms.to_be_bytes());
+    buf.extend_from_slice(&expires_ms.to_be_bytes());
+    let device_bytes = device.unwrap_or("").as_bytes();
+    let len: u16 = device_bytes.len() as u16;
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(device_bytes);
+    buf
+}
+
 // =============================================================================
 // File Message Types
 // =============================================================================
@@ -472,9 +503,8 @@ mod auth_tests {
     #[test]
     fn test_signature_verification() {
         use ed25519_dalek::{Signer, SigningKey, Verifier};
-        use rand::rngs::OsRng;
 
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::from_bytes(&rand::random());
         let public_key = signing_key.verifying_key();
 
         let payload = build_auth_payload(&[0u8; 32], 1234567890123, &public_key.to_bytes(), 42, &[0u8; 32]);

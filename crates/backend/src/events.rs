@@ -12,6 +12,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+use urlencoding::encode;
 use uuid::Uuid;
 
 // =============================================================================
@@ -680,6 +681,155 @@ impl FileMessage {
 }
 
 // =============================================================================
+// P2P File Message (libp2p transfer)
+// =============================================================================
+
+/// A P2P file share message embedded in chat.
+/// Carries peer id and multiaddrs so clients can dial directly.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct P2pFileMessage {
+    /// Message type marker (always "p2p_file").
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// File information.
+    pub file: P2pFileInfo,
+}
+
+/// File info + peer routing hints for libp2p transfers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct P2pFileInfo {
+    pub name: String,
+    pub size: u64,
+    /// Hex-encoded 32-byte file id (BLAKE3 in current implementation).
+    pub file_id: String,
+    /// Base58 libp2p PeerId of the seeding peer.
+    pub peer_id: String,
+    /// Multiaddr strings (already include /p2p/<peer> component when applicable).
+    pub addrs: Vec<String>,
+}
+
+impl P2pFileMessage {
+    pub const SCHEMA: &'static str = "https://rumble.example/schemas/p2p-file-message-v1.json";
+
+    pub fn new(name: String, size: u64, file_id: String, peer_id: String, addrs: Vec<String>) -> Self {
+        Self {
+            msg_type: "p2p_file".to_string(),
+            file: P2pFileInfo {
+                name,
+                size,
+                file_id,
+                peer_id,
+                addrs,
+            },
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let obj = value.as_object()?;
+
+        if obj.get("type")?.as_str()? != "p2p_file" {
+            return None;
+        }
+
+        let file_obj = obj.get("file")?.as_object()?;
+        let required_fields = ["name", "size", "file_id", "peer_id", "addrs"];
+        for field in &required_fields {
+            if !file_obj.contains_key(*field) {
+                return None;
+            }
+        }
+
+        for key in file_obj.keys() {
+            if !required_fields.contains(&key.as_str()) {
+                return None;
+            }
+        }
+
+        for key in obj.keys() {
+            if !["type", "file", "$schema"].contains(&key.as_str()) {
+                return None;
+            }
+        }
+
+        serde_json::from_value(value).ok()
+    }
+
+    pub fn magnet_link(&self) -> String {
+        let mut uri = format!("rumblep2p://{}/{}", self.file.peer_id, self.file.file_id);
+        if !self.file.addrs.is_empty() {
+            let query = self
+                .file
+                .addrs
+                .iter()
+                .map(|addr| format!("ma={}", encode(addr)))
+                .collect::<Vec<_>>()
+                .join("&");
+            uri.push('?');
+            uri.push_str(&query);
+        }
+        uri
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+// =============================================================================
+// Auto-Download Settings
+// =============================================================================
+
+/// A single auto-download rule with a MIME pattern and max file size.
+#[derive(Debug, Clone)]
+pub struct AutoDownloadRule {
+    /// MIME type pattern (e.g., "image/*", "audio/*", "application/pdf").
+    pub mime_pattern: String,
+    /// Maximum file size in bytes. 0 = disabled for this pattern.
+    pub max_size_bytes: u64,
+}
+
+impl AutoDownloadRule {
+    /// Check if a given MIME type matches this rule's pattern.
+    ///
+    /// Supports wildcard patterns like "image/*" and exact matches like "application/pdf".
+    pub fn matches_mime(&self, mime: &str) -> bool {
+        if self.mime_pattern.ends_with("/*") {
+            // Wildcard pattern: "image/*" matches "image/jpeg", "image/png", etc.
+            let prefix = &self.mime_pattern[..self.mime_pattern.len() - 1]; // "image/"
+            mime.starts_with(prefix)
+        } else {
+            // Exact match
+            self.mime_pattern == mime
+        }
+    }
+
+    /// Check if a file matches this rule (MIME and size).
+    pub fn matches(&self, mime: &str, size: u64) -> bool {
+        self.max_size_bytes > 0 && size <= self.max_size_bytes && self.matches_mime(mime)
+    }
+}
+
+/// File transfer settings including auto-download configuration.
+#[derive(Debug, Clone, Default)]
+pub struct FileTransferSettings {
+    /// Auto-download files matching the rules below.
+    pub auto_download_enabled: bool,
+    /// Auto-download rules, each with a MIME pattern and size limit.
+    pub auto_download_rules: Vec<AutoDownloadRule>,
+}
+
+impl FileTransferSettings {
+    /// Check if a file should be auto-downloaded based on the current settings.
+    pub fn should_auto_download(&self, mime: &str, size: u64) -> bool {
+        if !self.auto_download_enabled {
+            return false;
+        }
+        self.auto_download_rules.iter().any(|rule| rule.matches(mime, size))
+    }
+}
+
+// =============================================================================
 // File Transfer State
 // =============================================================================
 
@@ -718,6 +868,71 @@ impl TransferState {
     }
 }
 
+/// Connection type for a transfer peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PeerConnectionType {
+    /// Direct TCP connection to peer.
+    #[default]
+    Direct,
+    /// Connection through server relay (for NAT'd peers).
+    Relay,
+    /// uTP (micro Transport Protocol) connection.
+    Utp,
+    /// Connection through SOCKS proxy.
+    Socks,
+}
+
+impl std::fmt::Display for PeerConnectionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerConnectionType::Direct => write!(f, "Direct"),
+            PeerConnectionType::Relay => write!(f, "Relay"),
+            PeerConnectionType::Utp => write!(f, "uTP"),
+            PeerConnectionType::Socks => write!(f, "SOCKS"),
+        }
+    }
+}
+
+/// State of a peer connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PeerState {
+    /// Connecting to peer.
+    #[default]
+    Connecting,
+    /// Connected and transferring.
+    Live,
+    /// Queued for connection.
+    Queued,
+    /// Connection failed or closed.
+    Dead,
+}
+
+impl std::fmt::Display for PeerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerState::Connecting => write!(f, "Connecting"),
+            PeerState::Live => write!(f, "Live"),
+            PeerState::Queued => write!(f, "Queued"),
+            PeerState::Dead => write!(f, "Dead"),
+        }
+    }
+}
+
+/// Information about a connected peer in a file transfer.
+#[derive(Debug, Clone, Default)]
+pub struct TransferPeerInfo {
+    /// Socket address of the peer (IP:port).
+    pub address: String,
+    /// Connection type (direct, relay, uTP, etc.).
+    pub connection_type: PeerConnectionType,
+    /// Current peer state.
+    pub state: PeerState,
+    /// Bytes downloaded from this peer.
+    pub downloaded_bytes: u64,
+    /// Bytes uploaded to this peer.
+    pub uploaded_bytes: u64,
+}
+
 /// Information about a file transfer.
 #[derive(Debug, Clone)]
 pub struct FileTransferState {
@@ -747,6 +962,29 @@ pub struct FileTransferState {
     pub magnet: Option<String>,
     /// Local file path (if available).
     pub local_path: Option<std::path::PathBuf>,
+    /// Detailed information about connected peers.
+    pub peer_details: Vec<TransferPeerInfo>,
+}
+
+// =============================================================================
+// P2P Peer Information
+// =============================================================================
+
+/// Information about a P2P peer announced by the server.
+#[derive(Debug, Clone, Default)]
+pub struct PeerInfo {
+    /// The user ID this peer corresponds to.
+    pub user_id: u64,
+    /// Session ID (32-byte hash of session public key).
+    pub session_id: [u8; 32],
+    /// libp2p PeerId as bytes.
+    pub libp2p_peer_id: Vec<u8>,
+    /// Multiaddrs where this peer can be reached.
+    pub multiaddrs: Vec<String>,
+    /// Whether the peer supports relay mode.
+    pub supports_relay: bool,
+    /// Whether the peer supports P2P voice.
+    pub supports_p2p_voice: bool,
 }
 
 // =============================================================================
@@ -772,6 +1010,14 @@ pub struct State {
     pub my_user_id: Option<u64>,
     /// Our current room ID (if in a room).
     pub my_room_id: Option<Uuid>,
+    /// Ephemeral session public key for this connection (P2P identity).
+    pub my_session_public_key: Option<[u8; 32]>,
+    /// Stable session identifier derived from the session public key.
+    pub my_session_id: Option<[u8; 32]>,
+
+    // P2P state
+    /// Known P2P peers (keyed by user_id).
+    pub p2p_peers: HashMap<u64, PeerInfo>,
 
     // Audio
     /// Audio subsystem state.
@@ -783,6 +1029,8 @@ pub struct State {
 
     // File Transfers
     pub file_transfers: Vec<FileTransferState>,
+    /// File transfer settings (auto-download rules, etc.).
+    pub file_transfer_settings: FileTransferSettings,
 
     // Room tree (derived from rooms)
     /// Hierarchical tree structure of rooms, rebuilt when rooms change.
@@ -1000,6 +1248,10 @@ pub enum Command {
     OpenFile {
         infohash: String,
     },
+    /// Update file transfer settings (auto-download rules, etc.).
+    UpdateFileTransferSettings {
+        settings: FileTransferSettings,
+    },
 }
 
 // Implement Debug manually since SigningCallback doesn't implement Debug
@@ -1097,6 +1349,11 @@ impl std::fmt::Debug for Command {
                 .field("destination", destination)
                 .finish(),
             Command::OpenFile { infohash } => f.debug_struct("OpenFile").field("infohash", infohash).finish(),
+            Command::UpdateFileTransferSettings { settings } => f
+                .debug_struct("UpdateFileTransferSettings")
+                .field("auto_download_enabled", &settings.auto_download_enabled)
+                .field("rules_count", &settings.auto_download_rules.len())
+                .finish(),
         }
     }
 }
@@ -1118,6 +1375,8 @@ mod tests {
             },
             my_user_id: Some(1),
             my_room_id: Some(room1_uuid),
+            my_session_public_key: None,
+            my_session_id: None,
             rooms: vec![
                 RoomInfo {
                     id: Some(room_id_from_uuid(room1_uuid)),
@@ -1157,6 +1416,7 @@ mod tests {
             chat_messages: vec![],
             file_transfers: vec![],
             room_tree: RoomTree::default(),
+            p2p_peers: HashMap::new(),
         };
 
         let users_in_room1 = state.users_in_room(room1_uuid);
@@ -1254,5 +1514,28 @@ mod tests {
         assert!(tree.is_ancestor(root_uuid, grandchild_uuid));
         assert!(tree.is_ancestor(child1_uuid, grandchild_uuid));
         assert!(!tree.is_ancestor(child2_uuid, grandchild_uuid));
+
+        #[test]
+        fn p2p_file_message_roundtrip() {
+            let msg = P2pFileMessage::new(
+                "clip.wav".to_string(),
+                1234,
+                "abcd".to_string(),
+                "12D3KooWTestPeer".to_string(),
+                vec!["/ip4/1.2.3.4/tcp/1234/p2p/12D3KooWTestPeer".to_string()],
+            );
+
+            let json = msg.to_json();
+            let parsed = P2pFileMessage::parse(&json).expect("parse");
+            assert_eq!(parsed.file.name, "clip.wav");
+            assert_eq!(parsed.file.size, 1234);
+            assert_eq!(parsed.file.file_id, "abcd");
+            assert_eq!(parsed.file.peer_id, "12D3KooWTestPeer");
+            assert_eq!(parsed.file.addrs.len(), 1);
+
+            let magnet = parsed.magnet_link();
+            assert!(magnet.starts_with("rumblep2p://12D3KooWTestPeer/abcd"));
+            assert!(magnet.contains("ma=%2Fip4%2F1.2.3.4%2Ftcp%2F1234%2Fp2p%2F12D3KooWTestPeer"));
+        }
     }
 }

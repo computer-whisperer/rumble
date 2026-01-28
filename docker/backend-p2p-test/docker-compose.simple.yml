@@ -1,0 +1,89 @@
+# Backend P2P Integration Test Environment (Simple Mode)
+#
+# Uses a single bridge network with the actual Rumble server and test nodes.
+# Tests file transfer via BitTorrent with NAT relay through the server.
+
+services:
+  # ============================================
+  # RUMBLE SERVER
+  # ============================================
+  server:
+    build:
+      context: ../..
+      dockerfile: docker/backend-p2p-test/Dockerfile
+    command: >
+      sh -c "
+        mkdir -p /app/certs /app/data &&
+        rumble-server --bind '[::]:5000' --cert-dir /app/certs --data-dir /app/data --domain localhost
+      "
+    container_name: backend-test-server
+    environment:
+      - RUST_LOG=info,server=debug
+      - RUMBLE_NO_CONFIG=1
+    networks:
+      test-network:
+        ipv4_address: 172.30.0.10
+    ports:
+      - "5000:5000"
+    volumes:
+      - server-certs:/app/certs
+      - server-data:/app/data
+
+  # ============================================
+  # NODE A (file sharer)
+  # ============================================
+  node-a:
+    build:
+      context: ../..
+      dockerfile: docker/backend-p2p-test/Dockerfile
+    container_name: backend-test-node-a
+    depends_on:
+      - server
+    environment:
+      - RUST_LOG=info,backend=debug
+    networks:
+      test-network:
+        ipv4_address: 172.30.0.20
+    volumes:
+      - ./test-files:/data/files
+      - node-a-downloads:/data/downloads
+      - server-certs:/certs:ro
+    stdin_open: true
+    tty: true
+    command: test-node --name node-a --server 172.30.0.10:5000 --cert /certs/fullchain.pem --download-dir /data/downloads wait --duration 0
+
+  # ============================================
+  # NODE B (file downloader)
+  # ============================================
+  node-b:
+    build:
+      context: ../..
+      dockerfile: docker/backend-p2p-test/Dockerfile
+    container_name: backend-test-node-b
+    depends_on:
+      - server
+    environment:
+      - RUST_LOG=info,backend=debug
+    networks:
+      test-network:
+        ipv4_address: 172.30.0.30
+    volumes:
+      - node-b-downloads:/data/downloads
+      - server-certs:/certs:ro
+    stdin_open: true
+    tty: true
+    command: test-node --name node-b --server 172.30.0.10:5000 --cert /certs/fullchain.pem --download-dir /data/downloads wait --duration 0
+
+networks:
+  test-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
+
+volumes:
+  server-certs:
+  server-data:
+  node-a-downloads:
+  node-b-downloads:

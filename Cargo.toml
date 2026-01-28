@@ -3,3 +3,12 @@ resolver = "3"
 members = [
     "crates/*"
 ]
+exclude = [
+    "docker/p2p-test",
+    "docker/backend-p2p-test",
+]
+
+[workspace.dependencies]
+ed25519-dalek = { version = "3.0.0-pre.4", features = ["rand_core"] }
+rand = "0.10.0-rc.3"
+rand_core = "0.10.0-rc.3"

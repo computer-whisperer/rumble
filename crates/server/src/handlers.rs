@@ -12,11 +12,14 @@
 
 use crate::{
     persistence::Persistence,
-    state::{ClientHandle, PendingAuth, ServerState, UserStatus, compute_server_state_hash},
+    state::{
+        ClientHandle, PeerCapabilitiesEntry, PendingAuth, ServerState, SessionEntry, UserStatus,
+        compute_server_state_hash,
+    },
 };
 use anyhow::Result;
 use api::{
-    ROOT_ROOM_UUID, build_auth_payload, encode_frame,
+    ROOT_ROOM_UUID, build_auth_payload, build_session_cert_payload, compute_session_id, encode_frame,
     proto::{self, ServerState as ProtoServerState, VoiceDatagram, envelope::Payload},
     room_id_from_uuid, uuid_from_room_id,
 };
@@ -132,9 +135,26 @@ pub async fn handle_envelope(
             }
             handle_tracker_scrape(ts, sender, state).await?;
         }
+        Some(Payload::PeerCapabilities(pc)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_peer_capabilities(pc, sender, state).await?;
+        }
+        Some(Payload::P2pVoiceStatus(vs)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_p2p_voice_status(vs, sender, state).await?;
+        }
         // Server-to-client messages or empty - ignore
         Some(
-            Payload::ServerHello(_) | Payload::ServerEvent(_) | Payload::AuthFailed(_) | Payload::CommandResult(_),
+            Payload::ServerHello(_)
+            | Payload::ServerEvent(_)
+            | Payload::AuthFailed(_)
+            | Payload::CommandResult(_)
+            | Payload::PeerAnnounce(_)
+            | Payload::RelayAllocation(_),
         )
         | None => {}
         _ => {
@@ -168,6 +188,17 @@ async fn handle_tracker_announce(
 
     let event = proto::tracker_announce::Event::try_from(msg.event).ok();
 
+    // Generate relay token BEFORE announce if client needs relay
+    let relay_port = state.relay_port();
+    let relay_token = if msg.needs_relay && relay_port > 0 {
+        Some(state.relay_tokens.generate_token(user_id))
+    } else {
+        if msg.needs_relay && relay_port == 0 {
+            debug!("Client requested relay but relay service is not enabled");
+        }
+        None
+    };
+
     let (complete, incomplete, peers) = state
         .tracker
         .announce(
@@ -181,22 +212,27 @@ async fn handle_tracker_announce(
             msg.left,
             event,
             msg.needs_relay,
+            relay_token,
         )
         .await;
 
-    // Generate relay info if client requested relay mode and relay is enabled
-    let relay = if msg.needs_relay {
-        let relay_port = state.relay_port();
-        if relay_port > 0 {
-            let token = state.relay_tokens.generate_token(user_id);
-            Some(proto::RelayInfo {
-                relay_token: hex::encode(token),
-                relay_port: relay_port as u32,
-            })
+    // Check if any peers need relay - if so, client needs to know the relay port
+    let has_relay_peers = peers.iter().any(|p| p.needs_relay && p.relay_token.is_some());
+
+    // Include relay info if:
+    // 1. Client requested relay mode (they need their own token)
+    // 2. OR there are relay peers (client needs to know relay port to reach them)
+    let relay = if relay_port > 0 && (msg.needs_relay || has_relay_peers) {
+        let token = if msg.needs_relay {
+            relay_token.map(|t| hex::encode(t)).unwrap_or_default()
         } else {
-            debug!("Client requested relay but relay service is not enabled");
-            None
-        }
+            // Client doesn't need a token for themselves, but we still tell them the port
+            String::new()
+        };
+        Some(proto::RelayInfo {
+            relay_token: token,
+            relay_port: relay_port as u32,
+        })
     } else {
         None
     };
@@ -214,6 +250,7 @@ async fn handle_tracker_announce(
                 ip: p.ip.to_string(),
                 port: p.port as u32,
                 supports_relay: p.needs_relay,
+                relay_token: p.relay_token.map(|t| hex::encode(t)),
             })
             .collect(),
         request_id: msg.request_id,
@@ -404,7 +441,55 @@ async fn handle_authenticate(
         return send_auth_failed(&sender, "Invalid signature").await;
     }
 
-    // 5. Authentication successful
+    // 5. Verify and record session certificate
+    let Some(cert) = auth.session_cert else {
+        return send_auth_failed(&sender, "Missing session certificate").await;
+    };
+
+    if cert.session_public_key.len() != 32 {
+        return send_auth_failed(&sender, "Invalid session public key length").await;
+    }
+    let session_public_key: [u8; 32] = match cert.session_public_key.as_slice().try_into() {
+        Ok(k) => k,
+        Err(_) => return send_auth_failed(&sender, "Invalid session public key").await,
+    };
+
+    // Basic time validity check
+    if cert.expires_ms <= cert.issued_ms {
+        return send_auth_failed(&sender, "Session certificate expiry invalid").await;
+    }
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    if cert.expires_ms < now_ms {
+        return send_auth_failed(&sender, "Session certificate expired").await;
+    }
+
+    // Verify certificate signature with the user's long-term key
+    let cert_payload = build_session_cert_payload(
+        &session_public_key,
+        cert.issued_ms,
+        cert.expires_ms,
+        cert.device.as_deref(),
+    );
+    let cert_sig: [u8; 64] = match cert.user_signature.as_slice().try_into() {
+        Ok(s) => s,
+        Err(_) => return send_auth_failed(&sender, "Invalid session certificate signature length").await,
+    };
+    let cert_sig = Signature::from_bytes(&cert_sig);
+    if verifying_key.verify_strict(&cert_payload, &cert_sig).is_err() {
+        return send_auth_failed(&sender, "Invalid session certificate signature").await;
+    }
+
+    let session_id = compute_session_id(&session_public_key);
+    let session_entry = SessionEntry {
+        user_public_key: pending.public_key,
+        session_public_key,
+        session_id,
+        issued_ms: cert.issued_ms,
+        expires_ms: cert.expires_ms,
+        device: cert.device.clone(),
+    };
+
+    // 6. Authentication successful
     sender.authenticated.store(true, Ordering::SeqCst);
 
     // 6. Mark key as known (if persistence enabled)
@@ -429,8 +514,8 @@ async fn handle_authenticate(
     sender.set_username(final_username.clone()).await;
     info!(user_id = sender.user_id, username = %final_username, "Authentication successful");
 
-    // 9. Track session
-    state.add_session(sender.user_id, pending.public_key);
+    // 9. Track session (user + session keys)
+    state.add_session(sender.user_id, session_entry);
 
     // 10. Determine initial room (restore last room if registered, otherwise Root)
     let initial_room = if let Some(ref persist) = persistence {
@@ -518,7 +603,7 @@ async fn handle_register_user(
     let target_user_id = req.user_id.map(|u| u.value).unwrap_or(0);
 
     // Get the target user's public key from active sessions
-    let target_key = match state.get_session_key(target_user_id) {
+    let target_key = match state.get_user_public_key(target_user_id) {
         Some(key) => key,
         None => {
             return send_command_result(&sender, "RegisterUser", false, "User not found").await;
@@ -573,7 +658,7 @@ async fn handle_unregister_user(
     let target_user_id = req.user_id.map(|u| u.value).unwrap_or(0);
 
     // Get the target user's public key
-    let target_key = match state.get_session_key(target_user_id) {
+    let target_key = match state.get_user_public_key(target_user_id) {
         Some(key) => key,
         None => {
             return send_command_result(&sender, "UnregisterUser", false, "User not found").await;
@@ -701,7 +786,7 @@ async fn handle_join_room(
 
     // Save last room for registered users
     if let Some(ref persist) = persistence {
-        if let Some(public_key) = state.get_session_key(sender.user_id) {
+        if let Some(public_key) = state.get_user_public_key(sender.user_id) {
             if persist.is_registered(&public_key) {
                 if let Err(e) = persist.update_user_last_room(&public_key, Some(new_room_uuid.into_bytes())) {
                     warn!("Failed to save user's last room: {e}");
@@ -1143,11 +1228,16 @@ pub async fn broadcast_state_update(state: &Arc<ServerState>, update: proto::sta
 pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<ServerState>) {
     let user_id = client_handle.user_id;
 
+    // Broadcast peer removal before removing session data
+    if client_handle.authenticated.load(Ordering::SeqCst) {
+        broadcast_peer_removal(user_id, state).await;
+    }
+
     // Remove client from DashMap (lock-free)
     state.remove_client_by_handle(client_handle);
     // Remove membership
     state.remove_user_membership(user_id).await;
-    // Remove session
+    // Remove session (also removes peer_capabilities)
     state.remove_session(user_id);
 
     debug!(user_id, "server: cleaned up client");
@@ -1254,6 +1344,176 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                 debug!(error = ?e, "server: datagram receive ended");
                 break;
             }
+        }
+    }
+}
+
+// =============================================================================
+// P2P Control Plane Handlers
+// =============================================================================
+
+/// Handle PeerCapabilities message from a client.
+/// This stores the client's P2P capabilities and broadcasts their info to other peers.
+async fn handle_peer_capabilities(
+    msg: proto::PeerCapabilities,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    let user_id = sender.user_id;
+
+    info!(
+        user_id,
+        supports_file_transfer = msg.supports_file_transfer,
+        supports_p2p_voice = msg.supports_p2p_voice,
+        prefer_relay = msg.prefer_relay,
+        multiaddrs_count = msg.multiaddrs.len(),
+        "Received PeerCapabilities"
+    );
+
+    // Store the capabilities
+    let capabilities = PeerCapabilitiesEntry {
+        supports_file_transfer: msg.supports_file_transfer,
+        supports_p2p_voice: msg.supports_p2p_voice,
+        prefer_relay: msg.prefer_relay,
+        libp2p_peer_id: msg.libp2p_peer_id.clone(),
+        multiaddrs: msg.multiaddrs.clone(),
+        bandwidth_tier: msg.bandwidth_tier,
+    };
+    state.set_peer_capabilities(user_id, capabilities);
+
+    // Get the session entry to build the PeerAnnounce
+    let Some(session) = state.get_session(user_id) else {
+        warn!(user_id, "No session found for user when handling PeerCapabilities");
+        return Ok(());
+    };
+
+    // Broadcast PeerAnnounce to all other connected clients
+    let announce = proto::PeerAnnounce {
+        user_id: Some(proto::UserId { value: user_id }),
+        session_id: session.session_id.to_vec(),
+        libp2p_peer_id: msg.libp2p_peer_id,
+        multiaddrs: msg.multiaddrs,
+        supports_relay: msg.prefer_relay, // If they prefer relay, they support it
+        supports_p2p_voice: msg.supports_p2p_voice,
+        is_removal: false,
+    };
+
+    let envelope = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::PeerAnnounce(announce)),
+    };
+    let frame = encode_frame(&envelope);
+
+    // Broadcast to all other clients
+    broadcast_to_others(&state, user_id, &frame).await;
+
+    // Also send existing peers to the new client
+    send_existing_peers_to_client(&sender, &state).await;
+
+    Ok(())
+}
+
+/// Handle P2PVoiceStatus message from a client.
+/// This tracks which peers a client has active P2P voice connections to.
+async fn handle_p2p_voice_status(
+    msg: proto::P2pVoiceStatus,
+    sender: Arc<ClientHandle>,
+    _state: Arc<ServerState>,
+) -> Result<()> {
+    let user_id = sender.user_id;
+
+    debug!(
+        user_id,
+        p2p_mode_active = msg.p2p_mode_active,
+        connected_sessions_count = msg.connected_sessions.len(),
+        "Received P2PVoiceStatus"
+    );
+
+    // For now, just log this. In the future, we can use this to:
+    // - Track which clients are using P2P vs relay for voice
+    // - Adjust topology hints
+    // - Route relay traffic only when needed
+
+    // TODO: Store P2P voice status for topology decisions
+
+    Ok(())
+}
+
+/// Send PeerAnnounce for all existing peers to a newly connected client.
+async fn send_existing_peers_to_client(client: &Arc<ClientHandle>, state: &Arc<ServerState>) {
+    let peers = state.get_all_peer_capabilities();
+
+    for (peer_user_id, session, caps) in peers {
+        // Don't announce the client to themselves
+        if peer_user_id == client.user_id {
+            continue;
+        }
+
+        let announce = proto::PeerAnnounce {
+            user_id: Some(proto::UserId { value: peer_user_id }),
+            session_id: session.session_id.to_vec(),
+            libp2p_peer_id: caps.libp2p_peer_id,
+            multiaddrs: caps.multiaddrs,
+            supports_relay: caps.prefer_relay,
+            supports_p2p_voice: caps.supports_p2p_voice,
+            is_removal: false,
+        };
+
+        let envelope = proto::Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::PeerAnnounce(announce)),
+        };
+        let frame = encode_frame(&envelope);
+
+        if let Err(e) = client.send_frame(&frame).await {
+            debug!(
+                user_id = client.user_id,
+                peer_user_id,
+                error = ?e,
+                "Failed to send PeerAnnounce to client"
+            );
+        }
+    }
+}
+
+/// Broadcast a removal announcement when a peer disconnects.
+pub async fn broadcast_peer_removal(user_id: u64, state: &Arc<ServerState>) {
+    // Get session info before it's removed
+    let Some(session) = state.get_session(user_id) else {
+        return;
+    };
+
+    let announce = proto::PeerAnnounce {
+        user_id: Some(proto::UserId { value: user_id }),
+        session_id: session.session_id.to_vec(),
+        libp2p_peer_id: Vec::new(),
+        multiaddrs: Vec::new(),
+        supports_relay: false,
+        supports_p2p_voice: false,
+        is_removal: true,
+    };
+
+    let envelope = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::PeerAnnounce(announce)),
+    };
+    let frame = encode_frame(&envelope);
+
+    broadcast_to_others(state, user_id, &frame).await;
+}
+
+/// Broadcast a frame to all connected clients except the sender.
+async fn broadcast_to_others(state: &Arc<ServerState>, exclude_user_id: u64, frame: &[u8]) {
+    for client in state.snapshot_clients() {
+        if client.user_id == exclude_user_id {
+            continue;
+        }
+        if let Err(e) = client.send_frame(frame).await {
+            debug!(
+                user_id = client.user_id,
+                error = ?e,
+                "Failed to broadcast frame to client"
+            );
         }
     }
 }

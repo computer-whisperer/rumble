@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -10,12 +11,12 @@ use std::{
 
 use librqbit::{
     AddTorrent, AddTorrentOptions, ListenerOptions, ManagedTorrent, ManagedTorrentState, Session, SessionOptions,
-    api::TorrentIdOrHash,
+    api::TorrentIdOrHash, spawn_utils::BlockingSpawner,
 };
 use quinn::Connection;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     sync::RwLock,
 };
 use tokio_util::sync::CancellationToken;
@@ -61,6 +62,134 @@ pub struct RelayInfo {
     pub port: u16,
     /// The relay server IP (same as QUIC connection)
     pub host: IpAddr,
+}
+
+/// Start a local TCP proxy that connects to the relay server as a dialer.
+/// Returns the local address to connect to.
+async fn start_relay_proxy(
+    relay_addr: SocketAddr,
+    relay_token: [u8; 32],
+    cancel_token: CancellationToken,
+) -> anyhow::Result<SocketAddr> {
+    // Bind to a random local port
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let local_addr = listener.local_addr()?;
+
+    info!(
+        "Started relay proxy at {} for token {}",
+        local_addr,
+        hex::encode(&relay_token[..8])
+    );
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    debug!("Relay proxy cancelled");
+                    break;
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok((local_stream, peer_addr)) => {
+                            debug!("Relay proxy accepted connection from {}", peer_addr);
+                            let relay_addr = relay_addr;
+                            let relay_token = relay_token;
+                            let cancel = cancel_token.clone();
+
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_relay_proxy_connection(
+                                    local_stream,
+                                    relay_addr,
+                                    relay_token,
+                                    cancel,
+                                ).await {
+                                    debug!("Relay proxy connection error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Relay proxy accept error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(local_addr)
+}
+
+/// Handle a single relay proxy connection
+async fn handle_relay_proxy_connection(
+    local_stream: TcpStream,
+    relay_addr: SocketAddr,
+    relay_token: [u8; 32],
+    cancel_token: CancellationToken,
+) -> anyhow::Result<()> {
+    // Connect to relay server as dialer
+    let mut relay_stream = TcpStream::connect(relay_addr).await?;
+    relay_stream.set_nodelay(true)?;
+
+    // Send dialer handshake
+    relay_stream.write_u8(RELAY_ROLE_DIALER).await?;
+    relay_stream.write_all(&relay_token).await?;
+
+    info!("Relay proxy connected to relay at {}", relay_addr);
+
+    // Bridge the streams
+    let (mut local_read, mut local_write) = local_stream.into_split();
+    let (mut relay_read, mut relay_write) = relay_stream.into_split();
+
+    let cancel1 = cancel_token.clone();
+    let cancel2 = cancel_token.clone();
+
+    let local_to_relay = async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            tokio::select! {
+                _ = cancel1.cancelled() => break,
+                result = local_read.read(&mut buf) => {
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if relay_write.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    };
+
+    let relay_to_local = async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            tokio::select! {
+                _ = cancel2.cancelled() => break,
+                result = relay_read.read(&mut buf) => {
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if local_write.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = local_to_relay => {}
+        _ = relay_to_local => {}
+    }
+
+    Ok(())
 }
 
 /// Information about a shared file, returned from share_file.
@@ -151,6 +280,14 @@ pub struct TorrentManager {
     relay_info: RwLock<Option<RelayInfo>>,
     /// Output folder for downloads.
     output_folder: PathBuf,
+    /// Tracks original file paths for shared files (infohash -> original path).
+    /// This is needed because shared files live in their original location,
+    /// not in the default output_folder.
+    /// Uses std::sync::RwLock (not tokio) since get_file_path() is synchronous.
+    shared_file_paths: std::sync::RwLock<HashMap<[u8; 20], PathBuf>>,
+    /// Tracks local addresses that are relay proxies (local proxy addr -> original peer addr).
+    /// This allows us to identify which connections are going through our relay.
+    relay_proxy_addrs: std::sync::RwLock<HashMap<SocketAddr, SocketAddr>>,
 }
 
 impl TorrentManager {
@@ -191,6 +328,8 @@ impl TorrentManager {
             needs_relay: AtomicBool::new(false),
             relay_info: RwLock::new(None),
             output_folder,
+            shared_file_paths: std::sync::RwLock::new(HashMap::new()),
+            relay_proxy_addrs: std::sync::RwLock::new(HashMap::new()),
         })
     }
 
@@ -213,6 +352,16 @@ impl TorrentManager {
         &self.session
     }
 
+    /// Check if an address is a relay proxy, returning the original peer address if so.
+    pub fn get_relay_original_addr(&self, proxy_addr: &SocketAddr) -> Option<SocketAddr> {
+        self.relay_proxy_addrs.read().unwrap().get(proxy_addr).copied()
+    }
+
+    /// Check if an address is a relay proxy (localhost connection that we proxied).
+    pub fn is_relay_proxy(&self, addr: &SocketAddr) -> bool {
+        self.relay_proxy_addrs.read().unwrap().contains_key(addr)
+    }
+
     pub async fn share_file(&self, path: PathBuf) -> anyhow::Result<SharedFileInfo> {
         // Get file metadata
         let metadata = tokio::fs::metadata(&path).await?;
@@ -230,7 +379,8 @@ impl TorrentManager {
             ..Default::default()
         };
 
-        let torrent_result = librqbit::create_torrent(&path, opts).await?;
+        let spawner = BlockingSpawner::new(4);
+        let torrent_result = librqbit::create_torrent(&path, opts, &spawner).await?;
 
         let output_folder = path
             .parent()
@@ -254,6 +404,14 @@ impl TorrentManager {
 
         let managed_torrent = handle.into_handle().ok_or(anyhow::anyhow!("Failed to get handle"))?;
         let info_hash = managed_torrent.info_hash();
+
+        // Store the original file path for this shared file
+        // This is needed because get_file_path() needs to return the original location,
+        // not the default output_folder
+        {
+            let mut shared_paths = self.shared_file_paths.write().unwrap();
+            shared_paths.insert(info_hash.0, path.clone());
+        }
 
         // Spawn announce loop
         self.spawn_announce_loop(managed_torrent.clone());
@@ -372,8 +530,8 @@ impl TorrentManager {
             }
         };
 
-        // Handle relay info if provided
-        if let Some(relay) = response.relay {
+        // Handle our own relay info if provided (for when WE need relay)
+        let relay_port = if let Some(ref relay) = response.relay {
             if let Ok(token_bytes) = hex::decode(&relay.relay_token) {
                 if token_bytes.len() == 32 {
                     let mut token = [0u8; 32];
@@ -390,18 +548,65 @@ impl TorrentManager {
                     self.connect_to_relay_as_acceptor(relay_info).await;
                 }
             }
-        }
+            Some(relay.relay_port as u16)
+        } else {
+            None
+        };
+
+        // Get relay server address for connecting to relay peers
+        let relay_addr = relay_port.map(|rp| SocketAddr::new(self.connection.remote_address().ip(), rp));
 
         let mut peers = Vec::new();
         for peer in response.peers {
             if let Ok(ip) = peer.ip.parse::<IpAddr>() {
                 let ip = normalize_peer_ip(ip);
-                let addr = SocketAddr::new(ip, peer.port as u16);
+                let direct_addr = SocketAddr::new(ip, peer.port as u16);
+
                 // Skip self
-                if addr.port() == port {
+                if direct_addr.port() == port {
                     continue;
                 }
-                peers.push(addr);
+
+                // Check if this peer needs relay
+                if peer.supports_relay {
+                    if let Some(ref token_hex) = peer.relay_token {
+                        if let Ok(token_bytes) = hex::decode(token_hex) {
+                            if token_bytes.len() == 32 {
+                                let mut token = [0u8; 32];
+                                token.copy_from_slice(&token_bytes);
+
+                                // Start a relay proxy for this peer
+                                if let Some(relay) = relay_addr {
+                                    match start_relay_proxy(relay, token, self.cancel_token.clone()).await {
+                                        Ok(proxy_addr) => {
+                                            info!(
+                                                "Created relay proxy {} for NAT'd peer {} (token {})",
+                                                proxy_addr,
+                                                direct_addr,
+                                                &token_hex[..16]
+                                            );
+                                            // Track this proxy so we can identify relay connections
+                                            {
+                                                let mut proxies = self.relay_proxy_addrs.write().unwrap();
+                                                proxies.insert(proxy_addr, direct_addr);
+                                            }
+                                            peers.push(proxy_addr);
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to create relay proxy for peer {}: {}", direct_addr, e);
+                                        }
+                                    }
+                                } else {
+                                    warn!("Peer {} needs relay but no relay port available", direct_addr);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Use direct connection
+                peers.push(direct_addr);
             }
         }
         info!("Resolved {} peers from server", peers.len());
@@ -683,13 +888,22 @@ impl TorrentManager {
     }
 
     /// Get the local file path for a completed torrent.
+    ///
+    /// For shared files, returns the original file path (where the user shared from).
+    /// For downloaded files, returns the path in the default output folder.
     pub fn get_file_path(&self, infohash: &str) -> anyhow::Result<std::path::PathBuf> {
         let hash_bytes = hex::decode(infohash)?;
         let hash: [u8; 20] = hash_bytes
             .try_into()
             .map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
-        let id = librqbit::dht::Id20::new(hash);
 
+        // First check if this is a shared file (we have its original path stored)
+        if let Some(path) = self.shared_file_paths.read().unwrap().get(&hash) {
+            return Ok(path.clone());
+        }
+
+        // Otherwise, it's a downloaded file - look it up in the session
+        let id = librqbit::dht::Id20::new(hash);
         let handle = self
             .session
             .get(TorrentIdOrHash::Hash(id))

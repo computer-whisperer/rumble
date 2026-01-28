@@ -6,7 +6,6 @@
 //! - First-run setup dialog coordination
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc};
@@ -233,7 +232,7 @@ impl KeyManager {
 
     /// Generate a new local key with optional password protection.
     pub fn generate_local_key(&mut self, password: Option<&str>) -> anyhow::Result<KeyInfo> {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::from_bytes(&rand::random());
         let public_key = signing_key.verifying_key().to_bytes();
         let private_key = signing_key.to_bytes();
 
@@ -408,21 +407,25 @@ pub fn parse_signing_key(hex_key: &str) -> Option<SigningKey> {
 
 /// Encrypt a private key with a password using Argon2 + ChaCha20-Poly1305.
 fn encrypt_key(key: &[u8; 32], password: &str) -> anyhow::Result<(String, String, String)> {
-    use argon2::{Argon2, password_hash::SaltString};
+    use argon2::Argon2;
     use chacha20poly1305::{
         ChaCha20Poly1305, Nonce,
         aead::{Aead, KeyInit},
     };
 
-    // Generate random salt and nonce
-    let salt = SaltString::generate(&mut OsRng);
+    // Generate random salt (22 bytes for Argon2 base64 salt) and nonce
+    let mut salt_bytes = [0u8; 16];
     let mut nonce_bytes = [0u8; 12];
-    rand::RngCore::fill_bytes(&mut OsRng, &mut nonce_bytes);
+    getrandom::fill(&mut salt_bytes).map_err(|e| anyhow::anyhow!("Failed to generate random salt: {}", e))?;
+    getrandom::fill(&mut nonce_bytes).map_err(|e| anyhow::anyhow!("Failed to generate random nonce: {}", e))?;
+
+    // Encode salt as hex (we'll use hex instead of base64 for simplicity)
+    let salt_hex = hex::encode(salt_bytes);
 
     // Derive encryption key using Argon2
     let mut derived_key = [0u8; 32];
     Argon2::default()
-        .hash_password_into(password.as_bytes(), salt.as_str().as_bytes(), &mut derived_key)
+        .hash_password_into(password.as_bytes(), salt_hex.as_bytes(), &mut derived_key)
         .map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
 
     // Encrypt with ChaCha20-Poly1305
@@ -433,11 +436,7 @@ fn encrypt_key(key: &[u8; 32], password: &str) -> anyhow::Result<(String, String
         .encrypt(nonce, key.as_slice())
         .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
 
-    Ok((
-        hex::encode(ciphertext),
-        salt.as_str().to_string(),
-        hex::encode(nonce_bytes),
-    ))
+    Ok((hex::encode(ciphertext), salt_hex, hex::encode(nonce_bytes)))
 }
 
 /// Decrypt a private key with a password.
@@ -743,7 +742,7 @@ pub async fn generate_and_add_to_agent(comment: String) -> anyhow::Result<KeyInf
     let mut client = SshAgentClient::connect().await?;
 
     // Generate a new keypair
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = SigningKey::from_bytes(&rand::random());
     let public_key = signing_key.verifying_key().to_bytes();
 
     // Add to agent
@@ -827,7 +826,7 @@ mod tests {
 
     #[test]
     fn test_parse_signing_key() {
-        let key = SigningKey::generate(&mut OsRng);
+        let key = SigningKey::from_bytes(&rand::random());
         let hex = hex::encode(key.to_bytes());
 
         let parsed = parse_signing_key(&hex).unwrap();

@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::Result;
 use api::{
-    build_auth_payload, compute_cert_hash, encode_frame,
+    build_auth_payload, build_session_cert_payload, compute_cert_hash, compute_session_id, encode_frame,
     proto::{self, Envelope, RoomInfo, User, envelope::Payload},
     room_id_from_uuid, try_decode_frame, uuid_from_room_id,
 };
@@ -21,7 +21,6 @@ use bytes::BytesMut;
 use ed25519_dalek::{Signer, SigningKey};
 use prost::Message;
 use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
-use rand::rngs::OsRng;
 use rustls_pemfile;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -47,6 +46,10 @@ static PORT_COUNTER: AtomicU16 = AtomicU16::new(56000);
 
 fn next_test_port() -> u16 {
     PORT_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+fn random_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&rand::random())
 }
 
 /// Start a server instance on the given port and return the guard.
@@ -154,6 +157,7 @@ struct RawConnection {
     user_id: u64,
     nonce: Option<[u8; 32]>,
     cert_der: Vec<u8>,
+    signing_key: Option<SigningKey>,
 }
 
 impl RawConnection {
@@ -200,6 +204,7 @@ impl RawConnection {
             user_id: 0,
             nonce: None,
             cert_der,
+            signing_key: None,
         };
 
         // Send ClientHello
@@ -247,13 +252,59 @@ impl RawConnection {
         Ok(raw)
     }
 
-    /// Send a custom Authenticate message with provided signature and timestamp.
+    /// Send a custom Authenticate message with provided signature and timestamp (no session cert - for testing failures).
     async fn send_authenticate(&mut self, signature: &[u8], timestamp_ms: i64) -> Result<()> {
         let env = Envelope {
             state_hash: Vec::new(),
             payload: Some(Payload::Authenticate(proto::Authenticate {
                 signature: signature.to_vec(),
                 timestamp_ms,
+                session_cert: None, // No session cert - used for testing invalid auth
+            })),
+        };
+        let frame = encode_frame(&env);
+        self.send.write_all(&frame).await?;
+        Ok(())
+    }
+
+    /// Send a complete Authenticate message with valid session certificate.
+    async fn send_authenticate_with_session_cert(
+        &mut self,
+        signing_key: &SigningKey,
+        public_key: &[u8; 32],
+    ) -> Result<()> {
+        let nonce = self.nonce.ok_or_else(|| anyhow::anyhow!("No nonce available"))?;
+        let server_cert_hash = compute_cert_hash(&self.cert_der);
+        let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+
+        // Build auth payload
+        let payload = build_auth_payload(&nonce, timestamp_ms, public_key, self.user_id, &server_cert_hash);
+        let signature = signing_key.sign(&payload);
+
+        // Generate ephemeral session keypair
+        let session_signing_key = random_signing_key();
+        let session_public_key = session_signing_key.verifying_key().to_bytes();
+        let issued_ms = timestamp_ms;
+        let expires_ms = timestamp_ms + 3600 * 1000; // 1 hour validity
+
+        // Sign the session certificate with the user's long-term key
+        let cert_payload = build_session_cert_payload(&session_public_key, issued_ms, expires_ms, None);
+        let cert_signature = signing_key.sign(&cert_payload);
+
+        let session_cert = proto::SessionCertificate {
+            session_public_key: session_public_key.to_vec(),
+            issued_ms,
+            expires_ms,
+            device: None,
+            user_signature: cert_signature.to_bytes().to_vec(),
+        };
+
+        let env = Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::Authenticate(proto::Authenticate {
+                signature: signature.to_bytes().to_vec(),
+                timestamp_ms,
+                session_cert: Some(session_cert),
             })),
         };
         let frame = encode_frame(&env);
@@ -337,7 +388,7 @@ impl TestClient {
     /// Connect to a server and complete the Ed25519 authentication handshake.
     async fn connect(addr: &str, name: &str, cert_path: &std::path::Path) -> Result<Self> {
         // Generate a keypair for this test client
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = random_signing_key();
         Self::connect_with_key(addr, name, signing_key, None, cert_path).await
     }
 
@@ -357,7 +408,7 @@ impl TestClient {
 
     /// Attempt to connect, returning either success or auth failure reason.
     async fn try_connect(addr: &str, name: &str, cert_path: &std::path::Path) -> Result<ConnectResult> {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = random_signing_key();
         Self::try_connect_with_key(addr, name, signing_key, None, cert_path).await
     }
 
@@ -507,7 +558,7 @@ impl TestClient {
         Ok(HandshakeResult::Success)
     }
 
-    /// Send the Authenticate message with Ed25519 signature.
+    /// Send the Authenticate message with Ed25519 signature and session certificate.
     async fn send_authenticate(&mut self, nonce: [u8; 32], cert_der: &[u8]) -> Result<()> {
         let public_key = self.signing_key.verifying_key().to_bytes();
         let server_cert_hash = compute_cert_hash(cert_der);
@@ -517,11 +568,30 @@ impl TestClient {
 
         let signature = self.signing_key.sign(&payload);
 
+        // Generate ephemeral session keypair
+        let session_signing_key = random_signing_key();
+        let session_public_key = session_signing_key.verifying_key().to_bytes();
+        let issued_ms = timestamp_ms;
+        let expires_ms = timestamp_ms + 3600 * 1000; // 1 hour validity
+
+        // Sign the session certificate with the user's long-term key
+        let cert_payload = build_session_cert_payload(&session_public_key, issued_ms, expires_ms, None);
+        let cert_signature = self.signing_key.sign(&cert_payload);
+
+        let session_cert = proto::SessionCertificate {
+            session_public_key: session_public_key.to_vec(),
+            issued_ms,
+            expires_ms,
+            device: None,
+            user_signature: cert_signature.to_bytes().to_vec(),
+        };
+
         let env = Envelope {
             state_hash: Vec::new(),
             payload: Some(Payload::Authenticate(proto::Authenticate {
                 signature: signature.to_bytes().to_vec(),
                 timestamp_ms,
+                session_cert: Some(session_cert),
             })),
         };
         let frame = encode_frame(&env);
@@ -1283,7 +1353,7 @@ async fn test_auth_failure_invalid_signature() {
     let server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = random_signing_key();
     let public_key = signing_key.verifying_key().to_bytes();
 
     let mut raw = RawConnection::connect_no_auth(
@@ -1325,7 +1395,7 @@ async fn test_auth_failure_timestamp_out_of_range() {
     let server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = random_signing_key();
     let public_key = signing_key.verifying_key().to_bytes();
 
     let mut raw = RawConnection::connect_no_auth(
@@ -1376,7 +1446,7 @@ async fn test_auth_failure_wrong_user_id_in_signature() {
     let server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = random_signing_key();
     let public_key = signing_key.verifying_key().to_bytes();
 
     let mut raw = RawConnection::connect_no_auth(
@@ -1426,7 +1496,7 @@ async fn test_auth_success_with_valid_credentials() {
     let server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = random_signing_key();
     let public_key = signing_key.verifying_key().to_bytes();
 
     let mut raw = RawConnection::connect_no_auth(
@@ -1439,15 +1509,8 @@ async fn test_auth_success_with_valid_credentials() {
     .await
     .expect("should establish connection");
 
-    let nonce = raw.nonce.unwrap();
-    let server_cert_hash = compute_cert_hash(&raw.cert_der);
-    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-
-    // Create valid signature
-    let payload = build_auth_payload(&nonce, timestamp_ms, &public_key, raw.user_id, &server_cert_hash);
-
-    let signature = signing_key.sign(&payload);
-    raw.send_authenticate(&signature.to_bytes(), timestamp_ms)
+    // Use the method that sends a proper session certificate
+    raw.send_authenticate_with_session_cert(&signing_key, &public_key)
         .await
         .unwrap();
 
@@ -1475,7 +1538,7 @@ async fn test_registered_user_last_room_persisted() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Create a client with a specific signing key
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = random_signing_key();
 
     // First connection: connect and register the user
     let mut client = TestClient::connect_with_key(
@@ -1552,7 +1615,7 @@ async fn test_unregistered_user_starts_in_root() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Create a client with a specific signing key (but don't register)
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = random_signing_key();
 
     // First connection: connect, create and join a room, but don't register
     let mut client = TestClient::connect_with_key(
@@ -1626,7 +1689,7 @@ async fn test_last_room_deleted_falls_back_to_root() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Create a registered user and join a room
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = random_signing_key();
 
     let mut client = TestClient::connect_with_key(
         &format!("127.0.0.1:{}", port),

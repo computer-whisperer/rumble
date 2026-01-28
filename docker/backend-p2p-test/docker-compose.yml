@@ -1,0 +1,202 @@
+# Backend P2P NAT Traversal Integration Test Environment
+#
+# Full NAT simulation with separate private networks.
+# Tests file transfer via BitTorrent with NAT relay through the Rumble server.
+#
+# Network topology:
+#
+#   ┌──────────────────────────────────────────────────────────────┐
+#   │                    public (10.100.0.0/24)                      │
+#   │                                                              │
+#   │    ┌─────────────┐                                           │
+#   │    │   server    │ 10.100.0.10:5000                            │
+#   │    │  (Rumble)   │                                           │
+#   │    └─────────────┘                                           │
+#   │          │                                                   │
+#   │    ┌─────┴─────┐                                             │
+#   │    │           │                                             │
+#   │ ┌──┴───┐   ┌───┴──┐                                          │
+#   │ │nat-a │   │nat-b │  NAT routers                             │
+#   │ │10.2. │   │10.2. │  (iptables masquerade)                   │
+#   │ │0.20  │   │0.30  │                                          │
+#   │ └──┬───┘   └───┬──┘                                          │
+#   │    │           │                                             │
+#   └────┼───────────┼─────────────────────────────────────────────┘
+#        │           │
+#   ┌────┴────┐ ┌────┴────┐
+#   │private-a│ │private-b│
+#   │192.168. │ │192.168. │
+#   │100.0/24 │ │200.0/24 │
+#   └────┬────┘ └────┬────┘
+#        │           │
+#   ┌────┴────┐ ┌────┴────┐
+#   │ node-a  │ │ node-b  │
+#   │192.168. │ │192.168. │
+#   │100.100  │ │200.100  │
+#   │(behind  │ │(behind  │
+#   │ NAT)    │ │ NAT)    │
+#   └─────────┘ └─────────┘
+
+services:
+  # ============================================
+  # RUMBLE SERVER (public)
+  # ============================================
+  server:
+    build:
+      context: ../..
+      dockerfile: docker/backend-p2p-test/Dockerfile
+    command: >
+      sh -c "
+        mkdir -p /app/certs /app/data &&
+        rumble-server --bind '[::]:5000' --cert-dir /app/certs --data-dir /app/data --domain localhost
+      "
+    container_name: backend-nat-server
+    environment:
+      - RUST_LOG=info,server=debug
+      - RUMBLE_NO_CONFIG=1
+    networks:
+      public:
+        ipv4_address: 10.100.0.10
+    volumes:
+      - server-certs:/app/certs
+      - server-data:/app/data
+
+  # ============================================
+  # NAT ROUTER A (for node-a)
+  # ============================================
+  nat-a:
+    image: alpine:latest
+    container_name: backend-nat-router-a
+    command: >
+      sh -c "
+        apk add --no-cache iptables &&
+        iptables -t nat -A POSTROUTING -j MASQUERADE &&
+        iptables -A FORWARD -j ACCEPT &&
+        echo 'NAT-A router ready' &&
+        tail -f /dev/null
+      "
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      public:
+        ipv4_address: 10.100.0.20
+      private-a:
+        ipv4_address: 192.168.100.2
+
+  # ============================================
+  # NAT ROUTER B (for node-b)
+  # ============================================
+  nat-b:
+    image: alpine:latest
+    container_name: backend-nat-router-b
+    command: >
+      sh -c "
+        apk add --no-cache iptables &&
+        iptables -t nat -A POSTROUTING -j MASQUERADE &&
+        iptables -A FORWARD -j ACCEPT &&
+        echo 'NAT-B router ready' &&
+        tail -f /dev/null
+      "
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      public:
+        ipv4_address: 10.100.0.30
+      private-b:
+        ipv4_address: 192.168.200.2
+
+  # ============================================
+  # NODE A (behind NAT-A, will share file)
+  # ============================================
+  node-a:
+    build:
+      context: ../..
+      dockerfile: docker/backend-p2p-test/Dockerfile
+    container_name: backend-nat-node-a
+    depends_on:
+      - server
+      - nat-a
+    environment:
+      - RUST_LOG=info,backend=debug
+    networks:
+      private-a:
+        ipv4_address: 192.168.100.100
+    volumes:
+      - ./test-files:/data/files
+      - node-a-downloads:/data/downloads
+      - server-certs:/certs:ro
+    dns: []
+    cap_add:
+      - NET_ADMIN
+    entrypoint: >
+      sh -c "
+        ip route del default 2>/dev/null || true
+        ip route add default via 192.168.100.2
+        echo 'Node A network configured, starting...'
+        exec test-node --name node-a --server 10.100.0.10:5000 --cert /certs/fullchain.pem --download-dir /data/downloads wait --duration 0
+      "
+
+  # ============================================
+  # NODE B (behind NAT-B, will download file)
+  # ============================================
+  node-b:
+    build:
+      context: ../..
+      dockerfile: docker/backend-p2p-test/Dockerfile
+    container_name: backend-nat-node-b
+    depends_on:
+      - server
+      - nat-b
+    environment:
+      - RUST_LOG=info,backend=debug
+    networks:
+      private-b:
+        ipv4_address: 192.168.200.100
+    volumes:
+      - node-b-downloads:/data/downloads
+      - server-certs:/certs:ro
+    dns: []
+    cap_add:
+      - NET_ADMIN
+    entrypoint: >
+      sh -c "
+        ip route del default 2>/dev/null || true
+        ip route add default via 192.168.200.2
+        echo 'Node B network configured, starting...'
+        exec test-node --name node-b --server 10.100.0.10:5000 --cert /certs/fullchain.pem --download-dir /data/downloads wait --duration 0
+      "
+
+networks:
+  # Public network (internet simulation)
+  public:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.0.0/24
+          gateway: 10.100.0.1
+
+  # Private network behind NAT-A
+  private-a:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 192.168.100.0/24
+
+  # Private network behind NAT-B
+  private-b:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 192.168.200.0/24
+
+volumes:
+  server-certs:
+  server-data:
+  node-a-downloads:
+  node-b-downloads:

@@ -157,6 +157,40 @@ pub struct PendingAuth {
     pub username: String,
 }
 
+/// Active session information for a connected client.
+#[derive(Clone, Debug)]
+pub struct SessionEntry {
+    /// The user's long-term Ed25519 public key.
+    pub user_public_key: [u8; 32],
+    /// Ephemeral session public key used for P2P (32 bytes).
+    pub session_public_key: [u8; 32],
+    /// Stable session identifier derived from `session_public_key`.
+    pub session_id: [u8; 32],
+    /// Certificate issuance time (ms since epoch).
+    pub issued_ms: i64,
+    /// Certificate expiry time (ms since epoch).
+    pub expires_ms: i64,
+    /// Optional device label provided by the client.
+    pub device: Option<String>,
+}
+
+/// P2P capabilities reported by a client.
+#[derive(Clone, Debug, Default)]
+pub struct PeerCapabilitiesEntry {
+    /// Whether the client supports libp2p file transfer.
+    pub supports_file_transfer: bool,
+    /// Whether the client supports P2P voice.
+    pub supports_p2p_voice: bool,
+    /// Whether the client wants to use relay mode (hides IP from peers).
+    pub prefer_relay: bool,
+    /// Client's libp2p PeerId as bytes.
+    pub libp2p_peer_id: Vec<u8>,
+    /// Client's publicly reachable multiaddrs.
+    pub multiaddrs: Vec<String>,
+    /// Self-reported bandwidth tier.
+    pub bandwidth_tier: u32,
+}
+
 /// The server's shared state.
 ///
 /// This contains all mutable server state including:
@@ -181,8 +215,12 @@ pub struct ServerState {
     next_user_id: AtomicU64,
     /// Pending authentication state: user_id → PendingAuth.
     pending_auth: DashMap<u64, PendingAuth>,
-    /// Active sessions: user_id → public_key (for looking up identity).
-    sessions: DashMap<u64, [u8; 32]>,
+    /// Active sessions: user_id → session entry (long-term + session keys).
+    sessions: DashMap<u64, SessionEntry>,
+    /// Reverse index: session_id → user_id for peer mapping.
+    sessions_by_id: DashMap<[u8; 32], u64>,
+    /// P2P capabilities reported by clients: user_id → capabilities.
+    peer_capabilities: DashMap<u64, PeerCapabilitiesEntry>,
     /// Server's TLS certificate DER bytes (for computing cert hash).
     server_cert_der: Vec<u8>,
     /// BitTorrent tracker.
@@ -204,6 +242,8 @@ impl ServerState {
             next_user_id: AtomicU64::new(1),
             pending_auth: DashMap::new(),
             sessions: DashMap::new(),
+            sessions_by_id: DashMap::new(),
+            peer_capabilities: DashMap::new(),
             server_cert_der: Vec::new(),
             tracker,
             relay_tokens: Arc::new(RelayTokenManager::new()),
@@ -221,6 +261,8 @@ impl ServerState {
             next_user_id: AtomicU64::new(1),
             pending_auth: DashMap::new(),
             sessions: DashMap::new(),
+            sessions_by_id: DashMap::new(),
+            peer_capabilities: DashMap::new(),
             server_cert_der: cert_der,
             tracker,
             relay_tokens: Arc::new(RelayTokenManager::new()),
@@ -253,19 +295,61 @@ impl ServerState {
         self.pending_auth.remove(&user_id).map(|(_, v)| v)
     }
 
-    /// Track an active session (user_id → public_key).
-    pub fn add_session(&self, user_id: u64, public_key: [u8; 32]) {
-        self.sessions.insert(user_id, public_key);
+    /// Track an active session for a user.
+    pub fn add_session(&self, user_id: u64, session: SessionEntry) {
+        self.sessions.insert(user_id, session.clone());
+        self.sessions_by_id.insert(session.session_id, user_id);
     }
 
     /// Remove an active session.
     pub fn remove_session(&self, user_id: u64) {
-        self.sessions.remove(&user_id);
+        if let Some((_, session)) = self.sessions.remove(&user_id) {
+            self.sessions_by_id.remove(&session.session_id);
+        }
+        // Also remove peer capabilities when session ends.
+        self.peer_capabilities.remove(&user_id);
     }
 
-    /// Get the public key for an active session.
-    pub fn get_session_key(&self, user_id: u64) -> Option<[u8; 32]> {
-        self.sessions.get(&user_id).map(|r| *r.value())
+    /// Get the session entry for a user.
+    pub fn get_session(&self, user_id: u64) -> Option<SessionEntry> {
+        self.sessions.get(&user_id).map(|r| r.value().clone())
+    }
+
+    /// Get the user's long-term public key for a session.
+    pub fn get_user_public_key(&self, user_id: u64) -> Option<[u8; 32]> {
+        self.sessions.get(&user_id).map(|r| r.user_public_key)
+    }
+
+    /// Find a session entry by its session_id.
+    pub fn get_session_by_id(&self, session_id: &[u8; 32]) -> Option<(u64, SessionEntry)> {
+        self.sessions_by_id.get(session_id).and_then(|uid| {
+            self.sessions
+                .get(uid.value())
+                .map(|s| (*uid.value(), s.value().clone()))
+        })
+    }
+
+    /// Store P2P capabilities for a user.
+    pub fn set_peer_capabilities(&self, user_id: u64, capabilities: PeerCapabilitiesEntry) {
+        self.peer_capabilities.insert(user_id, capabilities);
+    }
+
+    /// Get P2P capabilities for a user.
+    pub fn get_peer_capabilities(&self, user_id: u64) -> Option<PeerCapabilitiesEntry> {
+        self.peer_capabilities.get(&user_id).map(|r| r.value().clone())
+    }
+
+    /// Get all peers with their capabilities (for broadcasting PeerAnnounce).
+    pub fn get_all_peer_capabilities(&self) -> Vec<(u64, SessionEntry, PeerCapabilitiesEntry)> {
+        let mut result = Vec::new();
+        for session_ref in self.sessions.iter() {
+            let user_id = *session_ref.key();
+            let session = session_ref.value().clone();
+            if let Some(caps_ref) = self.peer_capabilities.get(&user_id) {
+                result.push((user_id, session, caps_ref.value().clone()));
+            }
+        }
+        result
     }
 
     /// Allocate the next user ID (lock-free).

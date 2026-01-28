@@ -16,7 +16,6 @@ use std::{
 
 use backend::{BackendHandle, Command as BackendCommand, ConnectConfig, ConnectionState, SigningCallback};
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use tempfile::TempDir;
 
 /// Guard that kills the server process on drop and cleans up temp dirs.
@@ -40,6 +39,10 @@ static PORT_COUNTER: AtomicU16 = AtomicU16::new(57000);
 
 fn next_test_port() -> u16 {
     PORT_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+fn random_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&rand::random())
 }
 
 /// Start a server instance on the given port and return the guard.
@@ -143,7 +146,7 @@ where
 
 /// Create Ed25519 signing credentials for a test client.
 fn create_test_credentials() -> ([u8; 32], SigningCallback) {
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = random_signing_key();
     let public_key = signing_key.verifying_key().to_bytes();
     let key_bytes = signing_key.to_bytes();
 

@@ -1,0 +1,36 @@
+# Rumble Server Configuration
+# ============================
+#
+# This file configures the Rumble VOIP server. All options can be
+# overridden via command-line arguments.
+
+# Socket address to bind to.
+# Supports both IPv4 and IPv6 addresses.
+# If no port is specified, 5000 is used.
+# Examples:
+#   - "[::]:5000"      - All interfaces, IPv6 and IPv4 (default)
+#   - "0.0.0.0:5000"   - All IPv4 interfaces only
+#   - "127.0.0.1:5000" - Localhost only
+#   - "[::1]:5000"     - IPv6 localhost only
+bind = "[::]:5000"
+
+# Logging level.
+# Options: trace, debug, info, warn, error
+log_level = "info"
+
+# Directory for server data (database, etc.).
+# Relative paths are resolved from the config file location.
+data_dir = "data"
+
+# Directory containing TLS certificates.
+# The server expects certbot-style PEM files:
+#   - fullchain.pem  - Certificate chain
+#   - privkey.pem    - Private key
+# If the directory doesn't exist or certificates are missing,
+# self-signed development certificates will be generated.
+cert_dir = "certs"
+
+# Server domain name.
+# Used for certificate generation and ACME support.
+# For development, "localhost" is used by default.
+domain = "localhost"

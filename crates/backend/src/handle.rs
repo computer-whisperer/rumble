@@ -38,6 +38,8 @@
 //! let state = handle.state();
 //! ```
 
+#[cfg(feature = "p2p")]
+use crate::p2p::{P2PManager, build_p2p_magnet, parse_p2p_magnet};
 use crate::{
     ConnectConfig,
     audio::AudioSystem,
@@ -49,15 +51,19 @@ use crate::{
     events::{AudioState, Command, ConnectionState, PendingCertificate, SigningCallback, State, VoiceMode},
 };
 use api::{
-    ROOT_ROOM_UUID, build_auth_payload, compute_cert_hash, encode_frame,
+    ROOT_ROOM_UUID, build_auth_payload, build_session_cert_payload, compute_cert_hash, compute_session_id,
+    encode_frame,
     proto::{self, envelope::Payload},
     room_id_from_uuid, try_decode_frame,
 };
 use bytes::BytesMut;
+use ed25519_dalek::SigningKey;
+#[cfg(feature = "p2p")]
+use libp2p::{Multiaddr, identity};
 use prost::Message;
 use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::ToSocketAddrs,
     sync::{Arc, RwLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -146,6 +152,9 @@ impl BackendHandle {
             users: Vec::new(),
             my_user_id: None,
             my_room_id: None,
+            my_session_public_key: None,
+            my_session_id: None,
+            p2p_peers: HashMap::new(),
             audio: AudioState {
                 input_devices,
                 output_devices,
@@ -167,6 +176,7 @@ impl BackendHandle {
             chat_messages: Vec::new(),
             room_tree: Default::default(),
             file_transfers: Vec::new(),
+            file_transfer_settings: Default::default(),
         };
 
         let state = Arc::new(RwLock::new(state));
@@ -351,6 +361,9 @@ async fn run_connection_task(
     let mut send_stream: Option<quinn::SendStream> = None;
     let mut client_name = String::new();
     let mut torrent_manager: Option<Arc<crate::torrent::TorrentManager>> = None;
+    let mut _session_identity: Option<SessionIdentity> = None;
+    #[cfg(feature = "p2p")]
+    let mut p2p_manager: Option<Arc<P2PManager>> = None;
     let mut transfer_update_interval = tokio::time::interval(std::time::Duration::from_millis(500));
 
     loop {
@@ -404,6 +417,69 @@ async fn run_connection_task(
                                 })
                                 .unwrap_or((0, 0, 0));
 
+                            // Get per-peer details from the live state
+                            let peer_details = handle.live()
+                                .map(|live| {
+                                    use librqbit::http_api_types::{PeerStatsFilter, PeerStatsSnapshot};
+                                    let filter = PeerStatsFilter::default(); // Default filters to live peers
+                                    let snapshot: PeerStatsSnapshot = live.per_peer_stats_snapshot(filter);
+
+                                    snapshot.peers.into_iter().map(|(addr_str, peer_stats)| {
+                                        // Parse the address to check if it's a relay proxy
+                                        let addr: Option<std::net::SocketAddr> = addr_str.parse().ok();
+                                        let is_relay = addr.as_ref()
+                                            .map(|a| tm.is_relay_proxy(a))
+                                            .unwrap_or(false);
+
+                                        // Determine connection type
+                                        // Note: ConnectionKind is not publicly exported from librqbit,
+                                        // so we serialize to JSON and check the string value
+                                        let connection_type = if is_relay {
+                                            crate::events::PeerConnectionType::Relay
+                                        } else if let Some(ref conn_kind) = peer_stats.conn_kind {
+                                            // ConnectionKind serializes to "tcp", "utp", or "socks"
+                                            let kind_str = serde_json::to_string(conn_kind)
+                                                .unwrap_or_default()
+                                                .trim_matches('"')
+                                                .to_string();
+                                            match kind_str.as_str() {
+                                                "tcp" => crate::events::PeerConnectionType::Direct,
+                                                "utp" => crate::events::PeerConnectionType::Utp,
+                                                "socks" => crate::events::PeerConnectionType::Socks,
+                                                _ => crate::events::PeerConnectionType::Direct,
+                                            }
+                                        } else {
+                                            crate::events::PeerConnectionType::Direct
+                                        };
+
+                                        // Map peer state
+                                        let peer_state = match peer_stats.state {
+                                            "live" => crate::events::PeerState::Live,
+                                            "connecting" => crate::events::PeerState::Connecting,
+                                            "queued" => crate::events::PeerState::Queued,
+                                            _ => crate::events::PeerState::Dead,
+                                        };
+
+                                        // Get display address - use original addr for relay, else the connected addr
+                                        let display_addr = if is_relay {
+                                            addr.and_then(|a| tm.get_relay_original_addr(&a))
+                                                .map(|a| a.to_string())
+                                                .unwrap_or(addr_str.clone())
+                                        } else {
+                                            addr_str.clone()
+                                        };
+
+                                        crate::events::TransferPeerInfo {
+                                            address: display_addr,
+                                            connection_type,
+                                            state: peer_state,
+                                            downloaded_bytes: peer_stats.counters.fetched_bytes,
+                                            uploaded_bytes: peer_stats.counters.uploaded_bytes,
+                                        }
+                                    }).collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+
                             // Get error message if in error state
                             let error = if matches!(state, crate::events::TransferState::Error) {
                                 stats.error.clone()
@@ -425,6 +501,7 @@ async fn run_connection_task(
                                 error,
                                 magnet: Some(magnet),
                                 local_path,
+                                peer_details,
                             });
                         }
                         transfers
@@ -444,6 +521,10 @@ async fn run_connection_task(
                     if let Some(conn) = connection.take() {
                         conn.close(quinn::VarInt::from_u32(0), b"shutdown");
                     }
+                    #[cfg(feature = "p2p")]
+                    if let Some(p2p) = p2p_manager.take() {
+                        p2p.shutdown().await;
+                    }
                     return;
                 };
                 match cmd {
@@ -462,7 +543,7 @@ async fn run_connection_task(
 
                         // Attempt connection with Ed25519 auth
                         match connect_to_server(&addr, &name, &public_key, &signer, password.as_deref(), &config, captured_cert.clone()).await {
-                            Ok((conn, send, recv, recv_buf, user_id, rooms, users)) => {
+                            Ok((conn, send, recv, recv_buf, user_id, rooms, users, session_info)) => {
                                 // Update state to Connected
                                 {
                                     let mut s = state.write().unwrap();
@@ -477,6 +558,8 @@ async fn run_connection_task(
                                         .and_then(|u| u.current_room.as_ref())
                                         .and_then(api::uuid_from_room_id)
                                         .or(Some(ROOT_ROOM_UUID));
+                                    s.my_session_public_key = Some(session_info.session_public_key);
+                                    s.my_session_id = Some(session_info.session_id);
                                     s.rooms = rooms;
                                     s.users = users;
                                     s.rebuild_room_tree();
@@ -491,12 +574,32 @@ async fn run_connection_task(
 
                                 connection = Some(conn.clone());
                                 send_stream = Some(send);
+                                _session_identity = Some(session_info);
+
+                                #[cfg(feature = "p2p")]
+                                {
+                                    p2p_manager = start_p2p_manager_from_session(
+                                        &_session_identity.as_ref().unwrap().signing_key,
+                                        &config,
+                                    )
+                                    .await;
+
+                                    // Send PeerCapabilities to server
+                                    if let Some(ref p2p) = p2p_manager {
+                                        send_peer_capabilities(
+                                            send_stream.as_mut().unwrap(),
+                                            p2p.clone(),
+                                        )
+                                        .await;
+                                    }
+                                }
 
                                 // Initialize TorrentManager
                                 let temp_dir = config.download_dir.clone()
                                     .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
                                 match crate::torrent::TorrentManager::new(conn.clone(), temp_dir).await {
                                     Ok(tm) => {
+                                        tm.set_needs_relay(config.prefer_relay);
                                         torrent_manager = Some(Arc::new(tm));
                                     }
                                     Err(e) => {
@@ -593,7 +696,7 @@ async fn run_connection_task(
                                 &new_config,
                                 captured_cert,
                             ).await {
-                                Ok((conn, send, recv, recv_buf, user_id, rooms, users)) => {
+                                Ok((conn, send, recv, recv_buf, user_id, rooms, users, session_info)) => {
                                     // Success! Update state
                                     {
                                         let mut s = state.write().unwrap();
@@ -607,6 +710,8 @@ async fn run_connection_task(
                                             .and_then(|u| u.current_room.as_ref())
                                             .and_then(api::uuid_from_room_id)
                                             .or(Some(ROOT_ROOM_UUID));
+                                        s.my_session_public_key = Some(session_info.session_public_key);
+                                        s.my_session_id = Some(session_info.session_id);
                                         s.rooms = rooms;
                                         s.users = users;
                                         s.rebuild_room_tree();
@@ -622,12 +727,32 @@ async fn run_connection_task(
                                     connection = Some(conn.clone());
                                     send_stream = Some(send);
                                     client_name = pending.username;
+                                    _session_identity = Some(session_info);
+
+                                    #[cfg(feature = "p2p")]
+                                    {
+                                        p2p_manager = start_p2p_manager_from_session(
+                                            &_session_identity.as_ref().unwrap().signing_key,
+                                            &new_config,
+                                        )
+                                        .await;
+
+                                        // Send PeerCapabilities to server
+                                        if let Some(ref p2p) = p2p_manager {
+                                            send_peer_capabilities(
+                                                send_stream.as_mut().unwrap(),
+                                                p2p.clone(),
+                                            )
+                                            .await;
+                                        }
+                                    }
 
                                     // Initialize TorrentManager
                                     let temp_dir = new_config.download_dir.clone()
                                         .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
                                     match crate::torrent::TorrentManager::new(conn.clone(), temp_dir).await {
                                         Ok(tm) => {
+                                            tm.set_needs_relay(new_config.prefer_relay);
                                             torrent_manager = Some(Arc::new(tm));
                                         }
                                         Err(e) => {
@@ -682,11 +807,17 @@ async fn run_connection_task(
                         }
                         send_stream = None;
                         torrent_manager = None;
+                        #[cfg(feature = "p2p")]
+                        if let Some(p2p) = p2p_manager.take() {
+                            p2p.shutdown().await;
+                        }
                         {
                             let mut s = state.write().unwrap();
                             s.connection = ConnectionState::Disconnected;
                             s.my_user_id = None;
                             s.my_room_id = None;
+                            s.my_session_public_key = None;
+                            s.my_session_id = None;
                             s.rooms.clear();
                             s.users.clear();
                             s.rebuild_room_tree();
@@ -904,6 +1035,77 @@ async fn run_connection_task(
                     }
 
                     Command::ShareFile { path } => {
+                        #[cfg(feature = "p2p")]
+                        if let Some(p2p) = &p2p_manager {
+                            let state = state.clone();
+                            let repaint = repaint.clone();
+                            let client = client_name.clone();
+                            let path = path.clone();
+                            let mut send_opt = send_stream.as_mut();
+
+                            match p2p.share_file(path.clone()).await {
+                                Ok(shared) => {
+                                    let addrs = p2p.listen_addrs().await;
+                                    let magnet = build_p2p_magnet(p2p.peer_id(), &shared, &addrs);
+                                    let addr_strings: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+
+                                    let msg = crate::events::P2pFileMessage::new(
+                                        shared.name.clone(),
+                                        shared.size,
+                                        hex::encode(shared.id),
+                                        p2p.peer_id().to_string(),
+                                        addr_strings,
+                                    );
+
+                                    if let Some(send) = send_opt.as_mut() {
+                                        let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
+                                        let timestamp_ms = SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis() as i64;
+
+                                        let env = proto::Envelope {
+                                            state_hash: Vec::new(),
+                                            payload: Some(Payload::ChatMessage(proto::ChatMessage {
+                                                id: message_id,
+                                                timestamp_ms,
+                                                sender: client.clone(),
+                                                text: msg.to_json(),
+                                            })),
+                                        };
+                                        let frame = encode_frame(&env);
+                                        if let Err(e) = send.write_all(&frame).await {
+                                            error!("Failed to send p2p file share message: {}", e);
+                                        }
+                                    }
+
+                                    let mut s = state.write().unwrap();
+                                    s.chat_messages.push(crate::events::ChatMessage {
+                                        id: uuid::Uuid::new_v4().into_bytes(),
+                                        sender: "System".to_string(),
+                                        text: format!("Sharing {} via P2P (magnet: {})", shared.name, magnet),
+                                        timestamp: SystemTime::now(),
+                                        is_local: true,
+                                    });
+                                    repaint();
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!("Failed to share file via P2P: {}", e);
+                                    let mut s = state.write().unwrap();
+                                    s.chat_messages.push(crate::events::ChatMessage {
+                                        id: uuid::Uuid::new_v4().into_bytes(),
+                                        sender: "System".to_string(),
+                                        text: format!("Failed to share file via P2P: {}", e),
+                                        timestamp: SystemTime::now(),
+                                        is_local: true,
+                                    });
+                                    repaint();
+                                    // fall through to torrent path as a fallback
+                                }
+                            }
+                        }
+
                         if let (Some(tm), Some(send)) = (&torrent_manager, &mut send_stream) {
                             let tm = tm.clone();
                             let path = path.clone();
@@ -945,12 +1147,12 @@ async fn run_connection_task(
                                         error!("Failed to send file share message: {}", e);
                                     }
 
-                                    // Add local confirmation
+                                    // Add local confirmation with magnet link
                                     let mut s = state.write().unwrap();
                                     s.chat_messages.push(crate::events::ChatMessage {
                                         id: uuid::Uuid::new_v4().into_bytes(),
                                         sender: "System".to_string(),
-                                        text: format!("Sharing {} ({} bytes)", file_info.name, file_info.size),
+                                        text: format!("Sharing {} ({} bytes)\nMagnet: {}", file_info.name, file_info.size, file_info.magnet),
                                         timestamp: SystemTime::now(),
                                         is_local: true,
                                     });
@@ -973,6 +1175,78 @@ async fn run_connection_task(
                     }
 
                     Command::DownloadFile { magnet } => {
+                        #[cfg(feature = "p2p")]
+                        if let Some(p2p) = &p2p_manager {
+                            if let Ok((peer_id, file_id, addrs)) = parse_p2p_magnet(&magnet) {
+                                let p2p = p2p.clone();
+                                let state = state.clone();
+                                let repaint = repaint.clone();
+                                let download_dir = config
+                                    .download_dir
+                                    .clone()
+                                    .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
+
+                                tokio::spawn(async move {
+                                    for addr in &addrs {
+                                        p2p.dial(addr.clone()).await;
+                                    }
+
+                                    match p2p.fetch_file(peer_id, file_id).await {
+                                        Ok((name, data)) => {
+                                            if let Err(e) = tokio::fs::create_dir_all(&download_dir).await {
+                                                error!("Failed to create download dir: {}", e);
+                                            }
+
+                                            let dest = download_dir.join(&name);
+                                            match tokio::fs::write(&dest, &data).await {
+                                                Ok(_) => {
+                                                    let mut s = state.write().unwrap();
+                                                    s.chat_messages.push(crate::events::ChatMessage {
+                                                        id: uuid::Uuid::new_v4().into_bytes(),
+                                                        sender: "System".to_string(),
+                                                        text: format!(
+                                                            "Downloaded {} via P2P to {}",
+                                                            name,
+                                                            dest.display()
+                                                        ),
+                                                        timestamp: SystemTime::now(),
+                                                        is_local: true,
+                                                    });
+                                                    repaint();
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to save P2P download: {}", e);
+                                                    let mut s = state.write().unwrap();
+                                                    s.chat_messages.push(crate::events::ChatMessage {
+                                                        id: uuid::Uuid::new_v4().into_bytes(),
+                                                        sender: "System".to_string(),
+                                                        text: format!("Failed to save P2P download: {}", e),
+                                                        timestamp: SystemTime::now(),
+                                                        is_local: true,
+                                                    });
+                                                    repaint();
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to download via P2P: {}", e);
+                                            let mut s = state.write().unwrap();
+                                            s.chat_messages.push(crate::events::ChatMessage {
+                                                id: uuid::Uuid::new_v4().into_bytes(),
+                                                sender: "System".to_string(),
+                                                text: format!("Failed P2P download: {}", e),
+                                                timestamp: SystemTime::now(),
+                                                is_local: true,
+                                            });
+                                            repaint();
+                                        }
+                                    }
+                                });
+
+                                continue;
+                            }
+                        }
+
                         if let Some(tm) = &torrent_manager {
                             let tm = tm.clone();
                             let magnet = magnet.clone();
@@ -1094,13 +1368,87 @@ async fn run_connection_task(
                             }
                         }
                     }
+
+                    Command::UpdateFileTransferSettings { settings } => {
+                        debug!("Updating file transfer settings: auto_download_enabled={}", settings.auto_download_enabled);
+                        let mut s = state.write().unwrap();
+                        s.file_transfer_settings = settings;
+                        drop(s);
+                        repaint();
+                    }
                 }
             }
         }
     }
 }
 
+/// Ephemeral session identity used for libp2p PeerId binding.
+struct SessionIdentity {
+    signing_key: SigningKey,
+    session_public_key: [u8; 32],
+    session_id: [u8; 32],
+    issued_ms: i64,
+    expires_ms: i64,
+}
+
+#[cfg(feature = "p2p")]
+async fn start_p2p_manager_from_session(
+    session_signing: &SigningKey,
+    config: &ConnectConfig,
+) -> Option<Arc<P2PManager>> {
+    let secret = identity::ed25519::SecretKey::try_from_bytes(session_signing.to_bytes()).ok()?;
+    let kp = identity::Keypair::from(identity::ed25519::Keypair::from(secret));
+
+    let listen_addrs: Vec<Multiaddr> = if config.p2p_listen_addrs.is_empty() {
+        vec!["/ip4/0.0.0.0/tcp/0".parse().expect("p2p default listen addr")]
+    } else {
+        config.p2p_listen_addrs.clone()
+    };
+
+    match P2PManager::spawn(kp, listen_addrs, config.p2p_relay.clone()).await {
+        Ok(manager) => Some(Arc::new(manager)),
+        Err(err) => {
+            error!(%err, "failed to start p2p manager");
+            None
+        }
+    }
+}
+
+/// Send PeerCapabilities message to the server after P2P manager is initialized.
+#[cfg(feature = "p2p")]
+async fn send_peer_capabilities(send: &mut quinn::SendStream, p2p: Arc<P2PManager>) {
+    // Wait a moment for listen addresses to be discovered
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let addrs = p2p.listen_addrs().await;
+    let peer_id_bytes = p2p.peer_id().to_bytes();
+
+    let capabilities = proto::PeerCapabilities {
+        supports_file_transfer: true,
+        supports_p2p_voice: false, // Not yet implemented
+        prefer_relay: false,
+        libp2p_peer_id: peer_id_bytes,
+        multiaddrs: addrs.into_iter().map(|a| a.to_string()).collect(),
+        bandwidth_tier: 0, // Auto
+    };
+
+    let envelope = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::PeerCapabilities(capabilities)),
+    };
+    let frame = encode_frame(&envelope);
+
+    if let Err(e) = send.write_all(&frame).await {
+        warn!("Failed to send PeerCapabilities: {}", e);
+    } else {
+        info!("Sent PeerCapabilities to server");
+    }
+}
+
 /// Connect to a server and perform handshake with Ed25519 authentication.
+///
+/// Returns the negotiated connection handles plus the generated session
+/// identity (ephemeral keypair) used for P2P features.
 async fn connect_to_server(
     addr: &str,
     client_name: &str,
@@ -1117,6 +1465,7 @@ async fn connect_to_server(
     u64,      // user_id
     Vec<proto::RoomInfo>,
     Vec<proto::User>,
+    SessionIdentity,
 )> {
     use std::net::SocketAddr;
     use url::Url;
@@ -1175,30 +1524,54 @@ async fn connect_to_server(
     // Step 3: Compute server certificate hash
     let server_cert_hash = compute_server_cert_hash(&conn);
 
-    // Step 4: Compute signature payload
-    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    // Step 4: Generate session keypair and certificate signed by long-term key
+    let session_secret: [u8; 32] = rand::random();
+    let session_signing = ed25519_dalek::SigningKey::from_bytes(&session_secret);
+    let session_public_bytes: [u8; 32] = session_signing.verifying_key().to_bytes();
 
+    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let expires_ms = timestamp_ms + 24 * 60 * 60 * 1000; // 24h validity for session cert
+
+    let cert_payload = build_session_cert_payload(&session_public_bytes, timestamp_ms, expires_ms, Some(client_name));
+    let session_signature = signer(&cert_payload).map_err(|e| anyhow::anyhow!("Signing failed: {}", e))?;
+
+    // Step 5: Compute signature payload for handshake
     let payload = build_auth_payload(&nonce, timestamp_ms, public_key, user_id, &server_cert_hash);
 
-    // Step 5: Sign the payload
+    // Step 6: Sign the handshake payload
     let signature = signer(&payload).map_err(|e| anyhow::anyhow!("Signing failed: {}", e))?;
 
-    // Step 6: Send Authenticate
+    // Step 7: Send Authenticate (includes session certificate)
     let auth = proto::Envelope {
         state_hash: Vec::new(),
         payload: Some(Payload::Authenticate(proto::Authenticate {
             signature: signature.to_vec(),
             timestamp_ms,
+            session_cert: Some(proto::SessionCertificate {
+                session_public_key: session_public_bytes.to_vec(),
+                issued_ms: timestamp_ms,
+                expires_ms,
+                device: Some(client_name.to_string()),
+                user_signature: session_signature.to_vec(),
+            }),
         })),
     };
     let frame = encode_frame(&auth);
     send.write_all(&frame).await?;
     debug!("Sent Authenticate");
 
-    // Step 7: Wait for ServerState or AuthFailed
+    // Step 8: Wait for ServerState or AuthFailed
     let (rooms, users) = wait_for_auth_result(&mut recv, &mut buf).await?;
 
-    Ok((conn, send, recv, buf, user_id, rooms, users))
+    let session_identity = SessionIdentity {
+        signing_key: session_signing,
+        session_public_key: session_public_bytes,
+        session_id: compute_session_id(&session_public_bytes),
+        issued_ms: timestamp_ms,
+        expires_ms,
+    };
+
+    Ok((conn, send, recv, buf, user_id, rooms, users, session_identity))
 }
 
 /// Wait for ServerHello message and extract nonce and user_id.
@@ -1337,6 +1710,8 @@ async fn run_receiver_task(
             };
             s.my_user_id = None;
             s.my_room_id = None;
+            s.my_session_public_key = None;
+            s.my_session_id = None;
             s.rooms.clear();
             s.users.clear();
             s.rebuild_room_tree();
@@ -1369,7 +1744,7 @@ fn handle_server_message(
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_task: &AudioTaskHandle,
-    _torrent_manager: &Option<Arc<crate::torrent::TorrentManager>>,
+    torrent_manager: &Option<Arc<crate::torrent::TorrentManager>>,
 ) {
     match env.payload {
         Some(Payload::TrackerAnnounceResponse(_)) => {
@@ -1428,6 +1803,39 @@ fn handle_server_message(
                             std::time::SystemTime::now()
                         };
 
+                        // Check if this is a file message that should be auto-downloaded
+                        let mut should_auto_download = None;
+                        if let Some(file_msg) = crate::events::FileMessage::parse(&cb.text) {
+                            let s = state.read().unwrap();
+                            if s.file_transfer_settings
+                                .should_auto_download(&file_msg.file.mime, file_msg.file.size)
+                            {
+                                // Check we're not already downloading this file
+                                let infohash_bytes = hex::decode(&file_msg.file.infohash).ok();
+                                let already_downloading = infohash_bytes
+                                    .as_ref()
+                                    .map(|ih| {
+                                        if ih.len() == 20 {
+                                            let mut arr = [0u8; 20];
+                                            arr.copy_from_slice(ih);
+                                            s.file_transfers.iter().any(|t| t.infohash == arr)
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .unwrap_or(false);
+
+                                if !already_downloading {
+                                    should_auto_download = Some(file_msg.magnet_link());
+                                    debug!(
+                                        "Auto-downloading file: {} ({} bytes, {})",
+                                        file_msg.file.name, file_msg.file.size, file_msg.file.mime
+                                    );
+                                }
+                            }
+                            drop(s);
+                        }
+
                         let mut s = state.write().unwrap();
                         s.chat_messages.push(crate::events::ChatMessage {
                             id,
@@ -1442,12 +1850,53 @@ fn handle_server_message(
                         }
                         drop(s);
                         repaint();
+
+                        // Trigger auto-download if conditions were met
+                        if let (Some(magnet), Some(tm)) = (should_auto_download, torrent_manager) {
+                            let tm = tm.clone();
+                            let state = state.clone();
+                            let repaint = repaint.clone();
+                            tokio::spawn(async move {
+                                match tm.download_file(magnet).await {
+                                    Ok(_) => {
+                                        info!("Auto-download started");
+                                        let mut s = state.write().unwrap();
+                                        s.chat_messages.push(crate::events::ChatMessage {
+                                            id: uuid::Uuid::new_v4().into_bytes(),
+                                            sender: "System".to_string(),
+                                            text: "Auto-download started".to_string(),
+                                            timestamp: std::time::SystemTime::now(),
+                                            is_local: true,
+                                        });
+                                        repaint();
+                                    }
+                                    Err(e) => {
+                                        error!("Auto-download failed: {}", e);
+                                        let mut s = state.write().unwrap();
+                                        s.chat_messages.push(crate::events::ChatMessage {
+                                            id: uuid::Uuid::new_v4().into_bytes(),
+                                            sender: "System".to_string(),
+                                            text: format!("Auto-download failed: {}", e),
+                                            timestamp: std::time::SystemTime::now(),
+                                            is_local: true,
+                                        });
+                                        repaint();
+                                    }
+                                }
+                            });
+                        }
                     }
                     proto::server_event::Kind::KeepAlive(_) => {
                         // Ignore keep-alive for now
                     }
                 }
             }
+        }
+        Some(Payload::PeerAnnounce(pa)) => {
+            handle_peer_announce(pa, state, repaint);
+        }
+        Some(Payload::RelayAllocation(ra)) => {
+            handle_relay_allocation(ra, state, repaint);
         }
         _ => {}
     }
@@ -1633,6 +2082,69 @@ fn apply_state_update(
         drop(s);
         repaint();
     }
+}
+
+/// Handle a PeerAnnounce message from the server.
+/// This updates our knowledge of P2P peers.
+fn handle_peer_announce(
+    announce: proto::PeerAnnounce,
+    state: &Arc<RwLock<State>>,
+    repaint: &Arc<dyn Fn() + Send + Sync>,
+) {
+    let user_id = announce.user_id.as_ref().map(|u| u.value).unwrap_or(0);
+
+    if announce.is_removal {
+        // Peer left - remove from our list
+        let mut s = state.write().unwrap();
+        s.p2p_peers.remove(&user_id);
+        info!(user_id, "P2P peer removed");
+        drop(s);
+        repaint();
+        return;
+    }
+
+    // Convert session_id to fixed array
+    let session_id: [u8; 32] = announce.session_id.try_into().unwrap_or_else(|_| [0u8; 32]);
+
+    let peer_info = crate::events::PeerInfo {
+        user_id,
+        session_id,
+        libp2p_peer_id: announce.libp2p_peer_id,
+        multiaddrs: announce.multiaddrs,
+        supports_relay: announce.supports_relay,
+        supports_p2p_voice: announce.supports_p2p_voice,
+    };
+
+    let mut s = state.write().unwrap();
+    s.p2p_peers.insert(user_id, peer_info);
+    info!(
+        user_id,
+        multiaddrs_count = s.p2p_peers.get(&user_id).map(|p| p.multiaddrs.len()).unwrap_or(0),
+        "P2P peer announced"
+    );
+    drop(s);
+    repaint();
+}
+
+/// Handle a RelayAllocation message from the server.
+/// This provides us with relay details for NAT traversal.
+fn handle_relay_allocation(
+    allocation: proto::RelayAllocation,
+    state: &Arc<RwLock<State>>,
+    repaint: &Arc<dyn Fn() + Send + Sync>,
+) {
+    info!(
+        relay_multiaddr = %allocation.relay_multiaddr,
+        expires_ms = allocation.expires_ms,
+        rate_limit = allocation.rate_limit_bytes_per_sec,
+        "Received relay allocation"
+    );
+
+    // TODO: Store relay allocation for use with P2P connections
+    // For now, just log it. When P2P voice is implemented, we'll use this
+    // to configure the libp2p swarm with the relay address.
+
+    let _ = (state, repaint); // Suppress unused warnings for now
 }
 
 /// Create a QUIC client endpoint with custom certificate verification.

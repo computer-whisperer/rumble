@@ -4,6 +4,10 @@ description = "Rumble client backend library"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+p2p = []
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "bloom", "log", "platform-verifier", "runtime-tokio"] }
@@ -25,11 +29,19 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 url = "2.5.7"
 sha2 = "0.10"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-librqbit = { git = "https://github.com/u6bkep/rqbit.git", rev = "558080c" }
-bencode = { git = "https://github.com/u6bkep/rqbit.git", rev = "558080c", package = "librqbit-bencode" }
+ed25519-dalek = { workspace = true }
+librqbit = { git = "https://github.com/u6bkep/rqbit.git", rev = "712db330" }
+bencode = { git = "https://github.com/u6bkep/rqbit.git", rev = "712db330", package = "librqbit-bencode" }
 hex = "0.4"
 urlencoding = "2"
-rand = "0.9"
+rand = { workspace = true }
+rand_core = { workspace = true }
 tokio-util = "0.7"
 open = "5"
+libp2p = { version = "0.52", features = ["tcp", "tokio", "dns", "noise", "yamux", "ping", "identify", "relay", "request-response", "dcutr", "macros"] }
+async-trait = "0.1"
+blake3 = "1"
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

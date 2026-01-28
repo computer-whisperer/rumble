@@ -21,7 +21,8 @@ pub struct Peer {
     pub downloaded: u64,
     pub left: u64,
     pub last_seen: Instant,
-    pub needs_relay: bool, // Client requested relay mode
+    pub needs_relay: bool,             // Client requested relay mode
+    pub relay_token: Option<[u8; 32]>, // Relay token for NAT traversal
 }
 
 impl Peer {
@@ -121,6 +122,7 @@ impl Tracker {
         left: u64,
         event: Option<api::proto::tracker_announce::Event>,
         needs_relay: bool,
+        relay_token: Option<[u8; 32]>,
     ) -> (u32, u32, Vec<Peer>) {
         let mut swarms = self.swarms.write().await;
         let swarm = swarms.entry(info_hash).or_insert_with(Swarm::new);
@@ -147,6 +149,7 @@ impl Tracker {
                     left,
                     last_seen: Instant::now(),
                     needs_relay,
+                    relay_token,
                 };
                 swarm.peers.insert(peer_id, peer);
             }

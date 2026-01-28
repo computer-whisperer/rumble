@@ -4,3 +4,4 @@ vendor/
 data/
 certs/
 .venv/
+chat_logs/
