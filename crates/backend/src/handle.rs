@@ -2110,11 +2110,23 @@ fn handle_server_message(
                         }
 
                         // Check if this is a file message that should be auto-downloaded
+                        // Skip auto-download if we sent this message (we already have the file)
                         let mut should_auto_download = None;
                         if let Some(file_msg) = crate::events::FileMessage::parse(&cb.text) {
                             let s = read_state(&state);
-                            if s.file_transfer_settings
-                                .should_auto_download(&file_msg.file.mime, file_msg.file.size)
+                            let is_own_message = s
+                                .my_user_id
+                                .and_then(|uid| {
+                                    s.users
+                                        .iter()
+                                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid))
+                                })
+                                .map(|u| u.username == cb.sender)
+                                .unwrap_or(false);
+
+                            if !is_own_message
+                                && s.file_transfer_settings
+                                    .should_auto_download(&file_msg.file.mime, file_msg.file.size)
                             {
                                 // Check we're not already downloading this file
                                 let infohash_bytes = hex::decode(&file_msg.file.infohash).ok();
