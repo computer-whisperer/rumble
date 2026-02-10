@@ -59,6 +59,12 @@ struct MoveRoomModalState {
 struct DownloadModalState {
     open: bool,
     magnet_link: String,
+    validation_error: Option<String>,
+}
+
+/// Validate a magnet link format.
+fn is_valid_magnet(s: &str) -> bool {
+    s.starts_with("magnet:?") && s.contains("xt=urn:btih:")
 }
 
 /// Categories for the settings sidebar
@@ -2744,20 +2750,37 @@ impl RumbleApp {
                 ui.heading("Download File");
                 ui.add_space(8.0);
                 ui.label("Enter Magnet Link:");
-                ui.text_edit_singleline(&mut self.download_modal.magnet_link);
+                let response = ui.text_edit_singleline(&mut self.download_modal.magnet_link);
+                if response.changed() {
+                    // Re-validate on every edit
+                    let link = self.download_modal.magnet_link.trim();
+                    if link.is_empty() {
+                        self.download_modal.validation_error = None;
+                    } else if !is_valid_magnet(link) {
+                        self.download_modal.validation_error = Some(
+                            "Invalid magnet link: must start with \"magnet:?\" and contain \"xt=urn:btih:\""
+                                .to_string(),
+                        );
+                    } else {
+                        self.download_modal.validation_error = None;
+                    }
+                }
+                if let Some(err) = &self.download_modal.validation_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                }
                 ui.add_space(8.0);
+                let link_valid = is_valid_magnet(self.download_modal.magnet_link.trim());
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         self.download_modal.open = false;
                     }
-                    if ui.button("Download").clicked() {
-                        if !self.download_modal.magnet_link.is_empty() {
-                            self.backend.send(Command::DownloadFile {
-                                magnet: self.download_modal.magnet_link.clone(),
-                            });
-                            self.download_modal.open = false;
-                            self.show_transfers = true;
-                        }
+                    let download_btn = ui.add_enabled(link_valid, egui::Button::new("Download"));
+                    if download_btn.clicked() {
+                        self.backend.send(Command::DownloadFile {
+                            magnet: self.download_modal.magnet_link.clone(),
+                        });
+                        self.download_modal.open = false;
+                        self.show_transfers = true;
                     }
                 });
             });
@@ -2777,31 +2800,36 @@ impl RumbleApp {
                                 ui.group(|ui| {
                                     // Status icon and name
                                     let (icon, status_text, color) = match transfer.state {
-                                        TransferState::Pending => ("⏳", "Pending", egui::Color32::GRAY),
-                                        TransferState::Checking => ("🔍", "Checking", egui::Color32::YELLOW),
-                                        TransferState::Downloading => ("↓", "Downloading", egui::Color32::GREEN),
-                                        TransferState::Seeding => ("↑", "Seeding", egui::Color32::LIGHT_BLUE),
-                                        TransferState::Paused => ("⏸", "Paused", egui::Color32::GRAY),
-                                        TransferState::Completed => ("✓", "Complete", egui::Color32::GREEN),
-                                        TransferState::Error => ("✗", "Error", egui::Color32::RED),
+                                        TransferState::Pending => ("\u{231b}", "Pending", egui::Color32::GRAY),
+                                        TransferState::Checking => ("\u{1f50d}", "Verifying...", egui::Color32::YELLOW),
+                                        TransferState::Downloading => {
+                                            ("\u{2b07}", "Downloading", egui::Color32::from_rgb(80, 140, 255))
+                                        }
+                                        TransferState::Seeding => ("\u{2b06}", "Seeding", egui::Color32::GREEN),
+                                        TransferState::Paused => {
+                                            ("\u{23f8}", "Paused", egui::Color32::from_rgb(160, 160, 160))
+                                        }
+                                        TransferState::Completed => ("\u{2714}", "Done", egui::Color32::GREEN),
+                                        TransferState::Error => ("\u{2718}", "Error", egui::Color32::RED),
                                     };
 
                                     ui.horizontal(|ui| {
                                         ui.colored_label(color, icon);
-                                        ui.strong(&transfer.name);
+                                        let name_text = egui::RichText::new(&transfer.name).color(color);
+                                        ui.strong(name_text);
                                     });
 
                                     // Size info
                                     let size_str = format_size(transfer.size);
                                     ui.horizontal(|ui| {
-                                        ui.label(format!("{} · {}", size_str, status_text));
+                                        ui.colored_label(color, format!("{} \u{00b7} {}", size_str, status_text));
                                         if transfer.peers > 0 {
-                                            ui.label(format!("· {} peers", transfer.peers));
+                                            ui.label(format!("\u{00b7} {} peers", transfer.peers));
                                         }
                                     });
 
-                                    // Progress bar (show for downloading/checking)
-                                    if matches!(transfer.state, TransferState::Downloading | TransferState::Checking) {
+                                    // Progress bar for downloading
+                                    if matches!(transfer.state, TransferState::Downloading) {
                                         ui.add(
                                             egui::ProgressBar::new(transfer.progress)
                                                 .show_percentage()
@@ -2812,29 +2840,47 @@ impl RumbleApp {
                                         if transfer.download_speed > 0 || transfer.upload_speed > 0 {
                                             ui.horizontal(|ui| {
                                                 if transfer.download_speed > 0 {
-                                                    ui.label(format!("↓ {}/s", format_size(transfer.download_speed)));
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(80, 140, 255),
+                                                        format!("\u{2b07} {}/s", format_size(transfer.download_speed)),
+                                                    );
                                                 }
                                                 if transfer.upload_speed > 0 {
-                                                    ui.label(format!("↑ {}/s", format_size(transfer.upload_speed)));
+                                                    ui.colored_label(
+                                                        egui::Color32::GREEN,
+                                                        format!("\u{2b06} {}/s", format_size(transfer.upload_speed)),
+                                                    );
                                                 }
                                             });
                                         }
+                                    }
+
+                                    // Progress bar for checking/verifying
+                                    if matches!(transfer.state, TransferState::Checking) {
+                                        ui.add(
+                                            egui::ProgressBar::new(transfer.progress)
+                                                .show_percentage()
+                                                .animate(true),
+                                        );
                                     }
 
                                     // Seeding stats
                                     if matches!(transfer.state, TransferState::Seeding) {
                                         ui.horizontal(|ui| {
                                             if transfer.upload_speed > 0 {
-                                                ui.label(format!("↑ {}/s", format_size(transfer.upload_speed)));
+                                                ui.colored_label(
+                                                    egui::Color32::GREEN,
+                                                    format!("\u{2b06} {}/s", format_size(transfer.upload_speed)),
+                                                );
                                             } else {
-                                                ui.label("Seeding...");
+                                                ui.colored_label(egui::Color32::GREEN, "Seeding...");
                                             }
                                         });
                                     }
 
                                     // Error message
                                     if let Some(err) = &transfer.error {
-                                        ui.colored_label(egui::Color32::RED, format!("Error: {}", err));
+                                        ui.colored_label(egui::Color32::RED, format!("\u{26a0} {}", err));
                                     }
 
                                     // Peer details (collapsible)

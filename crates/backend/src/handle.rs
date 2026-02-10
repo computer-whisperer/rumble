@@ -72,6 +72,79 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// Detect MIME type from a filename's extension.
+fn mime_from_extension(filename: &str) -> Option<String> {
+    let ext = filename.rsplit('.').next()?.to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        // Images
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        // Audio
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        "opus" => "audio/opus",
+        "m4a" => "audio/mp4",
+        // Video
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "mov" => "video/quicktime",
+        // Documents
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" => "application/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "md" => "text/markdown",
+        // Archives
+        "zip" => "application/zip",
+        "gz" | "gzip" => "application/gzip",
+        "tar" => "application/x-tar",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "xz" => "application/x-xz",
+        // Other
+        "exe" => "application/octet-stream",
+        "wasm" => "application/wasm",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+/// Map a raw error message to a user-friendly description.
+fn friendly_download_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("connection refused") {
+        "Could not reach any peers sharing this file".to_string()
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "Download timed out \u{2014} peers may be offline".to_string()
+    } else if lower.contains("no such file") || lower.contains("not found") {
+        "File not found \u{2014} the magnet link may be invalid or expired".to_string()
+    } else if lower.contains("no peers") || lower.contains("no seeds") {
+        "No peers available \u{2014} nobody is currently sharing this file".to_string()
+    } else if lower.contains("invalid magnet") || lower.contains("invalid info hash") {
+        "Invalid magnet link \u{2014} please check the link and try again".to_string()
+    } else if lower.contains("disk") || lower.contains("no space") || lower.contains("permission denied") {
+        "Disk error \u{2014} check available space and file permissions".to_string()
+    } else if lower.contains("dns") || lower.contains("resolve") {
+        "Network error \u{2014} could not resolve tracker address".to_string()
+    } else {
+        format!("Download failed: {}", raw)
+    }
+}
+
 /// A handle to the backend that can be used from UI code.
 ///
 /// This type manages the tokio runtime, async connection, audio subsystem,
@@ -505,18 +578,23 @@ async fn run_connection_task(
                                 })
                                 .unwrap_or_default();
 
-                            // Get error message if in error state
+                            // Get error message if in error state, with user-friendly mapping
                             let error = if matches!(state, crate::events::TransferState::Error) {
-                                stats.error.clone()
+                                stats
+                                    .error
+                                    .as_deref()
+                                    .map(friendly_download_error)
                             } else {
                                 None
                             };
+
+                            let mime = mime_from_extension(&name);
 
                             transfers.push(crate::events::FileTransferState {
                                 infohash: info_hash.0,
                                 name,
                                 size: stats.total_bytes,
-                                mime: None, // TODO: detect from filename extension
+                                mime,
                                 progress,
                                 download_speed,
                                 upload_speed,
@@ -1301,11 +1379,12 @@ async fn run_connection_task(
                                         }
                                         Err(e) => {
                                             error!("Failed to download via P2P: {}", e);
+                                            let msg = friendly_download_error(&e.to_string());
                                             let mut s = write_state(&state);
                                             s.chat_messages.push(crate::events::ChatMessage {
                                                 id: uuid::Uuid::new_v4().into_bytes(),
                                                 sender: "System".to_string(),
-                                                text: format!("Failed P2P download: {}", e),
+                                                text: msg,
                                                 timestamp: SystemTime::now(),
                                                 is_local: true,
                                             });
@@ -1339,11 +1418,12 @@ async fn run_connection_task(
                                     }
                                     Err(e) => {
                                         error!("Failed to download file: {}", e);
+                                        let msg = friendly_download_error(&e.to_string());
                                         let mut s = write_state(&state);
                                         s.chat_messages.push(crate::events::ChatMessage {
                                             id: uuid::Uuid::new_v4().into_bytes(),
                                             sender: "System".to_string(),
-                                            text: format!("Failed to download file: {}", e),
+                                            text: msg,
                                             timestamp: SystemTime::now(),
                                             is_local: true,
                                         });
