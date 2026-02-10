@@ -54,6 +54,14 @@ struct MoveRoomModalState {
     new_parent_name: String,
 }
 
+/// State for the delete room confirmation modal
+#[derive(Default)]
+struct DeleteRoomModalState {
+    open: bool,
+    room_id: Option<Uuid>,
+    room_name: String,
+}
+
 /// State for the download file modal
 #[derive(Default)]
 struct DownloadModalState {
@@ -202,6 +210,9 @@ pub struct RumbleApp {
 
     // Download file modal state
     download_modal: DownloadModalState,
+
+    // Delete room confirmation modal state
+    delete_room_modal: DeleteRoomModalState,
 
     // Settings modal state with pending changes
     settings_modal: SettingsModalState,
@@ -441,6 +452,7 @@ impl RumbleApp {
             rename_modal: RenameModalState::default(),
             move_room_modal: MoveRoomModalState::default(),
             download_modal: DownloadModalState::default(),
+            delete_room_modal: DeleteRoomModalState::default(),
             settings_modal: SettingsModalState::default(),
             push_to_talk_active: false,
             portal_hotkeys_available: false,
@@ -3503,21 +3515,21 @@ impl RumbleApp {
                             ui.separator();
                         });
                         strip.cell(|ui| {
-                            ui.horizontal(|ui| {
-                                let send = {
-                                    let resp = ui.text_edit_singleline(&mut self.chat_input);
-                                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                } || ui.button("Send").clicked();
-                                if send {
-                                    let text = self.chat_input.trim();
-                                    if !text.is_empty() && state.connection.is_connected() {
-                                        self.backend.send(Command::SendChat { text: text.to_owned() });
-                                        self.chat_input.clear();
+                            let connected = state.connection.is_connected();
+                            if connected {
+                                ui.horizontal(|ui| {
+                                    let send = {
+                                        let resp = ui.text_edit_singleline(&mut self.chat_input);
+                                        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    } || ui.button("Send").clicked();
+                                    if send {
+                                        let text = self.chat_input.trim();
+                                        if !text.is_empty() {
+                                            self.backend.send(Command::SendChat { text: text.to_owned() });
+                                            self.chat_input.clear();
+                                        }
                                     }
-                                }
 
-                                // Sync history button
-                                if state.connection.is_connected() {
                                     if ui
                                         .button("↻ Sync")
                                         .on_hover_text("Request chat history from peers")
@@ -3525,8 +3537,17 @@ impl RumbleApp {
                                     {
                                         self.backend.send(Command::RequestChatHistory);
                                     }
-                                }
-                            });
+                                });
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled(
+                                        false,
+                                        egui::TextEdit::singleline(&mut self.chat_input)
+                                            .hint_text("Connect to a server to chat"),
+                                    );
+                                    ui.add_enabled(false, egui::Button::new("Send"));
+                                });
+                            }
                         });
                     });
             });
@@ -3555,6 +3576,7 @@ impl RumbleApp {
                 // Collect pending commands to execute after tree view
                 let mut pending_commands: Vec<Command> = Vec::new();
                 let mut pending_rename: Option<(Option<Uuid>, String)> = None;
+                let mut pending_delete: Option<(Uuid, String)> = None;
 
                 // Build set of rooms that have users in them or in any descendant
                 let mut rooms_with_users: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
@@ -3577,6 +3599,7 @@ impl RumbleApp {
                             rooms_with_users: &std::collections::HashSet<Uuid>,
                             pending_commands: &mut Vec<Command>,
                             pending_rename: &mut Option<(Option<Uuid>, String)>,
+                            pending_delete: &mut Option<(Uuid, String)>,
                             builder: &mut egui_ltreeview::TreeViewBuilder<TreeNodeId>,
                         ) {
                             let Some(tree_node) = state.room_tree.get(room_id) else {
@@ -3586,16 +3609,30 @@ impl RumbleApp {
                             let is_current = state.my_room_id == Some(room_id);
                             let is_root = room_id == api::ROOT_ROOM_UUID;
                             let has_users_in_subtree = rooms_with_users.contains(&room_id);
+                            let user_count = state.users_in_room(room_id).len();
 
                             // Capture values for context menu closure
                             let room_name = tree_node.name.clone();
                             let parent_id = tree_node.parent_id;
                             let my_room_id = state.my_room_id;
 
-                            let room_label = if is_current {
-                                format!("📁 {}  (current)", room_name)
+                            let room_label = {
+                                let count_suffix = if user_count > 0 {
+                                    format!(" ({})", user_count)
+                                } else {
+                                    String::new()
+                                };
+                                if is_current {
+                                    format!("📁 {}{}  [current]", room_name, count_suffix)
+                                } else {
+                                    format!("📁 {}{}", room_name, count_suffix)
+                                }
+                            };
+
+                            let room_label = if user_count == 0 && !is_current {
+                                egui::RichText::new(room_label).weak()
                             } else {
-                                format!("📁 {}", room_name)
+                                egui::RichText::new(room_label)
                             };
 
                             let room_node = NodeBuilder::dir(TreeNodeId::Room(room_id))
@@ -3633,7 +3670,7 @@ impl RumbleApp {
                                         ui.close();
                                     }
                                     if !is_root && ui.button("Delete Room").clicked() {
-                                        pending_commands.push(Command::DeleteRoom { room_id });
+                                        *pending_delete = Some((room_id, room_name.clone()));
                                         ui.close();
                                     }
                                 });
@@ -3654,6 +3691,7 @@ impl RumbleApp {
                                         rooms_with_users,
                                         pending_commands,
                                         pending_rename,
+                                        pending_delete,
                                         builder,
                                     );
                                 }
@@ -3848,6 +3886,7 @@ impl RumbleApp {
                                 &rooms_with_users,
                                 &mut pending_commands,
                                 &mut pending_rename,
+                                &mut pending_delete,
                                 builder,
                             );
                         }
@@ -3909,6 +3948,15 @@ impl RumbleApp {
                     self.rename_modal = RenameModalState {
                         open: true,
                         room_uuid,
+                        room_name,
+                    };
+                }
+
+                // Handle delete room confirmation
+                if let Some((room_id, room_name)) = pending_delete {
+                    self.delete_room_modal = DeleteRoomModalState {
+                        open: true,
+                        room_id: Some(room_id),
                         room_name,
                     };
                 }
@@ -4281,6 +4329,48 @@ impl RumbleApp {
             });
             if modal.should_close() {
                 self.move_room_modal.open = false;
+            }
+        }
+
+        // Delete room confirmation modal
+        if self.delete_room_modal.open {
+            let modal = Modal::new(egui::Id::new("delete_room_modal")).show(ctx, |ui| {
+                ui.set_width(350.0);
+                ui.heading("Delete Room");
+                ui.add_space(8.0);
+
+                ui.label(format!(
+                    "Are you sure you want to delete room '{}'?",
+                    self.delete_room_modal.room_name
+                ));
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("This cannot be undone.").weak());
+
+                ui.add_space(12.0);
+                ui.separator();
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new("Delete").color(egui::Color32::RED),
+                            ))
+                            .clicked()
+                        {
+                            if let Some(room_id) = self.delete_room_modal.room_id {
+                                self.backend.send(Command::DeleteRoom { room_id });
+                            }
+                            ui.close();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ui.close();
+                        }
+                    },
+                );
+            });
+            if modal.should_close() {
+                self.delete_room_modal.open = false;
             }
         }
     }
