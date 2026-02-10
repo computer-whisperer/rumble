@@ -71,12 +71,20 @@ struct DownloadModalState {
     validation_error: Option<String>,
 }
 
-/// State for the image view modal (click-to-enlarge)
+/// State for the image view modal (click-to-enlarge with zoom/pan)
 #[derive(Default)]
 struct ImageViewModalState {
     open: bool,
     image_uri: String,
     image_name: String,
+    /// Path to the full-resolution image file on disk
+    file_path: Option<PathBuf>,
+    /// Current zoom level (1.0 = fit to modal)
+    zoom: f32,
+    /// Pan offset for scrolling within the zoomed image
+    pan_offset: egui::Vec2,
+    /// Whether the full-resolution image has been loaded into the cache
+    fullsize_loaded: bool,
 }
 
 /// Validate a magnet link format.
@@ -3592,8 +3600,15 @@ impl RumbleApp {
                                                                 if response.clicked() {
                                                                     self.image_view_modal = ImageViewModalState {
                                                                         open: true,
-                                                                        image_uri: uri.clone(),
+                                                                        image_uri: format!(
+                                                                            "bytes://file_fullsize/{}",
+                                                                            infohash_hex
+                                                                        ),
                                                                         image_name: file_msg.file.name.clone(),
+                                                                        file_path: Some(path.clone()),
+                                                                        zoom: 1.0,
+                                                                        pan_offset: egui::Vec2::ZERO,
+                                                                        fullsize_loaded: false,
                                                                     };
                                                                 }
                                                                 image_shown = true;
@@ -4638,29 +4653,132 @@ impl RumbleApp {
             }
         }
 
-        // Image View Modal (click-to-enlarge)
+        // Image View Modal (click-to-enlarge with zoom/pan)
         if self.image_view_modal.open {
+            // Load the full-resolution image from disk if not yet cached
+            if !self.image_view_modal.fullsize_loaded {
+                if let Some(ref path) = self.image_view_modal.file_path {
+                    let uri = &self.image_view_modal.image_uri;
+                    let already_cached = ctx.try_load_bytes(uri).is_ok();
+                    if !already_cached {
+                        if let Ok(bytes) = std::fs::read(path) {
+                            ctx.include_bytes(uri.clone(), bytes);
+                        }
+                    }
+                }
+                self.image_view_modal.fullsize_loaded = true;
+            }
+
+            // Handle Ctrl+Scroll zoom before the modal consumes events
+            let ctrl_scroll_zoom = ctx.input(|i| {
+                if i.modifiers.ctrl {
+                    // Use raw scroll events when Ctrl is held
+                    let delta = i.smooth_scroll_delta.y;
+                    if delta != 0.0 { Some(delta) } else { None }
+                } else {
+                    None
+                }
+            });
+            if let Some(delta) = ctrl_scroll_zoom {
+                let zoom_factor = 1.0 + delta * 0.005;
+                self.image_view_modal.zoom = (self.image_view_modal.zoom * zoom_factor).clamp(0.25, 10.0);
+            }
+
             let modal = Modal::new(egui::Id::new("image_view_modal")).show(ctx, |ui| {
-                ui.heading(&self.image_view_modal.image_name);
+                // Header with image name and zoom controls
+                ui.horizontal(|ui| {
+                    ui.heading(&self.image_view_modal.image_name);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            ui.close();
+                        }
+                        if ui
+                            .button("Fit")
+                            .on_hover_text("Reset zoom to fit image in window")
+                            .clicked()
+                        {
+                            self.image_view_modal.zoom = 1.0;
+                            self.image_view_modal.pan_offset = egui::Vec2::ZERO;
+                        }
+                        if ui.button("+").clicked() {
+                            self.image_view_modal.zoom = (self.image_view_modal.zoom * 1.25).clamp(0.25, 10.0);
+                        }
+                        if ui.button("\u{2212}").clicked() {
+                            // Unicode minus sign
+                            self.image_view_modal.zoom = (self.image_view_modal.zoom / 1.25).clamp(0.25, 10.0);
+                        }
+                        ui.label(format!("{:.0}%", self.image_view_modal.zoom * 100.0));
+                    });
+                });
                 ui.add_space(4.0);
 
-                let available = ui.available_size();
-                let screen = ctx.screen_rect();
-                let viewport_width = screen.width();
-                let viewport_height = screen.height();
-                let max_width = available.x.min(viewport_width * 0.9);
-                let max_height = (viewport_height * 0.9) - 80.0; // Leave room for heading and button
+                // Calculate the viewport for the image
+                let content_rect = ctx.content_rect();
+                let viewport_width = content_rect.width();
+                let viewport_height = content_rect.height();
+                let max_width = ui.available_width().min(viewport_width * 0.9);
+                let max_height = (viewport_height * 0.9) - 80.0;
 
-                ui.add(
-                    egui::Image::new(&self.image_view_modal.image_uri)
-                        .max_width(max_width)
-                        .max_height(max_height)
-                        .corner_radius(4.0),
-                );
+                // Get the native image size to compute fitted dimensions
+                let image_uri = &self.image_view_modal.image_uri;
+                let image_size = ui
+                    .ctx()
+                    .try_load_texture(
+                        image_uri,
+                        egui::TextureOptions::LINEAR,
+                        egui::SizeHint::Scale(1.0.into()),
+                    )
+                    .ok()
+                    .and_then(|poll| match poll {
+                        egui::load::TexturePoll::Ready { texture } => Some(texture.size),
+                        _ => None,
+                    });
 
-                ui.add_space(8.0);
-                if ui.button("Close").clicked() {
-                    ui.close();
+                let zoom = self.image_view_modal.zoom;
+
+                if let Some(native_size) = image_size {
+                    // Compute the fitted size at zoom 1.0 (fit to viewport)
+                    let aspect = native_size.x / native_size.y;
+                    let (fit_w, fit_h) = if max_width / max_height > aspect {
+                        (max_height * aspect, max_height)
+                    } else {
+                        (max_width, max_width / aspect)
+                    };
+
+                    // Apply zoom to the fitted dimensions
+                    let zoomed_w = fit_w * zoom;
+                    let zoomed_h = fit_h * zoom;
+
+                    // ScrollArea for panning when zoomed in (scroll without Ctrl)
+                    let scroll_w = max_width.min(zoomed_w);
+                    let scroll_h = max_height.min(zoomed_h);
+
+                    egui::ScrollArea::both()
+                        .max_width(scroll_w)
+                        .max_height(scroll_h)
+                        .auto_shrink([true, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Image::new(image_uri)
+                                    .fit_to_exact_size(egui::vec2(zoomed_w, zoomed_h))
+                                    .corner_radius(4.0),
+                            );
+                        });
+
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Ctrl+Scroll to zoom, scroll to pan")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                } else {
+                    // Fallback if texture not yet loaded
+                    ui.add(
+                        egui::Image::new(image_uri)
+                            .max_width(max_width)
+                            .max_height(max_height)
+                            .corner_radius(4.0),
+                    );
                 }
             });
             if modal.should_close() {
