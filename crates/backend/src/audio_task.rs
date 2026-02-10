@@ -37,7 +37,7 @@ use pipeline;
 use prost::Message;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -499,14 +499,20 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     // Transmission State Machine
     // =========================================================================
     //
-    // Instead of scattered logic, we use a declarative approach:
-    // 1. should_transmit() - pure function that determines desired state
-    // 2. sync_transmission_state() - ensures actual state matches desired state
+    // The audio input stream is connection-scoped: created when a connection is
+    // established and kept alive until disconnection. This avoids ALSA device
+    // enumeration errors (e.g., OSS emulation `/dev/dsp` failures) on every
+    // PTT press/release cycle.
     //
-    // Every handler that changes relevant state just calls sync_transmission_state()
-    // after updating its piece, eliminating bugs from inconsistent logic.
+    // A shared `capture_active` flag controls whether captured samples are
+    // processed and encoded or silently discarded. The `should_capture()` function
+    // determines the desired state, and `sync_transmission!` toggles the flag
+    // (and sends EOS when stopping) instead of creating/destroying the stream.
+    //
+    // The stream is only recreated for device changes, settings changes, or
+    // disconnection.
 
-    /// Determine if we should be capturing audio based on current state.
+    /// Determine if we should be processing captured audio based on current state.
     /// Note: VAD is a pipeline processor, not a voice mode. In Continuous mode
     /// with VAD enabled, the pipeline's suppress flag gates actual transmission.
     #[inline]
@@ -520,6 +526,10 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
         }
     }
 
+    // Shared flag: when true, the capture callback processes samples; when false, it discards them.
+    let capture_active = Arc::new(AtomicBool::new(false));
+    let capture_active_for_callback = capture_active.clone();
+
     // Interval for cleaning up stale talking_users
     let mut cleanup_interval = tokio::time::interval(Duration::from_millis(500));
 
@@ -531,32 +541,34 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
     info!("Audio task started");
 
-    /// Macro to sync capture state after any state change.
-    /// This ensures capture is started/stopped to match the desired state.
+    /// Macro to sync the capture_active flag after any state change.
+    /// This toggles whether captured samples are processed or discarded,
+    /// WITHOUT creating/destroying the audio input stream.
+    /// The audio input stream lifecycle is managed separately (connection-scoped).
     macro_rules! sync_transmission {
         () => {{
             let want = should_capture(voice_mode, self_muted, ptt_active, connection.is_some());
-            let have = audio_input.is_some();
+            let have = capture_active.load(std::sync::atomic::Ordering::Relaxed);
 
             if want && !have {
-                start_transmission(
-                    &audio_system,
-                    &selected_input,
-                    &encoded_tx,
-                    &audio_settings,
-                    &tx_pipeline_config,
-                    &processor_registry,
-                    &encoder,
-                    &mut audio_input,
-                    &state,
-                    &repaint,
-                    &audio_dumper,
-                );
+                capture_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                {
+                    let mut s = write_state(&state);
+                    s.audio.is_transmitting = true;
+                }
+                repaint();
+                info!("Capture activated (samples will be processed)");
             } else if !want && have {
-                // Send end-of-stream before stopping transmission
+                // Send end-of-stream before deactivating
                 // (PTT released, muted, disconnected, etc.)
                 let _ = encoded_tx.send(CaptureMessage::EndOfStream);
-                stop_transmission(&mut audio_input, &state, &repaint);
+                capture_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                {
+                    let mut s = write_state(&state);
+                    s.audio.is_transmitting = false;
+                }
+                repaint();
+                info!("Capture deactivated (samples will be discarded)");
             }
         }};
     }
@@ -603,7 +615,27 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             audio_output = start_audio_output(&audio_system, &selected_output);
                         }
 
-                        // Sync transmission state
+                        // Create connection-scoped audio input stream (unless muted).
+                        // The stream stays alive for the entire connection to avoid
+                        // ALSA device enumeration on every PTT press.
+                        if audio_input.is_none() && !self_muted {
+                            start_transmission(
+                                &audio_system,
+                                &selected_input,
+                                &encoded_tx,
+                                &audio_settings,
+                                &tx_pipeline_config,
+                                &processor_registry,
+                                &encoder,
+                                &capture_active_for_callback,
+                                &mut audio_input,
+                                &state,
+                                &repaint,
+                                &audio_dumper,
+                            );
+                        }
+
+                        // Sync transmission state (toggles capture_active flag)
                         sync_transmission!();
                     }
 
@@ -612,8 +644,11 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         connection = None;
                         my_user_id = 0;
 
-                        // Stop transmission (sync will handle this since connected=false)
+                        // Deactivate capture first (sync will handle this since connected=false)
                         sync_transmission!();
+
+                        // Destroy connection-scoped audio input stream
+                        stop_transmission(&mut audio_input, &state, &repaint);
 
                         // Destroy connection-scoped encoder
                         if let Ok(mut guard) = encoder.lock() {
@@ -642,11 +677,27 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         }
                         repaint();
 
-                        // Restart input if currently transmitting (need to use new device)
+                        // Restart input stream if connected (need to use new device)
                         if audio_input.is_some() {
                             stop_transmission(&mut audio_input, &state, &repaint);
-                            sync_transmission!();
                         }
+                        if connection.is_some() && !self_muted {
+                            start_transmission(
+                                &audio_system,
+                                &selected_input,
+                                &encoded_tx,
+                                &audio_settings,
+                                &tx_pipeline_config,
+                                &processor_registry,
+                                &encoder,
+                                &capture_active_for_callback,
+                                &mut audio_input,
+                                &state,
+                                &repaint,
+                                &audio_dumper,
+                            );
+                        }
+                        sync_transmission!();
                     }
 
                     AudioCommand::SetOutputDevice { device_id } => {
@@ -691,12 +742,36 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             s.audio.self_muted = muted;
                         }
                         repaint();
-                        sync_transmission!();
+
+                        // Manage stream lifecycle on mute changes:
+                        // Muted -> destroy stream (no point capturing)
+                        // Unmuted + connected -> create stream
+                        if muted {
+                            sync_transmission!();
+                            stop_transmission(&mut audio_input, &state, &repaint);
+                        } else if connection.is_some() && audio_input.is_none() {
+                            start_transmission(
+                                &audio_system,
+                                &selected_input,
+                                &encoded_tx,
+                                &audio_settings,
+                                &tx_pipeline_config,
+                                &processor_registry,
+                                &encoder,
+                                &capture_active_for_callback,
+                                &mut audio_input,
+                                &state,
+                                &repaint,
+                                &audio_dumper,
+                            );
+                            sync_transmission!();
+                        }
                     }
 
                     AudioCommand::SetDeafened { deafened } => {
                         self_deafened = deafened;
                         // Deafen implies mute
+                        let was_muted = self_muted;
                         if deafened && !self_muted {
                             self_muted = true;
                         }
@@ -719,7 +794,29 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             audio_output = start_audio_output(&audio_system, &selected_output);
                         }
 
-                        sync_transmission!();
+                        // Manage stream lifecycle on mute state change
+                        if self_muted && !was_muted {
+                            sync_transmission!();
+                            stop_transmission(&mut audio_input, &state, &repaint);
+                        } else if !self_muted && was_muted && connection.is_some() && audio_input.is_none() {
+                            start_transmission(
+                                &audio_system,
+                                &selected_input,
+                                &encoded_tx,
+                                &audio_settings,
+                                &tx_pipeline_config,
+                                &processor_registry,
+                                &encoder,
+                                &capture_active_for_callback,
+                                &mut audio_input,
+                                &state,
+                                &repaint,
+                                &audio_dumper,
+                            );
+                            sync_transmission!();
+                        } else {
+                            sync_transmission!();
+                        }
                     }
 
                     AudioCommand::MuteUser { user_id } => {
@@ -762,9 +859,25 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         }
                         repaint();
 
-                        // If currently transmitting, stop and restart with new settings
+                        // Recreate stream with new settings if connected
                         if audio_input.is_some() {
                             stop_transmission(&mut audio_input, &state, &repaint);
+                        }
+                        if connection.is_some() && !self_muted {
+                            start_transmission(
+                                &audio_system,
+                                &selected_input,
+                                &encoded_tx,
+                                &audio_settings,
+                                &tx_pipeline_config,
+                                &processor_registry,
+                                &encoder,
+                                &capture_active_for_callback,
+                                &mut audio_input,
+                                &state,
+                                &repaint,
+                                &audio_dumper,
+                            );
                         }
                         sync_transmission!();
                     }
@@ -799,11 +912,27 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         }
                         repaint();
 
-                        // Restart transmission to rebuild pipeline with new config
+                        // Recreate stream to rebuild pipeline with new config
                         if audio_input.is_some() {
                             stop_transmission(&mut audio_input, &state, &repaint);
-                            sync_transmission!();
                         }
+                        if connection.is_some() && !self_muted {
+                            start_transmission(
+                                &audio_system,
+                                &selected_input,
+                                &encoded_tx,
+                                &audio_settings,
+                                &tx_pipeline_config,
+                                &processor_registry,
+                                &encoder,
+                                &capture_active_for_callback,
+                                &mut audio_input,
+                                &state,
+                                &repaint,
+                                &audio_dumper,
+                            );
+                        }
+                        sync_transmission!();
                     }
 
                     AudioCommand::UpdateRxPipelineDefaults { config } => {
@@ -1124,7 +1253,12 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     }
 }
 
-/// Start audio transmission (input capture + encoding).
+/// Start audio input stream (connection-scoped).
+///
+/// The stream is created once and kept alive for the duration of the connection.
+/// The `capture_active` flag controls whether captured samples are processed and
+/// encoded (true) or silently discarded (false). This avoids ALSA device
+/// enumeration errors on every PTT press/release cycle.
 fn start_transmission(
     audio_system: &AudioSystem,
     selected_input: &Option<String>,
@@ -1133,13 +1267,14 @@ fn start_transmission(
     tx_pipeline_config: &pipeline::PipelineConfig,
     processor_registry: &pipeline::ProcessorRegistry,
     encoder: &Arc<std::sync::Mutex<Option<VoiceEncoder>>>,
+    capture_active: &Arc<AtomicBool>,
     audio_input: &mut Option<AudioInput>,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_dumper: &AudioDumper,
 ) {
     if audio_input.is_some() {
-        return; // Already transmitting
+        return; // Stream already exists
     }
 
     // Get input device
@@ -1188,6 +1323,7 @@ fn start_transmission(
 
     // Clone Arc for use in callback
     let encoder_for_callback = encoder.clone();
+    let capture_active_for_callback = capture_active.clone();
 
     // Build the TX pipeline from config
     let tx_pipeline = match pipeline::AudioPipeline::from_config(tx_pipeline_config, processor_registry) {
@@ -1229,6 +1365,19 @@ fn start_transmission(
         let remaining = frames_to_discard_for_callback.load(std::sync::atomic::Ordering::Relaxed);
         if remaining > 0 {
             frames_to_discard_for_callback.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+
+        // Check if capture is active (PTT pressed, continuous mode, etc.)
+        // When inactive, silently discard samples to keep the stream alive
+        // without triggering ALSA device re-enumeration.
+        if !capture_active_for_callback.load(std::sync::atomic::Ordering::Relaxed) {
+            // Still send EOS if we were previously transmitting
+            let was_tx = was_transmitting_for_callback.load(std::sync::atomic::Ordering::Relaxed);
+            if was_tx {
+                was_transmitting_for_callback.store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = encoded_tx.send(CaptureMessage::EndOfStream);
+            }
             return;
         }
 
@@ -1304,13 +1453,8 @@ fn start_transmission(
     match input {
         Ok(input) => {
             *audio_input = Some(input);
-            {
-                let mut s = write_state(&state);
-                s.audio.is_transmitting = true;
-            }
-            repaint();
             info!(
-                "Started audio transmission with pipeline ({} processors)",
+                "Started connection-scoped audio input stream with pipeline ({} processors)",
                 tx_pipeline_config.processors.len()
             );
         }
@@ -1320,26 +1464,22 @@ fn start_transmission(
     }
 }
 
-/// Stop audio transmission.
+/// Stop and destroy the audio input stream.
+///
+/// This destroys the underlying cpal stream. It should only be called on
+/// disconnection, device change, settings change, or mute - NOT on PTT release.
+/// The `capture_active` flag (managed by `sync_transmission!`) handles PTT gating.
 fn stop_transmission(
     audio_input: &mut Option<AudioInput>,
-    state: &Arc<RwLock<State>>,
-    repaint: &Arc<dyn Fn() + Send + Sync>,
+    _state: &Arc<RwLock<State>>,
+    _repaint: &Arc<dyn Fn() + Send + Sync>,
 ) {
     if audio_input.is_none() {
-        return; // Not transmitting
+        return; // No stream to destroy
     }
 
-    // The encoder is owned by the AudioInput's callback closure,
-    // so it will be dropped when we drop the AudioInput.
     *audio_input = None;
-
-    {
-        let mut s = write_state(&state);
-        s.audio.is_transmitting = false;
-    }
-    repaint();
-    info!("Stopped audio transmission");
+    info!("Destroyed audio input stream");
 }
 
 /// Start audio output for playback.
@@ -1724,7 +1864,7 @@ mod tests {
         assert!(!should_capture(VoiceMode::PushToTalk, true, true, true));
     }
 
-    /// Test sync_transmission logic: updating settings while in continuous mode
+    /// Test sync_transmission logic: activates capture flag in continuous mode
     #[test]
     fn test_sync_transmission_continuous_mode() {
         let voice_mode = VoiceMode::Continuous;
@@ -1732,85 +1872,90 @@ mod tests {
         let ptt_active = false;
         let connected = true;
 
-        // Simulate stopping for settings update
-        let mut audio_input_present = false;
+        // sync_transmission! now toggles capture_active flag, not stream existence
+        let mut capture_active = false;
 
-        // sync_transmission! would do:
         let want = should_capture(voice_mode, self_muted, ptt_active, connected);
-        let have = audio_input_present;
+        let have = capture_active;
 
         if want && !have {
-            audio_input_present = true; // start_transmission would be called
+            capture_active = true; // Flag activated
         } else if !want && have {
-            audio_input_present = false; // stop_transmission would be called
+            capture_active = false; // Flag deactivated
         }
 
-        assert!(audio_input_present, "Should restart capture in continuous mode");
+        assert!(capture_active, "Should activate capture in continuous mode");
     }
 
-    /// Test sync_transmission logic: muting stops capture
+    /// Test sync_transmission logic: muting deactivates capture flag
     #[test]
     fn test_sync_transmission_mute() {
         let voice_mode = VoiceMode::Continuous;
         let self_muted = true; // NOW MUTED
         let ptt_active = false;
         let connected = true;
-        let mut audio_input_present = true; // Currently capturing
+        let mut capture_active = true; // Currently active
 
         let want = should_capture(voice_mode, self_muted, ptt_active, connected);
-        let have = audio_input_present;
+        let have = capture_active;
 
         if want && !have {
-            audio_input_present = true;
+            capture_active = true;
         } else if !want && have {
-            audio_input_present = false; // stop_transmission should be called
+            capture_active = false; // Flag deactivated
         }
 
-        assert!(!audio_input_present, "Should stop capture when muted");
+        assert!(!capture_active, "Should deactivate capture when muted");
     }
 
-    /// Test sync_transmission logic: unmuting resumes capture
+    /// Test sync_transmission logic: unmuting reactivates capture flag
     #[test]
     fn test_sync_transmission_unmute() {
         let voice_mode = VoiceMode::Continuous;
         let self_muted = false; // UNMUTED
         let ptt_active = false;
         let connected = true;
-        let mut audio_input_present = false; // Currently not capturing (was muted)
+        let mut capture_active = false; // Currently inactive (was muted)
 
         let want = should_capture(voice_mode, self_muted, ptt_active, connected);
-        let have = audio_input_present;
+        let have = capture_active;
 
         if want && !have {
-            audio_input_present = true; // start_transmission should be called
+            capture_active = true; // Flag activated
         } else if !want && have {
-            audio_input_present = false;
+            capture_active = false;
         }
 
         assert!(
-            audio_input_present,
-            "Should resume capture when unmuted in continuous mode"
+            capture_active,
+            "Should reactivate capture when unmuted in continuous mode"
         );
     }
 
-    /// Test sync_transmission logic: PTT release in PTT mode
+    /// Test sync_transmission logic: PTT release deactivates capture flag
+    /// but does NOT destroy the audio stream (stream is connection-scoped)
     #[test]
     fn test_sync_transmission_ptt_release() {
         let voice_mode = VoiceMode::PushToTalk;
         let self_muted = false;
         let ptt_active = false; // PTT released
         let connected = true;
-        let mut audio_input_present = true; // Was capturing
+        let mut capture_active = true; // Was active
+        let audio_stream_alive = true; // Stream is connection-scoped
 
         let want = should_capture(voice_mode, self_muted, ptt_active, connected);
-        let have = audio_input_present;
+        let have = capture_active;
 
         if want && !have {
-            audio_input_present = true;
+            capture_active = true;
         } else if !want && have {
-            audio_input_present = false; // stop_transmission should be called
+            capture_active = false; // Flag deactivated, but stream stays alive
         }
 
-        assert!(!audio_input_present, "Should stop capture when PTT released");
+        assert!(!capture_active, "Should deactivate capture when PTT released");
+        assert!(
+            audio_stream_alive,
+            "Audio stream should remain alive (connection-scoped)"
+        );
     }
 }
