@@ -29,15 +29,6 @@ impl Renderer {
     pub fn render(&mut self, ctx: &egui::Context, output: &egui::FullOutput) -> Result<RgbaImage, String> {
         self.inner.render(ctx, output)
     }
-
-    /// Render the egui output to PNG bytes.
-    pub fn render_to_png(&mut self, ctx: &egui::Context, output: &egui::FullOutput) -> anyhow::Result<Vec<u8>> {
-        let image = self.render(ctx, output).map_err(|e| anyhow::anyhow!(e))?;
-        let mut png_data = Vec::new();
-        let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
-        image.write_with_encoder(encoder)?;
-        Ok(png_data)
-    }
 }
 
 impl Default for Renderer {
