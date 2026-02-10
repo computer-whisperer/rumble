@@ -344,7 +344,7 @@ impl BackendHandle {
 }
 
 /// Acquire a read lock on the state, recovering from lock poisoning.
-fn read_state(state: &Arc<RwLock<State>>) -> RwLockReadGuard<'_, State> {
+pub(crate) fn read_state(state: &Arc<RwLock<State>>) -> RwLockReadGuard<'_, State> {
     match state.read() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -355,7 +355,7 @@ fn read_state(state: &Arc<RwLock<State>>) -> RwLockReadGuard<'_, State> {
 }
 
 /// Acquire a write lock on the state, recovering from lock poisoning.
-fn write_state(state: &Arc<RwLock<State>>) -> RwLockWriteGuard<'_, State> {
+pub(crate) fn write_state(state: &Arc<RwLock<State>>) -> RwLockWriteGuard<'_, State> {
     match state.write() {
         Ok(guard) => guard,
         Err(poisoned) => {
