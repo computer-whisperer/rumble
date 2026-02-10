@@ -459,6 +459,7 @@ async fn run_connection_task(
     let mut send_stream: Option<quinn::SendStream> = None;
     let mut client_name = String::new();
     let mut torrent_manager: Option<Arc<crate::torrent::TorrentManager>> = None;
+    let mut shared_infohashes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut _session_identity: Option<SessionIdentity> = None;
     #[cfg(feature = "p2p")]
     let mut p2p_manager: Option<Arc<P2PManager>> = None;
@@ -716,9 +717,9 @@ async fn run_connection_task(
                                 let audio_task_clone = audio_task.clone();
                                 let torrent_manager_clone = torrent_manager.clone();
                                 let command_tx_clone = command_tx.clone();
-                                let client_name_clone = client_name.clone();
+                                let shared_infohashes_clone = shared_infohashes.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, client_name_clone).await;
+                                    run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, shared_infohashes_clone).await;
                                 });
                             }
                             Err(e) => {
@@ -871,9 +872,9 @@ async fn run_connection_task(
                                     let audio_task_clone = audio_task.clone();
                                     let torrent_manager_clone = torrent_manager.clone();
                                     let command_tx_clone = command_tx.clone();
-                                    let client_name_clone = client_name.clone();
+                                    let shared_infohashes_clone = shared_infohashes.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, client_name_clone).await;
+                                        run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, shared_infohashes_clone).await;
                                     });
                                 }
                                 Err(e) => {
@@ -1152,6 +1153,7 @@ async fn run_connection_task(
 
                             match p2p.share_file(path.clone()).await {
                                 Ok(shared) => {
+                                    shared_infohashes.insert(hex::encode(shared.id));
                                     let addrs = p2p.listen_addrs().await;
                                     let magnet = build_p2p_magnet(p2p.peer_id(), &shared, &addrs);
                                     let addr_strings: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
@@ -1224,6 +1226,7 @@ async fn run_connection_task(
                             match tm.share_file(path).await {
                                 Ok(file_info) => {
                                     info!("Shared file: {} ({})", file_info.name, file_info.magnet);
+                                    shared_infohashes.insert(file_info.infohash.clone());
 
                                     // Create file message JSON
                                     let file_message = crate::events::FileMessage::new(
@@ -1954,7 +1957,7 @@ async fn run_receiver_task(
     audio_task: AudioTaskHandle,
     torrent_manager: Option<Arc<crate::torrent::TorrentManager>>,
     command_tx: mpsc::UnboundedSender<Command>,
-    client_name: String,
+    shared_infohashes: std::collections::HashSet<String>,
 ) {
     loop {
         let mut chunk = [0u8; 4096];
@@ -1970,7 +1973,7 @@ async fn run_receiver_task(
                             &audio_task,
                             &torrent_manager,
                             &command_tx,
-                            &client_name,
+                            &shared_infohashes,
                         );
                     }
                 }
@@ -2040,7 +2043,7 @@ fn handle_server_message(
     audio_task: &AudioTaskHandle,
     torrent_manager: &Option<Arc<crate::torrent::TorrentManager>>,
     command_tx: &mpsc::UnboundedSender<Command>,
-    client_name: &str,
+    shared_infohashes: &std::collections::HashSet<String>,
 ) {
     match env.payload {
         Some(Payload::TrackerAnnounceResponse(_)) => {
@@ -2122,13 +2125,13 @@ fn handle_server_message(
                         }
 
                         // Check if this is a file message that should be auto-downloaded
-                        // Skip auto-download if we sent this message (we already have the file)
+                        // Skip auto-download if we're already seeding this file
                         let mut should_auto_download = None;
                         if let Some(file_msg) = crate::events::FileMessage::parse(&cb.text) {
-                            let is_own_message = cb.sender == client_name;
+                            let already_shared = shared_infohashes.contains(&file_msg.file.infohash);
 
                             let s = read_state(&state);
-                            if !is_own_message
+                            if !already_shared
                                 && s.file_transfer_settings
                                     .should_auto_download(&file_msg.file.mime, file_msg.file.size)
                             {
