@@ -4645,14 +4645,9 @@ impl RumbleApp {
                 ui.add_space(4.0);
 
                 let available = ui.available_size();
-                let viewport = ctx.input(|i| {
-                    i.viewport()
-                        .inner_rect_px()
-                        .unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)))
-                });
-                let ppp = ctx.pixels_per_point();
-                let viewport_width = viewport.width() / ppp;
-                let viewport_height = viewport.height() / ppp;
+                let screen = ctx.screen_rect();
+                let viewport_width = screen.width();
+                let viewport_height = screen.height();
                 let max_width = available.x.min(viewport_width * 0.9);
                 let max_height = (viewport_height * 0.9) - 80.0; // Leave room for heading and button
 
