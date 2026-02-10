@@ -72,8 +72,11 @@ impl UserMap {
         Self {
             rumble_to_mumble: HashMap::new(),
             mumble_to_rumble: HashMap::new(),
-            // Session IDs start at 1 (0 is sometimes reserved)
-            next_session: 1,
+            // Session ID partitioning:
+            //   1-999:       reserved
+            //   1000-99999:  Mumble client sessions (BridgeState.next_mumble_session)
+            //   100000+:     Rumble user proxy sessions (UserMap.next_session)
+            next_session: 100_000,
         }
     }
 

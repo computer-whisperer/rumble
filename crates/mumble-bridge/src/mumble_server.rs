@@ -184,7 +184,7 @@ async fn mumble_auth_handshake(
 
         // Snapshot current state for sending to the client
         channels = build_channel_states(&mut state);
-        users = build_user_states(&state, session, &username);
+        users = build_user_states(&state, session);
     }
 
     // Send server Version
@@ -197,11 +197,11 @@ async fn mumble_auth_handshake(
     };
     write_message(writer, MessageType::Version, &version).await?;
 
-    // Send CryptSetup (empty/dummy since we're TCP-only)
+    // Send CryptSetup with random keys (TCP-only, but avoids known-zero crypto material)
     let crypt = mumble::CryptSetup {
-        key: Some(vec![0u8; 16]),
-        client_nonce: Some(vec![0u8; 16]),
-        server_nonce: Some(vec![0u8; 16]),
+        key: Some(rand::random::<[u8; 16]>().to_vec()),
+        client_nonce: Some(rand::random::<[u8; 16]>().to_vec()),
+        server_nonce: Some(rand::random::<[u8; 16]>().to_vec()),
     };
     write_message(writer, MessageType::CryptSetup, &crypt).await?;
 
@@ -304,7 +304,7 @@ fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
 }
 
 /// Build UserState messages for all known Rumble users.
-fn build_user_states(state: &BridgeState, exclude_session: u32, _exclude_name: &str) -> Vec<mumble::UserState> {
+fn build_user_states(state: &BridgeState, exclude_session: u32) -> Vec<mumble::UserState> {
     let mut users = Vec::new();
 
     for user in &state.rumble_users {
