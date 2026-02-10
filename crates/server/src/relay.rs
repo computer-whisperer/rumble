@@ -53,14 +53,6 @@ struct WaitingAcceptor {
     registered_at: Instant,
 }
 
-/// Active relay session state (for future monitoring/metrics)
-#[allow(dead_code)]
-struct RelaySession {
-    user_id: u64,
-    bytes_transferred: AtomicU64,
-    started_at: Instant,
-}
-
 /// Rate limiter for a user
 struct UserRateLimit {
     bytes_this_second: AtomicU64,
