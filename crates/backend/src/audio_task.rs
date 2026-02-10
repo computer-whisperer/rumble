@@ -487,7 +487,8 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     let mut audio_input: Option<AudioInput> = None;
     // Start audio output immediately so SFX can play even when disconnected.
     // The output is cheap when idle (just outputs silence).
-    let mut audio_output: Option<AudioOutput> = None;
+    // (Initialized below after audio_system and selected_output are set up.)
+    let mut audio_output: Option<AudioOutput>;
 
     // Sound effects sample queue - mixed into playback output each frame
     let mut sfx_queue: VecDeque<f32> = VecDeque::new();

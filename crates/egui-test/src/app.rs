@@ -284,6 +284,7 @@ pub struct RumbleApp {
     // SFX event tracking
     prev_self_muted: bool,
     prev_user_ids_in_room: std::collections::HashSet<u64>,
+    prev_user_ids_initialized: bool,
     prev_chat_count: usize,
 }
 
@@ -519,6 +520,7 @@ impl RumbleApp {
             prev_connection_state: ConnectionState::Disconnected,
             prev_self_muted: false,
             prev_user_ids_in_room: std::collections::HashSet::new(),
+            prev_user_ids_initialized: false,
             prev_chat_count: 0,
         };
 
@@ -2888,8 +2890,8 @@ impl RumbleApp {
                     .filter(|id| state.my_user_id != Some(*id))
                     .collect();
 
-                // Only detect diffs after the first frame (prev is populated)
-                if !self.prev_user_ids_in_room.is_empty() || !current_user_ids.is_empty() {
+                // Only detect diffs after the first observation (skip initial connect)
+                if self.prev_user_ids_initialized {
                     for id in &current_user_ids {
                         if !self.prev_user_ids_in_room.contains(id) {
                             self.play_sfx(SfxKind::UserJoin);
@@ -2905,9 +2907,11 @@ impl RumbleApp {
                 }
 
                 self.prev_user_ids_in_room = current_user_ids;
+                self.prev_user_ids_initialized = true;
             }
         } else {
             self.prev_user_ids_in_room.clear();
+            self.prev_user_ids_initialized = false;
         }
 
         // Detect new non-local chat messages for SFX

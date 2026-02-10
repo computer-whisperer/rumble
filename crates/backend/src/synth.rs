@@ -112,16 +112,17 @@ pub fn generate_tone(tone: &Tone, sample_rate: u32) -> Vec<f32> {
             break;
         }
 
-        // Compute frequency (with optional sweep)
-        let freq = match tone.end_frequency {
+        // Compute phase (with optional frequency sweep using integrated phase)
+        let phase = match tone.end_frequency {
             Some(end_freq) if tone.duration > 0.0 => {
-                let progress = (t / tone.duration).min(1.0);
-                tone.frequency + (end_freq - tone.frequency) * progress
+                let f0 = tone.frequency;
+                let f1 = end_freq;
+                let t_clamped = t.min(tone.duration);
+                // Integrated phase for linear frequency sweep: f0*t + (f1-f0)*t^2/(2*duration)
+                f0 * t_clamped + (f1 - f0) * t_clamped * t_clamped / (2.0 * tone.duration)
             }
-            _ => tone.frequency,
+            _ => tone.frequency * t,
         };
-
-        let phase = freq * t;
         let wave = waveform_sample(tone.waveform, phase);
         let env = tone.envelope.amplitude(t, tone.duration);
 
