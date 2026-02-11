@@ -645,13 +645,13 @@ fn handle_rumble_voice(
         None => return,
     };
 
-    // Skip voice from our own virtual users to avoid echo
-    {
+    // If the sender is one of our own virtual users, look up the Mumble session
+    // to exclude from relay (avoid echo back to the original speaker).
+    // For normal Rumble users, exclude_session is None and we relay to all clients.
+    let exclude_session = {
         let state = bridge_state.read().unwrap();
-        if state.reverse_virtual_user_map.contains_key(&sender_id) {
-            return;
-        }
-    }
+        state.reverse_virtual_user_map.get(&sender_id).copied()
+    };
 
     // Determine the Mumble session for this Rumble sender, and the target channel
     let (session, target_channel) = {
@@ -682,17 +682,25 @@ fn handle_rumble_voice(
         mumble_voice::encode_voice_packet(session, current_seq, &datagram.opus_data, datagram.end_of_stream);
 
     if let Some(target_channel) = target_channel {
-        // Only relay to Mumble clients in the matching channel
+        // Only relay to Mumble clients in the matching channel, skipping the
+        // original sender's Mumble session to prevent echo
         let state = bridge_state.read().unwrap();
         for (&client_session, sender) in client_senders {
+            if exclude_session == Some(client_session) {
+                continue;
+            }
             let client_channel = state.mumble_clients.get(&client_session).map(|c| c.channel_id);
             if client_channel == Some(target_channel) {
                 let _ = sender.tx.send(MumbleOutbound::Voice(voice_data.clone()));
             }
         }
     } else {
-        // No room_id on the datagram — fall back to broadcasting to all clients
-        for sender in client_senders.values() {
+        // No room_id on the datagram — fall back to broadcasting to all clients,
+        // skipping the original sender's Mumble session to prevent echo
+        for (&client_session, sender) in client_senders {
+            if exclude_session == Some(client_session) {
+                continue;
+            }
             let _ = sender.tx.send(MumbleOutbound::Voice(voice_data.clone()));
         }
     }
