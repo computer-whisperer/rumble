@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use api::{
-    build_auth_payload, compute_cert_hash, encode_frame,
+    build_auth_payload, build_session_cert_payload, compute_cert_hash, encode_frame,
     proto::{self, envelope::Payload},
     try_decode_frame,
 };
@@ -66,18 +66,34 @@ pub async fn connect(addr: &str, username: &str, signing_key: &SigningKey) -> Re
     // Compute server cert hash
     let server_cert_hash = compute_server_cert_hash(&conn);
 
-    // Sign auth payload
+    // Generate session keypair and certificate
     let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let expires_ms = timestamp_ms + 24 * 60 * 60 * 1000; // 24h validity
+    let session_secret: [u8; 32] = rand::random();
+    let session_signing = SigningKey::from_bytes(&session_secret);
+    let session_public_bytes: [u8; 32] = session_signing.verifying_key().to_bytes();
+
+    let cert_payload =
+        build_session_cert_payload(&session_public_bytes, timestamp_ms, expires_ms, Some(username));
+    let session_signature = signing_key.sign(&cert_payload);
+
+    // Sign auth payload
     let payload = build_auth_payload(&nonce, timestamp_ms, &public_key, user_id, &server_cert_hash);
     let signature = signing_key.sign(&payload);
 
-    // Send Authenticate
+    // Send Authenticate with session certificate
     let auth = proto::Envelope {
         state_hash: Vec::new(),
         payload: Some(Payload::Authenticate(proto::Authenticate {
             signature: signature.to_bytes().to_vec(),
             timestamp_ms,
-            session_cert: None,
+            session_cert: Some(proto::SessionCertificate {
+                session_public_key: session_public_bytes.to_vec(),
+                issued_ms: timestamp_ms,
+                expires_ms,
+                device: Some(username.to_string()),
+                user_signature: session_signature.to_bytes().to_vec(),
+            }),
         })),
     };
     send.write_all(&encode_frame(&auth)).await?;
@@ -151,11 +167,12 @@ fn make_bridge_endpoint(remote_addr: std::net::SocketAddr) -> Result<Endpoint> {
 
     // Use a permissive TLS config that accepts any certificate (bridge use case)
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+    let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
         .with_no_client_auth();
+    client_cfg.alpn_protocols = vec![b"rumble".to_vec()];
 
     let rustls_config = Arc::new(client_cfg);
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)?;
