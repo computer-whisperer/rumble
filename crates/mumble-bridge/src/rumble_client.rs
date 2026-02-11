@@ -73,8 +73,7 @@ pub async fn connect(addr: &str, username: &str, signing_key: &SigningKey) -> Re
     let session_signing = SigningKey::from_bytes(&session_secret);
     let session_public_bytes: [u8; 32] = session_signing.verifying_key().to_bytes();
 
-    let cert_payload =
-        build_session_cert_payload(&session_public_bytes, timestamp_ms, expires_ms, Some(username));
+    let cert_payload = build_session_cert_payload(&session_public_bytes, timestamp_ms, expires_ms, Some(username));
     let session_signature = signing_key.sign(&cert_payload);
 
     // Sign auth payload
