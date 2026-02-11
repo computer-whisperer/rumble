@@ -608,6 +608,22 @@ async fn handle_authenticate(
     )
     .await?;
 
+    // 13. Send welcome message if configured
+    if let Some(welcome_text) = state.welcome_message() {
+        let welcome_env = proto::Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::ServerEvent(proto::ServerEvent {
+                kind: Some(proto::server_event::Kind::WelcomeMessage(proto::WelcomeMessage {
+                    text: welcome_text.to_string(),
+                })),
+            })),
+        };
+        let frame = encode_frame(&welcome_env);
+        if let Err(e) = sender.send_frame(&frame).await {
+            warn!(user_id = sender.user_id, error = ?e, "Failed to send welcome message");
+        }
+    }
+
     Ok(())
 }
 

@@ -289,6 +289,8 @@ pub struct ServerState {
     virtual_users: DashMap<u64, VirtualUser>,
     /// Per-user voice datagram rate limiters: user_id → VoiceRateLimit.
     voice_rate_limits: DashMap<u64, VoiceRateLimit>,
+    /// Welcome message (MOTD) sent to clients after authentication.
+    welcome_message: Option<String>,
 }
 
 impl ServerState {
@@ -310,6 +312,7 @@ impl ServerState {
             relay_port: std::sync::atomic::AtomicU16::new(0),
             virtual_users: DashMap::new(),
             voice_rate_limits: DashMap::new(),
+            welcome_message: None,
         }
     }
 
@@ -331,7 +334,20 @@ impl ServerState {
             relay_port: std::sync::atomic::AtomicU16::new(0),
             virtual_users: DashMap::new(),
             voice_rate_limits: DashMap::new(),
+            welcome_message: None,
         }
+    }
+
+    /// Create a new server state with the given server certificate and welcome message.
+    pub fn with_cert_and_welcome(cert_der: Vec<u8>, welcome_message: Option<String>) -> Self {
+        let mut state = Self::with_cert(cert_der);
+        state.welcome_message = welcome_message;
+        state
+    }
+
+    /// Get the welcome message.
+    pub fn welcome_message(&self) -> Option<&str> {
+        self.welcome_message.as_deref()
     }
 
     /// Set the relay port (called after relay service starts).

@@ -36,6 +36,8 @@ pub struct Config {
     pub data_dir: Option<String>,
     /// Relay service configuration. If None, relay service is disabled.
     pub relay: Option<RelayConfig>,
+    /// Welcome message (MOTD) sent to clients after authentication.
+    pub welcome_message: Option<String>,
 }
 
 /// The Rumble VOIP server.
@@ -57,7 +59,7 @@ impl Server {
         let cert_der = config.certs.first().map(|c| c.to_vec()).unwrap_or_default();
 
         let endpoint = make_server_endpoint(&config)?;
-        let state = Arc::new(ServerState::with_cert(cert_der));
+        let state = Arc::new(ServerState::with_cert_and_welcome(cert_der, config.welcome_message));
 
         // Initialize persistence if data_dir is provided
         let persistence = if let Some(ref data_dir) = config.data_dir {

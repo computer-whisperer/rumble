@@ -61,6 +61,11 @@ cert_dir = "certs"
 # Used for certificate generation and ACME support.
 # For development, "localhost" is used by default.
 domain = "localhost"
+
+# Welcome message (MOTD) sent to clients after authentication.
+# If not set, no welcome message is sent.
+# Can also be set via RUMBLE_WELCOME_MESSAGE environment variable.
+# welcome_message = "Welcome to the Rumble server!"
 "#;
 
 /// Command-line arguments for the server.
@@ -118,6 +123,10 @@ pub struct FileConfig {
     /// Server domain name.
     #[serde(default = "default_domain")]
     pub domain: String,
+
+    /// Welcome message (MOTD) sent to clients after authentication.
+    #[serde(default)]
+    pub welcome_message: Option<String>,
 }
 
 fn default_bind() -> String {
@@ -148,6 +157,7 @@ impl Default for FileConfig {
             data_dir: default_data_dir(),
             cert_dir: default_cert_dir(),
             domain: default_domain(),
+            welcome_message: None,
         }
     }
 }
@@ -169,6 +179,8 @@ pub struct ServerConfig {
     pub domain: String,
     /// Base directory for resolving relative paths (config file directory).
     pub base_dir: PathBuf,
+    /// Welcome message (MOTD) sent to clients after authentication.
+    pub welcome_message: Option<String>,
 }
 
 impl ServerConfig {
@@ -224,12 +236,16 @@ impl ServerConfig {
         let env_data_dir = std::env::var("RUMBLE_DATA_DIR").ok().map(PathBuf::from);
         let env_cert_dir = std::env::var("RUMBLE_CERT_DIR").ok().map(PathBuf::from);
         let env_domain = std::env::var("RUMBLE_DOMAIN").ok();
+        let env_welcome_message = std::env::var("RUMBLE_WELCOME_MESSAGE").ok();
 
         let bind_str = args.bind.or(env_bind).unwrap_or(file_config.bind);
         let log_level = args.log_level.or(env_log_level).unwrap_or(file_config.log_level);
         let data_dir = args.data_dir.or(env_data_dir).unwrap_or(file_config.data_dir);
         let cert_dir = args.cert_dir.or(env_cert_dir).unwrap_or(file_config.cert_dir);
         let domain = args.domain.or(env_domain).unwrap_or(file_config.domain);
+        let welcome_message = env_welcome_message
+            .or(file_config.welcome_message)
+            .filter(|s| !s.trim().is_empty());
 
         // Parse bind address
         let bind = parse_bind_address(&bind_str)?;
@@ -245,6 +261,7 @@ impl ServerConfig {
             cert_dir,
             domain,
             base_dir,
+            welcome_message,
         })
     }
 
