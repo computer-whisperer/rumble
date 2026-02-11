@@ -116,6 +116,10 @@ pub struct MumbleClient {
     pub username: String,
     /// The Mumble channel ID the client is currently in.
     pub channel_id: u32,
+    /// Whether the client is self-muted.
+    pub is_muted: bool,
+    /// Whether the client is self-deafened.
+    pub is_deafened: bool,
 }
 
 /// Shared bridge state, protected by RwLock externally.

@@ -37,6 +37,12 @@ pub enum BridgeEvent {
     MumbleChat { session: u32, message: String },
     /// Mumble client changed channel.
     MumbleChannelChange { session: u32, channel_id: u32 },
+    /// Mumble client changed mute/deaf state.
+    MumbleMuteDeafChange {
+        session: u32,
+        is_muted: Option<bool>,
+        is_deafened: Option<bool>,
+    },
     /// Received a Rumble envelope from the server.
     RumbleEnvelope(proto::Envelope),
     /// Received a Rumble voice datagram.
@@ -44,28 +50,49 @@ pub enum BridgeEvent {
 }
 
 /// Per-client sender handle.
-struct ClientSender {
-    tx: mpsc::UnboundedSender<MumbleOutbound>,
+pub(crate) struct ClientSender {
+    pub tx: mpsc::UnboundedSender<MumbleOutbound>,
+}
+
+/// Persistent state that survives across reconnects.
+pub struct BridgeLoopState {
+    /// Outbound channels for each connected Mumble client.
+    pub(crate) client_senders: HashMap<u32, ClientSender>,
+    /// Per-Mumble-session sequence counters (Mumble->Rumble direction).
+    pub(crate) mumble_to_rumble_seq: HashMap<u32, u32>,
+    /// Per-Rumble-user outbound sequence counters (Rumble->Mumble direction).
+    pub(crate) rumble_outbound_seq: HashMap<u64, u64>,
+}
+
+impl BridgeLoopState {
+    pub fn new() -> Self {
+        Self {
+            client_senders: HashMap::new(),
+            mumble_to_rumble_seq: HashMap::new(),
+            rumble_outbound_seq: HashMap::new(),
+        }
+    }
 }
 
 /// Run the core bridge event loop.
 ///
 /// Consumes events from both Mumble clients and the Rumble connection,
 /// translating and forwarding messages between the two protocols.
+/// Returns when the shutdown signal fires or the event channel closes.
+/// `loop_state` persists across reconnects to preserve client senders and
+/// sequence counters.
 pub async fn run_bridge(
     config: Arc<BridgeConfig>,
     bridge_state: Arc<RwLock<BridgeState>>,
     mut bridge_rx: mpsc::UnboundedReceiver<BridgeEvent>,
     rumble_conn: quinn::Connection,
     rumble_send: &mut quinn::SendStream,
-) -> Result<()> {
-    let mut client_senders: HashMap<u32, ClientSender> = HashMap::new();
-    // Per-Rumble-user outbound sequence counters (for Rumble->Mumble direction)
-    let mut rumble_outbound_seq: HashMap<u64, u64> = HashMap::new();
-    // Per-Mumble-session sequence counters (for Mumble->Rumble direction).
-    // Mumble's sequence increments by iFramesPerPacket (typically 2) per packet,
-    // but Rumble's jitter buffer expects consecutive (1-per-packet) sequences.
-    let mut mumble_to_rumble_seq: HashMap<u32, u32> = HashMap::new();
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    loop_state: &mut BridgeLoopState,
+) -> (Result<()>, mpsc::UnboundedReceiver<BridgeEvent>) {
+    let client_senders = &mut loop_state.client_senders;
+    let rumble_outbound_seq = &mut loop_state.rumble_outbound_seq;
+    let mumble_to_rumble_seq = &mut loop_state.mumble_to_rumble_seq;
     // (virtual_user_id, mumble_session) pairs that need BridgeJoinRoom after registration
     let mut pending_join_rooms: Vec<(u64, u32)> = Vec::new();
     // Virtual user IDs that arrived late (Mumble client already left) and need cleanup
@@ -73,7 +100,26 @@ pub async fn run_bridge(
 
     info!("Bridge event loop started");
 
-    while let Some(event) = bridge_rx.recv().await {
+    let mut shutdown_requested = false;
+
+    loop {
+        let event = tokio::select! {
+            event = bridge_rx.recv() => {
+                match event {
+                    Some(e) => e,
+                    None => break,
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("Shutdown signal received");
+                shutdown_requested = true;
+                break;
+            }
+            reason = rumble_conn.closed() => {
+                warn!(%reason, "Rumble QUIC connection closed");
+                break;
+            }
+        };
         match event {
             BridgeEvent::MumbleClientJoined { session, username } => {
                 info!(session, %username, "Mumble client joined bridge");
@@ -85,7 +131,7 @@ pub async fn run_bridge(
                     channel_id: Some(0),
                     ..Default::default()
                 };
-                broadcast_to_mumble_except(&client_senders, session, MessageType::UserState, &user_state);
+                broadcast_to_mumble_except(client_senders, session, MessageType::UserState, &user_state);
 
                 // Register this Mumble client as a virtual user on the Rumble server
                 {
@@ -130,7 +176,7 @@ pub async fn run_bridge(
                     ban_certificate: None,
                     ban_ip: None,
                 };
-                broadcast_to_all_mumble(&client_senders, MessageType::UserRemove, &remove);
+                broadcast_to_all_mumble(client_senders, MessageType::UserRemove, &remove);
             }
 
             BridgeEvent::MumbleClientSender { session, sender } => {
@@ -139,9 +185,28 @@ pub async fn run_bridge(
 
             BridgeEvent::MumblePing { session, payload } => {
                 if let Some(client) = client_senders.get(&session) {
+                    // Parse the client's Ping, preserve timestamp, zero server stats
+                    let response = if let Ok(ping) = mumble::Ping::decode(&*payload) {
+                        mumble::Ping {
+                            timestamp: ping.timestamp,
+                            good: Some(0),
+                            late: Some(0),
+                            lost: Some(0),
+                            resync: Some(0),
+                            udp_packets: Some(0),
+                            tcp_packets: Some(0),
+                            udp_ping_avg: Some(0.0),
+                            udp_ping_var: Some(0.0),
+                            tcp_ping_avg: Some(0.0),
+                            tcp_ping_var: Some(0.0),
+                        }
+                        .encode_to_vec()
+                    } else {
+                        payload
+                    };
                     let _ = client.tx.send(MumbleOutbound::Protobuf {
                         msg_type: MessageType::Ping as u16,
-                        payload,
+                        payload: response,
                     });
                 }
             }
@@ -220,7 +285,7 @@ pub async fn run_bridge(
                     message: Some(message),
                     ..Default::default()
                 };
-                broadcast_to_mumble_except(&client_senders, session, MessageType::TextMessage, &text_msg);
+                broadcast_to_mumble_except(client_senders, session, MessageType::TextMessage, &text_msg);
             }
 
             BridgeEvent::MumbleChannelChange { session, channel_id } => {
@@ -247,31 +312,90 @@ pub async fn run_bridge(
                     channel_id: Some(channel_id),
                     ..Default::default()
                 };
-                broadcast_to_all_mumble(&client_senders, MessageType::UserState, &user_state);
+                broadcast_to_all_mumble(client_senders, MessageType::UserState, &user_state);
+            }
+
+            BridgeEvent::MumbleMuteDeafChange {
+                session,
+                is_muted,
+                is_deafened,
+            } => {
+                let (virtual_user_id, final_muted, final_deafened) = {
+                    let mut state = bridge_state.write().unwrap();
+                    if let Some(client) = state.mumble_clients.get_mut(&session) {
+                        if let Some(m) = is_muted {
+                            client.is_muted = m;
+                        }
+                        if let Some(d) = is_deafened {
+                            client.is_deafened = d;
+                        }
+                        // Enforce Mumble invariant: deaf implies mute, unmute clears deaf
+                        if client.is_deafened {
+                            client.is_muted = true;
+                        }
+                        if !client.is_muted {
+                            client.is_deafened = false;
+                        }
+                    }
+                    let vid = state.virtual_user_map.get(&session).copied();
+                    let client = state.mumble_clients.get(&session);
+                    let m = client.map(|c| c.is_muted).unwrap_or(false);
+                    let d = client.map(|c| c.is_deafened).unwrap_or(false);
+                    (vid, m, d)
+                };
+
+                if let Some(vid) = virtual_user_id {
+                    if let Err(e) =
+                        rumble_client::send_bridge_set_user_status(rumble_send, vid, final_muted, final_deafened).await
+                    {
+                        warn!(error = %e, vid, "Failed to send BridgeSetUserStatus");
+                    }
+                }
+
+                // Broadcast the enforced mute/deaf state to other Mumble clients
+                let user_state = mumble::UserState {
+                    session: Some(session),
+                    self_mute: Some(final_muted),
+                    self_deaf: Some(final_deafened),
+                    ..Default::default()
+                };
+                broadcast_to_mumble_except(client_senders, session, MessageType::UserState, &user_state);
             }
 
             BridgeEvent::RumbleEnvelope(env) => {
                 handle_rumble_envelope(
                     env,
                     &bridge_state,
-                    &client_senders,
-                    &mut rumble_outbound_seq,
+                    client_senders,
+                    rumble_outbound_seq,
                     &mut pending_join_rooms,
                     &mut pending_unregister,
                 );
 
                 // Process any pending join-room requests from BridgeUserRegistered
                 for (vid, session) in pending_join_rooms.drain(..) {
-                    let room_id = {
+                    let (room_id, is_muted, is_deafened) = {
                         let state = bridge_state.read().unwrap();
-                        let channel_id = state.mumble_clients.get(&session).map(|c| c.channel_id);
-                        channel_id
+                        let client = state.mumble_clients.get(&session);
+                        let channel_id = client.map(|c| c.channel_id);
+                        let room_id = channel_id
                             .and_then(|ch| state.channels.get_rumble_uuid(ch))
                             .map(api::room_id_from_uuid)
-                            .unwrap_or_else(api::root_room_id)
+                            .unwrap_or_else(api::root_room_id);
+                        let is_muted = client.map(|c| c.is_muted).unwrap_or(false);
+                        let is_deafened = client.map(|c| c.is_deafened).unwrap_or(false);
+                        (room_id, is_muted, is_deafened)
                     };
                     if let Err(e) = rumble_client::send_bridge_join_room(rumble_send, vid, room_id).await {
                         warn!(error = %e, vid, "Failed to send BridgeJoinRoom for new virtual user");
+                    }
+                    // Sync mute/deaf state for the newly registered virtual user
+                    if is_muted || is_deafened {
+                        if let Err(e) =
+                            rumble_client::send_bridge_set_user_status(rumble_send, vid, is_muted, is_deafened).await
+                        {
+                            warn!(error = %e, vid, "Failed to sync mute/deaf state for new virtual user");
+                        }
                     }
                 }
 
@@ -284,13 +408,31 @@ pub async fn run_bridge(
             }
 
             BridgeEvent::RumbleVoice(datagram) => {
-                handle_rumble_voice(datagram, &bridge_state, &client_senders, &mut rumble_outbound_seq);
+                handle_rumble_voice(datagram, &bridge_state, client_senders, rumble_outbound_seq);
             }
         }
     }
 
+    // Only attempt graceful cleanup on intentional shutdown (signal),
+    // not when the QUIC connection died underneath us.
+    if shutdown_requested {
+        let virtual_users: Vec<u64> = {
+            let state = bridge_state.read().unwrap();
+            state.virtual_user_map.values().copied().collect()
+        };
+        if !virtual_users.is_empty() {
+            info!(count = virtual_users.len(), "Unregistering virtual users on shutdown");
+            for vid in virtual_users {
+                if let Err(e) = rumble_client::send_bridge_unregister_user(rumble_send, vid).await {
+                    warn!(error = %e, vid, "Failed to unregister virtual user on shutdown");
+                }
+            }
+        }
+        rumble_conn.close(0u32.into(), b"bridge shutdown");
+    }
+
     info!("Bridge event loop ended");
-    Ok(())
+    (Ok(()), bridge_rx)
 }
 
 /// Handle a Rumble server envelope and forward relevant events to Mumble clients.

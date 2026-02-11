@@ -179,6 +179,8 @@ async fn mumble_auth_handshake(
                 session,
                 username: username.clone(),
                 channel_id: 0, // Start in root channel
+                is_muted: false,
+                is_deafened: false,
             },
         );
 
@@ -343,6 +345,8 @@ fn build_user_states(state: &BridgeState, exclude_session: u32) -> Vec<mumble::U
             session: Some(client.session),
             name: Some(client.username.clone()),
             channel_id: Some(client.channel_id),
+            self_mute: Some(client.is_muted),
+            self_deaf: Some(client.is_deafened),
             ..Default::default()
         });
     }
@@ -382,10 +386,17 @@ async fn mumble_message_loop(
                 }
             }
             Some(MessageType::UserState) => {
-                // Client might be changing channel or mute state
+                // Client might be changing channel or mute/deaf state
                 if let Ok(user_state) = mumble::UserState::decode(&*msg.payload) {
                     if let Some(channel_id) = user_state.channel_id {
                         bridge_tx.send(BridgeEvent::MumbleChannelChange { session, channel_id })?;
+                    }
+                    if user_state.self_mute.is_some() || user_state.self_deaf.is_some() {
+                        bridge_tx.send(BridgeEvent::MumbleMuteDeafChange {
+                            session,
+                            is_muted: user_state.self_mute,
+                            is_deafened: user_state.self_deaf,
+                        })?;
                     }
                 }
             }
