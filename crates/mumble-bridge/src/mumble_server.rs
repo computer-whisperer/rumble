@@ -269,47 +269,94 @@ async fn mumble_auth_handshake(
 }
 
 /// Build ChannelState messages for all known rooms.
+///
+/// Channels are returned in BFS order (root first, then children) to match
+/// the Mumble reference server behavior. Mumble clients expect parent channels
+/// to be sent before their children.
 fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
-    let mut channels = Vec::new();
+    use std::collections::{HashMap, VecDeque};
 
-    for room in &state.rumble_rooms {
+    // First pass: assign Mumble IDs and build a parent->children map
+    let mut children_of: HashMap<uuid::Uuid, Vec<usize>> = HashMap::new();
+    let mut room_uuids: Vec<Option<uuid::Uuid>> = Vec::new();
+
+    for (idx, room) in state.rumble_rooms.iter().enumerate() {
         let uuid = room.id.as_ref().and_then(api::uuid_from_room_id);
+        room_uuids.push(uuid);
         if let Some(uuid) = uuid {
-            let channel_id = state.channels.get_or_insert(uuid);
-            let parent = room
+            // Ensure channel IDs are assigned
+            state.channels.get_or_insert(uuid);
+
+            let parent_uuid = room
                 .parent_id
                 .as_ref()
                 .and_then(api::uuid_from_room_id)
-                .map(|p| state.channels.get_or_insert(p));
+                .unwrap_or(api::ROOT_ROOM_UUID);
 
-            // Root channel has no parent in Mumble (or parent = itself)
-            let parent = if uuid == api::ROOT_ROOM_UUID {
-                None
-            } else {
-                parent.or(Some(0)) // Default parent to root
-            };
-
-            channels.push(mumble::ChannelState {
-                channel_id: Some(channel_id),
-                parent,
-                name: Some(room.name.clone()),
-                description: room.description.clone(),
-                ..Default::default()
-            });
+            if uuid != api::ROOT_ROOM_UUID {
+                children_of.entry(parent_uuid).or_default().push(idx);
+            }
         }
     }
 
-    // Ensure root channel always exists
-    if !channels.iter().any(|c| c.channel_id == Some(0)) {
-        channels.insert(
-            0,
-            mumble::ChannelState {
-                channel_id: Some(0),
-                parent: None,
-                name: Some("Root".to_string()),
-                ..Default::default()
-            },
-        );
+    // BFS from root to produce parent-before-child ordering
+    let mut channels = Vec::new();
+    let mut queue = VecDeque::new();
+
+    // Find the root room index
+    let root_idx = room_uuids.iter().position(|u| *u == Some(api::ROOT_ROOM_UUID));
+
+    if let Some(root_idx) = root_idx {
+        queue.push_back(root_idx);
+    } else {
+        // No root room in state — synthesize one
+        channels.push(mumble::ChannelState {
+            channel_id: Some(0),
+            parent: None,
+            name: Some("Root".to_string()),
+            ..Default::default()
+        });
+        // Still enqueue children of ROOT_ROOM_UUID
+        if let Some(children) = children_of.get(&api::ROOT_ROOM_UUID) {
+            for &idx in children {
+                queue.push_back(idx);
+            }
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        let room = &state.rumble_rooms[idx];
+        let uuid = match room_uuids[idx] {
+            Some(u) => u,
+            None => continue,
+        };
+
+        let channel_id = state.channels.get_or_insert(uuid);
+        let parent = if uuid == api::ROOT_ROOM_UUID {
+            None
+        } else {
+            let parent_uuid = room
+                .parent_id
+                .as_ref()
+                .and_then(api::uuid_from_room_id)
+                .unwrap_or(api::ROOT_ROOM_UUID);
+            Some(state.channels.get_or_insert(parent_uuid))
+        };
+
+        channels.push(mumble::ChannelState {
+            channel_id: Some(channel_id),
+            parent,
+            name: Some(room.name.clone()),
+            description: room.description.clone(),
+            ..Default::default()
+        });
+
+        // Enqueue children of this room
+        if let Some(children) = children_of.get(&uuid) {
+            for &child_idx in children {
+                queue.push_back(child_idx);
+            }
+        }
     }
 
     channels
