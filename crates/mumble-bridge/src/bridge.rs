@@ -60,6 +60,8 @@ pub async fn run_bridge(
     rumble_send: &mut quinn::SendStream,
 ) -> Result<()> {
     let mut client_senders: HashMap<u32, ClientSender> = HashMap::new();
+    // Per-Rumble-user outbound sequence counters (for Rumble->Mumble direction)
+    let mut rumble_outbound_seq: HashMap<u64, u64> = HashMap::new();
 
     info!("Bridge event loop started");
 
@@ -115,7 +117,7 @@ pub async fn run_bridge(
                 if let Some(voice) = mumble_voice::parse_voice_packet(&data) {
                     let datagram = proto::VoiceDatagram {
                         opus_data: voice.opus_data,
-                        sequence: 0,
+                        sequence: voice.sequence as u32,
                         timestamp_us: 0,
                         end_of_stream: voice.is_last,
                         sender_id: None,
@@ -171,11 +173,11 @@ pub async fn run_bridge(
             }
 
             BridgeEvent::RumbleEnvelope(env) => {
-                handle_rumble_envelope(env, &bridge_state, &client_senders);
+                handle_rumble_envelope(env, &bridge_state, &client_senders, &mut rumble_outbound_seq);
             }
 
             BridgeEvent::RumbleVoice(datagram) => {
-                handle_rumble_voice(datagram, &bridge_state, &client_senders);
+                handle_rumble_voice(datagram, &bridge_state, &client_senders, &mut rumble_outbound_seq);
             }
         }
     }
@@ -189,6 +191,7 @@ fn handle_rumble_envelope(
     env: proto::Envelope,
     bridge_state: &Arc<RwLock<BridgeState>>,
     client_senders: &HashMap<u32, ClientSender>,
+    rumble_outbound_seq: &mut HashMap<u64, u64>,
 ) {
     match env.payload {
         Some(Payload::ServerEvent(se)) => {
@@ -214,7 +217,7 @@ fn handle_rumble_envelope(
                     }
 
                     proto::server_event::Kind::StateUpdate(su) => {
-                        handle_state_update(su, bridge_state, client_senders);
+                        handle_state_update(su, bridge_state, client_senders, rumble_outbound_seq);
                     }
 
                     proto::server_event::Kind::ChatBroadcast(cb) => {
@@ -244,6 +247,7 @@ fn handle_state_update(
     su: proto::StateUpdate,
     bridge_state: &Arc<RwLock<BridgeState>>,
     client_senders: &HashMap<u32, ClientSender>,
+    rumble_outbound_seq: &mut HashMap<u64, u64>,
 ) {
     match su.update {
         Some(proto::state_update::Update::UserJoined(uj)) => {
@@ -288,6 +292,9 @@ fn handle_state_update(
             state
                 .rumble_users
                 .retain(|u| u.user_id.as_ref().map(|id| id.value).unwrap_or(0) != rumble_id);
+
+            // Clean up outbound sequence counter for this user
+            rumble_outbound_seq.remove(&rumble_id);
 
             if let Some(session) = session {
                 let remove = mumble::UserRemove {
@@ -427,11 +434,12 @@ fn handle_state_update(
     }
 }
 
-/// Handle a Rumble voice datagram and forward to all Mumble clients.
+/// Handle a Rumble voice datagram and forward to Mumble clients in the matching channel.
 fn handle_rumble_voice(
     datagram: proto::VoiceDatagram,
     bridge_state: &Arc<RwLock<BridgeState>>,
     client_senders: &HashMap<u32, ClientSender>,
+    outbound_seq: &mut HashMap<u64, u64>,
 ) {
     if datagram.opus_data.is_empty() && !datagram.end_of_stream {
         return;
@@ -442,9 +450,19 @@ fn handle_rumble_voice(
         None => return,
     };
 
-    let session = {
+    // Determine the Mumble session for this Rumble sender, and the target channel
+    let (session, target_channel) = {
         let state = bridge_state.read().unwrap();
-        state.users.get_mumble_session(sender_id)
+        let session = state.users.get_mumble_session(sender_id);
+
+        // Resolve the room_id from the datagram to a Mumble channel ID
+        let target_channel = datagram
+            .room_id
+            .as_ref()
+            .and_then(|bytes| uuid::Uuid::from_slice(bytes).ok())
+            .and_then(|uuid| state.channels.get_mumble_id(&uuid));
+
+        (session, target_channel)
     };
 
     let session = match session {
@@ -452,10 +470,28 @@ fn handle_rumble_voice(
         None => return,
     };
 
-    let voice_data = mumble_voice::encode_voice_packet(session, &datagram.opus_data, datagram.end_of_stream);
+    // Increment per-sender outbound sequence
+    let seq = outbound_seq.entry(sender_id).or_insert(0);
+    *seq += 1;
+    let current_seq = *seq;
 
-    for sender in client_senders.values() {
-        let _ = sender.tx.send(MumbleOutbound::Voice(voice_data.clone()));
+    let voice_data =
+        mumble_voice::encode_voice_packet(session, current_seq, &datagram.opus_data, datagram.end_of_stream);
+
+    if let Some(target_channel) = target_channel {
+        // Only relay to Mumble clients in the matching channel
+        let state = bridge_state.read().unwrap();
+        for (&client_session, sender) in client_senders {
+            let client_channel = state.mumble_clients.get(&client_session).map(|c| c.channel_id);
+            if client_channel == Some(target_channel) {
+                let _ = sender.tx.send(MumbleOutbound::Voice(voice_data.clone()));
+            }
+        }
+    } else {
+        // No room_id on the datagram — fall back to broadcasting to all clients
+        for sender in client_senders.values() {
+            let _ = sender.tx.send(MumbleOutbound::Voice(voice_data.clone()));
+        }
     }
 }
 

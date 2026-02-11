@@ -1,13 +1,20 @@
 /// Parse and encode Mumble UDPTunnel voice packets (Opus over TCP).
 ///
-/// UDPTunnel format (raw bytes, NOT protobuf):
+/// Client -> Server format (no session ID — server knows sender from TCP connection):
 /// ```text
-/// byte 0: header byte
-///   bits 7-5: type (4 = Opus)
-///   bits 4-0: target (0 = normal talking)
-/// byte 1+: varint-encoded session ID (sender)
-/// byte N+: varint-encoded opus payload length (bottom 13 bits = size, top bit = terminator)
+/// byte 0:  header byte  (bits 7-5 = type [4=Opus], bits 4-0 = target [0=normal])
+/// byte 1+: varint sequence number
+/// byte N+: varint opus length (bits 12-0 = size, bit 13 = terminator)
 /// byte M+: opus frame data
+/// ```
+///
+/// Server -> Client format (includes session ID so client knows who is speaking):
+/// ```text
+/// byte 0:  header byte
+/// byte 1+: varint session ID (sender)
+/// byte N+: varint sequence number
+/// byte P+: varint opus length (bits 12-0 = size, bit 13 = terminator)
+/// byte Q+: opus frame data
 /// ```
 
 /// Opus type code in the header byte (bits 7-5).
@@ -108,20 +115,27 @@ fn encode_varint(val: u64) -> Vec<u8> {
     }
 }
 
-/// A parsed Mumble Opus voice packet.
+/// A parsed Mumble Opus voice packet (client->server format).
+///
+/// Client->server packets do NOT contain a session ID; the server knows the
+/// sender from the TCP connection.  The first varint after the header byte is
+/// the sequence number.
 #[derive(Debug)]
 pub struct MumbleVoicePacket {
     /// Target (0 = normal talking, other values = whisper targets).
     pub target: u8,
-    /// Session ID of the sender.
-    pub session_id: u32,
+    /// Sequence number from the Mumble client.
+    pub sequence: u64,
     /// Raw Opus frame data.
     pub opus_data: Vec<u8>,
     /// Whether this is the last frame in the packet (terminator bit set).
     pub is_last: bool,
 }
 
-/// Parse a Mumble UDPTunnel voice packet (raw bytes, not protobuf).
+/// Parse a Mumble UDPTunnel voice packet from a client (raw bytes, not protobuf).
+///
+/// Client->server format: `header + sequence(varint) + opus_len(varint) + opus_data`
+/// There is NO session ID in client->server packets.
 pub fn parse_voice_packet(data: &[u8]) -> Option<MumbleVoicePacket> {
     if data.is_empty() {
         return None;
@@ -138,8 +152,8 @@ pub fn parse_voice_packet(data: &[u8]) -> Option<MumbleVoicePacket> {
 
     let rest = &data[1..];
 
-    // Read session ID
-    let (session_id, consumed) = read_varint(rest)?;
+    // Read sequence number (first varint after header — NOT session ID)
+    let (sequence, consumed) = read_varint(rest)?;
     let rest = &rest[consumed..];
 
     // Read opus payload length (bottom 13 bits = size, bit 13 = terminator)
@@ -156,16 +170,19 @@ pub fn parse_voice_packet(data: &[u8]) -> Option<MumbleVoicePacket> {
 
     Some(MumbleVoicePacket {
         target,
-        session_id: session_id as u32,
+        sequence,
         opus_data,
         is_last,
     })
 }
 
-/// Encode a Mumble Opus voice packet for sending via UDPTunnel.
-pub fn encode_voice_packet(session_id: u32, opus_data: &[u8], is_last: bool) -> Vec<u8> {
+/// Encode a Mumble Opus voice packet for sending via UDPTunnel (server->client).
+///
+/// Server->client format: `header + session(varint) + sequence(varint) + opus_len(varint) + opus_data`
+pub fn encode_voice_packet(session_id: u32, sequence: u64, opus_data: &[u8], is_last: bool) -> Vec<u8> {
     let header: u8 = (OPUS_TYPE << 5) | 0; // target 0 = normal
     let session_varint = encode_varint(session_id as u64);
+    let sequence_varint = encode_varint(sequence);
 
     let mut opus_len = opus_data.len() as u64;
     if is_last {
@@ -173,9 +190,11 @@ pub fn encode_voice_packet(session_id: u32, opus_data: &[u8], is_last: bool) -> 
     }
     let len_varint = encode_varint(opus_len);
 
-    let mut packet = Vec::with_capacity(1 + session_varint.len() + len_varint.len() + opus_data.len());
+    let mut packet =
+        Vec::with_capacity(1 + session_varint.len() + sequence_varint.len() + len_varint.len() + opus_data.len());
     packet.push(header);
     packet.extend_from_slice(&session_varint);
+    packet.extend_from_slice(&sequence_varint);
     packet.extend_from_slice(&len_varint);
     packet.extend_from_slice(opus_data);
     packet
@@ -208,22 +227,75 @@ mod tests {
     }
 
     #[test]
-    fn test_voice_packet_roundtrip() {
+    fn test_parse_client_to_server_packet() {
+        // Client->server format: header + sequence(varint) + opus_len(varint) + opus_data
+        // No session ID in this direction.
         let opus_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let encoded = encode_voice_packet(42, &opus_data, false);
-        let parsed = parse_voice_packet(&encoded).unwrap();
-        assert_eq!(parsed.session_id, 42);
+        let mut packet = Vec::new();
+        packet.push((OPUS_TYPE << 5) | 0); // header
+        packet.extend_from_slice(&encode_varint(7)); // sequence = 7
+        packet.extend_from_slice(&encode_varint(opus_data.len() as u64)); // opus_len
+        packet.extend_from_slice(&opus_data);
+
+        let parsed = parse_voice_packet(&packet).unwrap();
+        assert_eq!(parsed.sequence, 7);
         assert_eq!(parsed.opus_data, opus_data);
         assert!(!parsed.is_last);
     }
 
     #[test]
-    fn test_voice_packet_with_terminator() {
+    fn test_parse_client_to_server_with_terminator() {
         let opus_data = vec![0x01, 0x02];
-        let encoded = encode_voice_packet(100, &opus_data, true);
-        let parsed = parse_voice_packet(&encoded).unwrap();
-        assert_eq!(parsed.session_id, 100);
+        let mut packet = Vec::new();
+        packet.push((OPUS_TYPE << 5) | 0);
+        packet.extend_from_slice(&encode_varint(99)); // sequence = 99
+        packet.extend_from_slice(&encode_varint(opus_data.len() as u64 | 0x2000)); // terminator bit
+        packet.extend_from_slice(&opus_data);
+
+        let parsed = parse_voice_packet(&packet).unwrap();
+        assert_eq!(parsed.sequence, 99);
         assert_eq!(parsed.opus_data, opus_data);
         assert!(parsed.is_last);
+    }
+
+    #[test]
+    fn test_encode_server_to_client_packet() {
+        // Server->client: header + session(varint) + sequence(varint) + opus_len(varint) + opus_data
+        let opus_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let encoded = encode_voice_packet(42, 7, &opus_data, false);
+
+        // Manually decode to verify format
+        assert_eq!((encoded[0] >> 5) & 0x07, OPUS_TYPE);
+        let rest = &encoded[1..];
+        let (session, consumed) = read_varint(rest).unwrap();
+        assert_eq!(session, 42);
+        let rest = &rest[consumed..];
+        let (sequence, consumed) = read_varint(rest).unwrap();
+        assert_eq!(sequence, 7);
+        let rest = &rest[consumed..];
+        let (opus_header, consumed) = read_varint(rest).unwrap();
+        assert_eq!((opus_header & 0x1FFF) as usize, opus_data.len());
+        assert_eq!((opus_header & 0x2000), 0); // no terminator
+        let rest = &rest[consumed..];
+        assert_eq!(rest, &opus_data);
+    }
+
+    #[test]
+    fn test_encode_server_to_client_with_terminator() {
+        let opus_data = vec![0x01, 0x02];
+        let encoded = encode_voice_packet(100, 50, &opus_data, true);
+
+        let rest = &encoded[1..];
+        let (session, consumed) = read_varint(rest).unwrap();
+        assert_eq!(session, 100);
+        let rest = &rest[consumed..];
+        let (sequence, consumed) = read_varint(rest).unwrap();
+        assert_eq!(sequence, 50);
+        let rest = &rest[consumed..];
+        let (opus_header, consumed) = read_varint(rest).unwrap();
+        assert_eq!((opus_header & 0x1FFF) as usize, opus_data.len());
+        assert!((opus_header & 0x2000) != 0); // terminator set
+        let rest = &rest[consumed..];
+        assert_eq!(rest, &opus_data);
     }
 }
