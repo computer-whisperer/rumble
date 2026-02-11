@@ -16,6 +16,8 @@ message Authenticate {
   repeated string tokens = 3;
   repeated int32 celt_versions = 4;
   optional bool opus = 5;
+  // 0 = REGULAR, 1 = BOT
+  optional int32 client_type = 6;
 }
 
 message Ping {
@@ -43,6 +45,7 @@ message Reject {
     ServerFull = 6;
     NoCertificate = 7;
     AuthenticatorFail = 8;
+    NoNewConnections = 9;
   }
   optional RejectType type = 1;
   optional string reason = 2;
@@ -80,6 +83,8 @@ message UserRemove {
   optional uint32 actor = 2;
   optional string reason = 3;
   optional bool ban = 4;
+  optional bool ban_certificate = 5;
+  optional bool ban_ip = 6;
 }
 
 message UserState {

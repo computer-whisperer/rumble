@@ -12,8 +12,8 @@ pub struct MumbleMessage {
     pub payload: Vec<u8>,
 }
 
-/// Maximum message size (8 MB, same as Mumble default).
-const MAX_MESSAGE_SIZE: u32 = 8 * 1024 * 1024;
+/// Maximum message size, matching the official Mumble implementation (0x7fffff).
+const MAX_MESSAGE_SIZE: u32 = 0x7FFFFF;
 
 /// Read a single Mumble-framed message from a TLS stream.
 ///

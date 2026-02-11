@@ -127,6 +127,8 @@ pub async fn run_bridge(
                     actor: None,
                     reason: Some("Disconnected".to_string()),
                     ban: None,
+                    ban_certificate: None,
+                    ban_ip: None,
                 };
                 broadcast_to_all_mumble(&client_senders, MessageType::UserRemove, &remove);
             }
@@ -474,6 +476,8 @@ fn handle_state_update(
                     actor: None,
                     reason: Some("Left".to_string()),
                     ban: None,
+                    ban_certificate: None,
+                    ban_ip: None,
                 };
                 drop(state);
                 broadcast_to_all_mumble(client_senders, MessageType::UserRemove, &remove);
