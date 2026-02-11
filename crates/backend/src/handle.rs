@@ -2242,6 +2242,21 @@ fn handle_server_message(
                     proto::server_event::Kind::KeepAlive(_) => {
                         // Ignore keep-alive for now
                     }
+                    proto::server_event::Kind::WelcomeMessage(wm) => {
+                        let mut s = write_state(&state);
+                        s.chat_messages.push(crate::events::ChatMessage {
+                            id: uuid::Uuid::new_v4().into_bytes(),
+                            sender: "Server".to_string(),
+                            text: wm.text,
+                            timestamp: std::time::SystemTime::now(),
+                            is_local: true,
+                        });
+                        if s.chat_messages.len() > 100 {
+                            s.chat_messages.remove(0);
+                        }
+                        drop(s);
+                        repaint();
+                    }
                 }
             }
         }

@@ -509,6 +509,12 @@ fn handle_rumble_envelope(
                     }
 
                     proto::server_event::Kind::KeepAlive(_) => {}
+
+                    proto::server_event::Kind::WelcomeMessage(wm) => {
+                        info!("Received welcome message from Rumble server");
+                        let mut state = bridge_state.write().unwrap();
+                        state.welcome_message = Some(wm.text);
+                    }
                 }
             }
         }

@@ -235,11 +235,20 @@ async fn mumble_auth_handshake(
     };
     write_message(writer, MessageType::UserState, &self_user).await?;
 
+    // Use the Rumble server's welcome message if available, otherwise fall back to config
+    let welcome_text = {
+        let state = bridge_state.read().unwrap();
+        state
+            .welcome_message
+            .clone()
+            .unwrap_or_else(|| config.welcome_text.clone())
+    };
+
     // Send ServerSync
     let sync = mumble::ServerSync {
         session: Some(session),
         max_bandwidth: Some(config.max_bandwidth),
-        welcome_text: Some(config.welcome_text.clone()),
+        welcome_text: Some(welcome_text.clone()),
         permissions: Some(0x07FFFFFF), // All permissions
     };
     write_message(writer, MessageType::ServerSync, &sync).await?;
@@ -247,7 +256,7 @@ async fn mumble_auth_handshake(
     // Send ServerConfig
     let server_config = mumble::ServerConfig {
         max_bandwidth: Some(config.max_bandwidth),
-        welcome_text: Some(config.welcome_text.clone()),
+        welcome_text: Some(welcome_text),
         allow_html: Some(true),
         message_length: Some(5000),
         image_message_length: Some(131072),

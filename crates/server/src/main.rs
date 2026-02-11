@@ -41,12 +41,17 @@ async fn main() -> Result<()> {
     // Port 0 means OS will assign an available port
     let relay = Some(RelayConfig::default());
 
+    if let Some(ref msg) = server_config.welcome_message {
+        info!("Welcome message: {}", msg);
+    }
+
     let config = Config {
         bind: server_config.bind,
         certs,
         key,
         data_dir,
         relay,
+        welcome_message: server_config.welcome_message,
     };
 
     let server = Server::new(config)?;

@@ -252,7 +252,14 @@ message ServerEvent {
     ServerState server_state = 3;
     // Incremental state update with hash for verification
     StateUpdate state_update = 7;
+    // Welcome message (MOTD) sent after authentication
+    WelcomeMessage welcome_message = 8;
   }
+}
+
+// Welcome message (Message of the Day) sent to clients after authentication.
+message WelcomeMessage {
+  string text = 1;
 }
 
 // Broadcast of a chat message to all connected clients in the same room.

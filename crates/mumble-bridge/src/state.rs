@@ -150,6 +150,8 @@ pub struct BridgeState {
     pub virtual_user_map: HashMap<u32, u64>,
     /// Rumble virtual user ID -> Mumble session (reverse lookup).
     pub reverse_virtual_user_map: HashMap<u64, u32>,
+    /// Welcome message received from the Rumble server.
+    pub welcome_message: Option<String>,
 }
 
 impl BridgeState {
@@ -166,6 +168,7 @@ impl BridgeState {
             pending_registrations: Vec::new(),
             virtual_user_map: HashMap::new(),
             reverse_virtual_user_map: HashMap::new(),
+            welcome_message: None,
         }
     }
 
