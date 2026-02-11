@@ -1050,12 +1050,79 @@ async fn run_connection_task(
                                     timestamp_ms,
                                     sender: client_name.clone(),
                                     text,
+                                    tree: None,
                                 })),
                             };
                             let frame = encode_frame(&env);
                             if let Err(e) = send.write_all(&frame).await {
                                 error!("Failed to send ChatMessage: {}", e);
                             }
+                        }
+                    }
+
+                    Command::SendTreeChat { text } => {
+                        if let Some(send) = &mut send_stream {
+                            let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
+                            let timestamp_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64;
+                            let env = proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: Some(Payload::ChatMessage(proto::ChatMessage {
+                                    id: message_id,
+                                    timestamp_ms,
+                                    sender: client_name.clone(),
+                                    text,
+                                    tree: Some(true),
+                                })),
+                            };
+                            let frame = encode_frame(&env);
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send tree ChatMessage: {}", e);
+                            }
+                        }
+                    }
+
+                    Command::SendDirectMessage { target_user_id, target_username, text } => {
+                        if let Some(send) = &mut send_stream {
+                            let message_id = uuid::Uuid::new_v4().into_bytes();
+                            let timestamp = std::time::SystemTime::now();
+                            let timestamp_ms = timestamp
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64;
+                            let env = proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: Some(Payload::DirectMessage(proto::DirectMessage {
+                                    target_user_id,
+                                    text: text.clone(),
+                                    id: message_id.to_vec(),
+                                    timestamp_ms,
+                                })),
+                            };
+                            let frame = encode_frame(&env);
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send DirectMessage: {}", e);
+                            }
+                            // Add local message so the sender sees their own DM
+                            let mut s = write_state(&state);
+                            s.chat_messages.push(crate::events::ChatMessage {
+                                id: message_id,
+                                sender: client_name.clone(),
+                                text,
+                                timestamp,
+                                is_local: false,
+                                kind: crate::events::ChatMessageKind::DirectMessage {
+                                    other_user_id: target_user_id,
+                                    other_username: target_username,
+                                },
+                            });
+                            if s.chat_messages.len() > 100 {
+                                s.chat_messages.remove(0);
+                            }
+                            drop(s);
+                            repaint();
                         }
                     }
 
@@ -1067,6 +1134,7 @@ async fn run_connection_task(
                             text,
                             timestamp: std::time::SystemTime::now(),
                             is_local: true,
+                            kind: Default::default(),
                         });
                         // Keep only recent messages
                         if s.chat_messages.len() > 100 {
@@ -1220,6 +1288,7 @@ async fn run_connection_task(
                                         text: format!("Sharing {} via P2P (magnet: {})", shared.name, magnet),
                                         timestamp: SystemTime::now(),
                                         is_local: true,
+                                        kind: Default::default(),
                                     });
                                     repaint();
                                     continue;
@@ -1233,6 +1302,7 @@ async fn run_connection_task(
                                         text: format!("Failed to share file via P2P: {}", e),
                                         timestamp: SystemTime::now(),
                                         is_local: true,
+                                        kind: Default::default(),
                                     });
                                     repaint();
                                     // fall through to torrent path as a fallback
@@ -1275,6 +1345,7 @@ async fn run_connection_task(
                                             timestamp_ms,
                                             sender: client.clone(),
                                             text: text.clone(),
+                                            tree: None,
                                         })),
                                     };
                                     let frame = encode_frame(&env);
@@ -1290,6 +1361,7 @@ async fn run_connection_task(
                                         text: format!("Sharing {} ({} bytes)\nMagnet: {}", file_info.name, file_info.size, file_info.magnet),
                                         timestamp: SystemTime::now(),
                                         is_local: true,
+                                        kind: Default::default(),
                                     });
                                     repaint();
                                 }
@@ -1302,6 +1374,7 @@ async fn run_connection_task(
                                         text: format!("Failed to share file: {}", e),
                                         timestamp: SystemTime::now(),
                                         is_local: true,
+                                        kind: Default::default(),
                                     });
                                     repaint();
                                 }
@@ -1443,6 +1516,7 @@ async fn run_connection_task(
                                             text: "Started download".to_string(),
                                             timestamp: SystemTime::now(),
                                             is_local: true,
+                                            kind: Default::default(),
                                         });
                                         repaint();
                                     }
@@ -1456,6 +1530,7 @@ async fn run_connection_task(
                                             text: msg,
                                             timestamp: SystemTime::now(),
                                             is_local: true,
+                                            kind: Default::default(),
                                         });
                                         repaint();
                                     }
@@ -1575,6 +1650,7 @@ async fn run_connection_task(
                                     timestamp_ms,
                                     sender: client_name.clone(),
                                     text: request.to_json(),
+                                    tree: None,
                                 })),
                             };
                             let frame = encode_frame(&env);
@@ -1589,6 +1665,7 @@ async fn run_connection_task(
                                     text: "Requesting chat history from peers...".to_string(),
                                     timestamp: SystemTime::now(),
                                     is_local: true,
+                                    kind: Default::default(),
                                 });
                                 repaint();
                             }
@@ -2054,6 +2131,7 @@ fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn
         text,
         timestamp: std::time::SystemTime::now(),
         is_local: true,
+        kind: Default::default(),
     });
     // Keep only recent messages
     if s.chat_messages.len() > 100 {
@@ -2189,6 +2267,12 @@ fn handle_server_message(
                             drop(s);
                         }
 
+                        let kind = if cb.tree.unwrap_or(false) {
+                            crate::events::ChatMessageKind::Tree
+                        } else {
+                            crate::events::ChatMessageKind::Room
+                        };
+
                         let mut s = write_state(&state);
                         s.chat_messages.push(crate::events::ChatMessage {
                             id,
@@ -2196,6 +2280,7 @@ fn handle_server_message(
                             text: cb.text,
                             timestamp,
                             is_local: false,
+                            kind,
                         });
                         // Keep only recent messages
                         if s.chat_messages.len() > 100 {
@@ -2220,6 +2305,7 @@ fn handle_server_message(
                                             text: "Auto-download started".to_string(),
                                             timestamp: std::time::SystemTime::now(),
                                             is_local: true,
+                                            kind: Default::default(),
                                         });
                                         repaint();
                                     }
@@ -2232,12 +2318,40 @@ fn handle_server_message(
                                             text: format!("Auto-download failed: {}", e),
                                             timestamp: std::time::SystemTime::now(),
                                             is_local: true,
+                                            kind: Default::default(),
                                         });
                                         repaint();
                                     }
                                 }
                             });
                         }
+                    }
+                    proto::server_event::Kind::DirectMessageReceived(dm) => {
+                        // Incoming DM from another user (server no longer echoes to sender)
+                        let id: [u8; 16] = dm.id.try_into().unwrap_or_else(|_| uuid::Uuid::new_v4().into_bytes());
+                        let timestamp = if dm.timestamp_ms > 0 {
+                            std::time::UNIX_EPOCH + std::time::Duration::from_millis(dm.timestamp_ms as u64)
+                        } else {
+                            std::time::SystemTime::now()
+                        };
+
+                        let mut s = write_state(&state);
+                        s.chat_messages.push(crate::events::ChatMessage {
+                            id,
+                            sender: dm.sender_name.clone(),
+                            text: dm.text,
+                            timestamp,
+                            is_local: false,
+                            kind: crate::events::ChatMessageKind::DirectMessage {
+                                other_user_id: dm.sender_id,
+                                other_username: dm.sender_name,
+                            },
+                        });
+                        if s.chat_messages.len() > 100 {
+                            s.chat_messages.remove(0);
+                        }
+                        drop(s);
+                        repaint();
                     }
                     proto::server_event::Kind::KeepAlive(_) => {
                         // Ignore keep-alive for now

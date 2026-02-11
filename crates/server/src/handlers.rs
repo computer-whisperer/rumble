@@ -65,6 +65,12 @@ pub async fn handle_envelope(
             }
             handle_chat_message(msg, sender, state).await?;
         }
+        Some(Payload::DirectMessage(dm)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_direct_message(dm, sender, state).await?;
+        }
         Some(Payload::JoinRoom(jr)) => {
             if !sender.authenticated.load(Ordering::SeqCst) {
                 warn!(user_id = sender.user_id, "unauthenticated client tried to join room");
@@ -747,12 +753,16 @@ async fn send_command_result(sender: &ClientHandle, command: &str, success: bool
 }
 
 /// Handle chat message - broadcast to room members.
+///
+/// When the `tree` flag is set, the message is broadcast to the sender's room
+/// AND all descendant rooms in the hierarchy.
 async fn handle_chat_message(
     msg: proto::ChatMessage,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    info!("chat from {}: {}", msg.sender, msg.text);
+    let is_tree = msg.tree.unwrap_or(false);
+    info!("chat from {}: {} (tree={})", msg.sender, msg.text, is_tree);
 
     let sender_room = state.get_user_room(sender.user_id).await.unwrap_or(ROOT_ROOM_UUID);
 
@@ -777,21 +787,141 @@ async fn handle_chat_message(
                 timestamp_ms,
                 sender: msg.sender,
                 text: msg.text,
+                tree: if is_tree { Some(true) } else { None },
             })),
         })),
     };
     let frame = encode_frame(&broadcast);
 
+    // Build the set of target rooms
+    let target_rooms = if is_tree {
+        collect_descendant_rooms(&state, sender_room).await
+    } else {
+        let mut set = std::collections::HashSet::new();
+        set.insert(sender_room);
+        set
+    };
+
     // Snapshot clients first, then iterate without holding any state locks
     let clients = state.snapshot_clients();
     for h in clients {
         let user_room = state.get_user_room(h.user_id).await;
-        if user_room != Some(sender_room) {
+        let in_target = user_room.map(|r| target_rooms.contains(&r)).unwrap_or(false);
+        if !in_target {
             continue;
         }
         if let Err(e) = h.send_frame(&frame).await {
             error!("broadcast write failed: {e:?}");
         }
+    }
+
+    Ok(())
+}
+
+/// Collect a room and all its descendants from the room hierarchy.
+async fn collect_descendant_rooms(state: &ServerState, root: uuid::Uuid) -> std::collections::HashSet<uuid::Uuid> {
+    let rooms = state.get_rooms().await;
+
+    // Build parent -> children map
+    let mut children_map: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>> = std::collections::HashMap::new();
+    for room in &rooms {
+        let room_uuid = room.id.as_ref().and_then(uuid_from_room_id);
+        let parent_uuid = room.parent_id.as_ref().and_then(uuid_from_room_id);
+        if let (Some(rid), Some(pid)) = (room_uuid, parent_uuid) {
+            children_map.entry(pid).or_default().push(rid);
+        }
+    }
+
+    // BFS from root
+    let mut result = std::collections::HashSet::new();
+    result.insert(root);
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root);
+    while let Some(current) = queue.pop_front() {
+        if let Some(kids) = children_map.get(&current) {
+            for &kid in kids {
+                result.insert(kid);
+                queue.push_back(kid);
+            }
+        }
+    }
+    result
+}
+
+/// Handle direct message - route to target user and echo back to sender.
+async fn handle_direct_message(
+    dm: proto::DirectMessage,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    // IMPORTANT-4: Reject DM to self
+    if dm.target_user_id == sender.user_id {
+        return send_command_result(&sender, "DirectMessage", false, "Cannot send a DM to yourself").await;
+    }
+
+    let sender_name = sender.get_username().await;
+    info!(
+        "DM from {} (id={}) to user_id={}: {}",
+        sender_name, sender.user_id, dm.target_user_id, dm.text
+    );
+
+    // Validate target user exists and resolve target client + username
+    let (target_client, target_username) = match state.get_client(dm.target_user_id) {
+        Some(c) => {
+            let name = c.get_username().await;
+            (c, name)
+        }
+        None => {
+            // Target might be a virtual user on a bridge
+            if let Some(vu) = state.get_virtual_user(dm.target_user_id) {
+                let name = vu.username.clone();
+                // Find the bridge connection
+                match state.get_client(vu.bridge_owner_id) {
+                    Some(c) => (c, name),
+                    None => {
+                        return send_command_result(&sender, "DirectMessage", false, "Target user not found").await;
+                    }
+                }
+            } else {
+                return send_command_result(&sender, "DirectMessage", false, "Target user not found").await;
+            }
+        }
+    };
+
+    let message_id = if dm.id.len() == 16 {
+        dm.id
+    } else {
+        uuid::Uuid::new_v4().into_bytes().to_vec()
+    };
+
+    let timestamp_ms = if dm.timestamp_ms > 0 {
+        dm.timestamp_ms
+    } else {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    };
+
+    let dm_event = proto::DirectMessageReceived {
+        sender_id: sender.user_id,
+        sender_name: sender_name.clone(),
+        text: dm.text,
+        id: message_id,
+        timestamp_ms,
+        target_user_id: dm.target_user_id,
+        target_username,
+    };
+
+    let envelope = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::ServerEvent(proto::ServerEvent {
+            kind: Some(proto::server_event::Kind::DirectMessageReceived(dm_event.clone())),
+        })),
+    };
+    let frame = encode_frame(&envelope);
+
+    // Send only to the target (or the bridge owning a virtual target).
+    // The sender's client already adds the DM locally, no echo needed.
+    if let Err(e) = target_client.send_frame(&frame).await {
+        error!("Failed to send DM to target: {e:?}");
     }
 
     Ok(())
@@ -1708,6 +1838,7 @@ async fn handle_bridge_chat_message(
                 timestamp_ms,
                 sender: vu.username,
                 text: bcm.text,
+                tree: None,
             })),
         })),
     };

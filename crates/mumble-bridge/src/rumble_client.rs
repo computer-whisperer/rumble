@@ -126,6 +126,38 @@ pub async fn send_chat(send: &mut quinn::SendStream, sender: &str, text: &str) -
             timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
             sender: sender.to_string(),
             text: text.to_string(),
+            tree: None,
+        })),
+    };
+    send.write_all(&encode_frame(&msg)).await?;
+    Ok(())
+}
+
+/// Send a direct message to a specific Rumble user.
+pub async fn send_direct_message(send: &mut quinn::SendStream, target_user_id: u64, text: &str) -> Result<()> {
+    let msg = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::DirectMessage(proto::DirectMessage {
+            target_user_id,
+            text: text.to_string(),
+            id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+        })),
+    };
+    send.write_all(&encode_frame(&msg)).await?;
+    Ok(())
+}
+
+/// Send a tree chat message (broadcast to room and all descendants).
+pub async fn send_tree_chat(send: &mut quinn::SendStream, sender: &str, text: &str) -> Result<()> {
+    let msg = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::ChatMessage(proto::ChatMessage {
+            id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            sender: sender.to_string(),
+            text: text.to_string(),
+            tree: Some(true),
         })),
     };
     send.write_all(&encode_frame(&msg)).await?;
