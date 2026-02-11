@@ -62,6 +62,10 @@ pub async fn run_bridge(
     let mut client_senders: HashMap<u32, ClientSender> = HashMap::new();
     // Per-Rumble-user outbound sequence counters (for Rumble->Mumble direction)
     let mut rumble_outbound_seq: HashMap<u64, u64> = HashMap::new();
+    // Per-Mumble-session sequence counters (for Mumble->Rumble direction).
+    // Mumble's sequence increments by iFramesPerPacket (typically 2) per packet,
+    // but Rumble's jitter buffer expects consecutive (1-per-packet) sequences.
+    let mut mumble_to_rumble_seq: HashMap<u32, u32> = HashMap::new();
     // (virtual_user_id, mumble_session) pairs that need BridgeJoinRoom after registration
     let mut pending_join_rooms: Vec<(u64, u32)> = Vec::new();
     // Virtual user IDs that arrived late (Mumble client already left) and need cleanup
@@ -95,6 +99,7 @@ pub async fn run_bridge(
 
             BridgeEvent::MumbleClientLeft { session } => {
                 client_senders.remove(&session);
+                mumble_to_rumble_seq.remove(&session);
 
                 let (username, virtual_user_id) = {
                     let mut state = bridge_state.write().unwrap();
@@ -156,9 +161,14 @@ pub async fn run_bridge(
 
                 // Parse the Mumble voice packet and forward to Rumble as datagram
                 if let Some(voice) = mumble_voice::parse_voice_packet(&data) {
+                    // Use bridge-owned sequence counter instead of Mumble's sequence.
+                    // Mumble sequences increment by iFramesPerPacket (e.g. 2) per packet,
+                    // but Rumble's jitter buffer expects consecutive per-packet sequences.
+                    let seq = mumble_to_rumble_seq.entry(session).or_insert(0);
+                    *seq = seq.wrapping_add(1);
                     let datagram = proto::VoiceDatagram {
                         opus_data: voice.opus_data,
-                        sequence: voice.sequence as u32,
+                        sequence: *seq,
                         timestamp_us: 0,
                         end_of_stream: voice.is_last,
                         sender_id: Some(virtual_user_id),
