@@ -3970,8 +3970,35 @@ impl RumbleApp {
                                                 });
                                             });
                                         } else {
-                                            // Regular chat message
-                                            ui.label(format!("{}{}: {}", timestamp_prefix, msg.sender, msg.text));
+                                            // Chat message with kind-based prefix
+                                            match &msg.kind {
+                                                backend::events::ChatMessageKind::DirectMessage { .. } => {
+                                                    let prefix = format!(
+                                                        "{}[DM] {}: {}",
+                                                        timestamp_prefix, msg.sender, msg.text
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(prefix)
+                                                            .color(egui::Color32::from_rgb(200, 150, 255)),
+                                                    );
+                                                }
+                                                backend::events::ChatMessageKind::Tree => {
+                                                    let prefix = format!(
+                                                        "{}[Tree] {}: {}",
+                                                        timestamp_prefix, msg.sender, msg.text
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(prefix)
+                                                            .color(egui::Color32::from_rgb(150, 200, 150)),
+                                                    );
+                                                }
+                                                backend::events::ChatMessageKind::Room => {
+                                                    ui.label(format!(
+                                                        "{}{}: {}",
+                                                        timestamp_prefix, msg.sender, msg.text
+                                                    ));
+                                                }
+                                            }
                                         }
                                     }
                                 });
@@ -4023,7 +4050,51 @@ impl RumbleApp {
                                     if send {
                                         let text = self.chat_input.trim();
                                         if !text.is_empty() {
-                                            self.backend.send(Command::SendChat { text: text.to_owned() });
+                                            if text == "/msg" || text.starts_with("/msg ") {
+                                                // /msg <username> <message>
+                                                let rest = text.strip_prefix("/msg").unwrap().trim_start();
+                                                if let Some(space_idx) = rest.find(' ') {
+                                                    let target_name = &rest[..space_idx];
+                                                    let msg_text = rest[space_idx + 1..].trim();
+                                                    if !msg_text.is_empty() {
+                                                        // Look up user by name
+                                                        let target =
+                                                            state.users.iter().find(|u| u.username == target_name);
+                                                        if let Some(user) = target {
+                                                            let uid =
+                                                                user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
+                                                            self.backend.send(Command::SendDirectMessage {
+                                                                target_user_id: uid,
+                                                                target_username: target_name.to_owned(),
+                                                                text: msg_text.to_owned(),
+                                                            });
+                                                        } else {
+                                                            self.backend.send(Command::LocalMessage {
+                                                                text: format!("User '{}' not found", target_name),
+                                                            });
+                                                        }
+                                                    } else {
+                                                        self.backend.send(Command::LocalMessage {
+                                                            text: "Usage: /msg <username> <message>".to_owned(),
+                                                        });
+                                                    }
+                                                } else {
+                                                    self.backend.send(Command::LocalMessage {
+                                                        text: "Usage: /msg <username> <message>".to_owned(),
+                                                    });
+                                                }
+                                            } else if text == "/tree" || text.starts_with("/tree ") {
+                                                let rest = text.strip_prefix("/tree").unwrap().trim_start();
+                                                if !rest.is_empty() {
+                                                    self.backend.send(Command::SendTreeChat { text: rest.to_owned() });
+                                                } else {
+                                                    self.backend.send(Command::LocalMessage {
+                                                        text: "Usage: /tree <message>".to_owned(),
+                                                    });
+                                                }
+                                            } else {
+                                                self.backend.send(Command::SendChat { text: text.to_owned() });
+                                            }
                                             self.chat_input.clear();
                                         }
                                     }

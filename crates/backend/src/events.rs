@@ -628,6 +628,24 @@ impl AudioState {
 // Chat Message
 // =============================================================================
 
+/// The kind of chat message (room, DM, tree broadcast).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatMessageKind {
+    /// Normal room chat message.
+    #[default]
+    Room,
+    /// Direct (private) message. Contains the other user's ID and name.
+    DirectMessage {
+        /// The user ID of the other party (sender for incoming, target for outgoing).
+        other_user_id: u64,
+        /// The username of the other party.
+        other_username: String,
+    },
+    /// Tree broadcast message (sent to a room and all descendants).
+    Tree,
+}
+
 /// A chat message.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatMessage {
@@ -641,6 +659,9 @@ pub struct ChatMessage {
     pub timestamp: std::time::SystemTime,
     /// True if this is a local status message (not from the server).
     pub is_local: bool,
+    /// The kind of message (room chat, DM, or tree broadcast).
+    #[serde(default)]
+    pub kind: ChatMessageKind,
 }
 
 // =============================================================================
@@ -985,6 +1006,7 @@ impl ChatHistoryContent {
                     text: e.text.clone(),
                     timestamp,
                     is_local: false,
+                    kind: ChatMessageKind::default(),
                 })
             })
             .collect()
@@ -1357,6 +1379,16 @@ pub enum Command {
     SendChat {
         text: String,
     },
+    /// Send a tree chat message (broadcast to room and all descendants).
+    SendTreeChat {
+        text: String,
+    },
+    /// Send a direct (private) message to a specific user.
+    SendDirectMessage {
+        target_user_id: u64,
+        target_username: String,
+        text: String,
+    },
     /// Add a local status message (not sent to server).
     LocalMessage {
         text: String,
@@ -1539,6 +1571,17 @@ impl std::fmt::Debug for Command {
                 .field("description", description)
                 .finish(),
             Command::SendChat { text } => f.debug_struct("SendChat").field("text", text).finish(),
+            Command::SendTreeChat { text } => f.debug_struct("SendTreeChat").field("text", text).finish(),
+            Command::SendDirectMessage {
+                target_user_id,
+                target_username,
+                text,
+            } => f
+                .debug_struct("SendDirectMessage")
+                .field("target_user_id", target_user_id)
+                .field("target_username", target_username)
+                .field("text", text)
+                .finish(),
             Command::LocalMessage { text } => f.debug_struct("LocalMessage").field("text", text).finish(),
             Command::SetInputDevice { device_id } => {
                 f.debug_struct("SetInputDevice").field("device_id", device_id).finish()

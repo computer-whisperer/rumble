@@ -391,7 +391,12 @@ async fn mumble_message_loop(
             Some(MessageType::TextMessage) => {
                 if let Ok(text_msg) = mumble::TextMessage::decode(&*msg.payload) {
                     if let Some(message) = text_msg.message {
-                        bridge_tx.send(BridgeEvent::MumbleChat { session, message })?;
+                        bridge_tx.send(BridgeEvent::MumbleChat {
+                            session,
+                            message,
+                            target_sessions: text_msg.session,
+                            target_tree_ids: text_msg.tree_id,
+                        })?;
                     }
                 }
             }

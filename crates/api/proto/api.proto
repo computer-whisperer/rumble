@@ -110,6 +110,7 @@ message Envelope {
     Disconnect disconnect = 13;
     ServerEvent server_event = 14;
     JoinRoom join_room = 16;
+    DirectMessage direct_message = 27;
     CreateRoom create_room = 20;
     DeleteRoom delete_room = 21;
     RenameRoom rename_room = 22;
@@ -206,6 +207,17 @@ message ChatMessage {
   int64 timestamp_ms = 2; // Unix timestamp milliseconds
   string sender = 3;
   string text = 4;        // EasyMark or JSON for file messages
+  // When true, broadcast to sender's room AND all descendant rooms.
+  optional bool tree = 5;
+}
+
+// Direct message sent from one user to another.
+// Client -> Server: send a private message to target_user_id.
+message DirectMessage {
+  uint64 target_user_id = 1;
+  string text = 2;
+  bytes id = 3;           // 16-byte UUID
+  int64 timestamp_ms = 4; // Unix timestamp milliseconds
 }
 
 // Graceful disconnect notification.
@@ -265,6 +277,8 @@ message ServerEvent {
     StateUpdate state_update = 7;
     // Welcome message (MOTD) sent after authentication
     WelcomeMessage welcome_message = 8;
+    // A direct (private) message received from another user.
+    DirectMessageReceived direct_message_received = 9;
   }
 }
 
@@ -273,12 +287,25 @@ message WelcomeMessage {
   string text = 1;
 }
 
+// Server -> Client: A direct message was received (or sent confirmation).
+message DirectMessageReceived {
+  uint64 sender_id = 1;
+  string sender_name = 2;
+  string text = 3;
+  bytes id = 4;           // 16-byte UUID
+  int64 timestamp_ms = 5;
+  uint64 target_user_id = 6;
+  string target_username = 7;
+}
+
 // Broadcast of a chat message to all connected clients in the same room.
 message ChatBroadcast {
   bytes id = 1;           // 16-byte UUID
   int64 timestamp_ms = 2; // Unix timestamp milliseconds
   string sender = 3;
   string text = 4;
+  // When true, this message was sent to a tree of rooms.
+  optional bool tree = 5;
 }
 
 // Empty keep-alive message with optional timestamp.

@@ -34,7 +34,14 @@ pub enum BridgeEvent {
     /// Mumble client sent voice data.
     MumbleVoice { session: u32, data: Vec<u8> },
     /// Mumble client sent a text message.
-    MumbleChat { session: u32, message: String },
+    MumbleChat {
+        session: u32,
+        message: String,
+        /// Target session IDs for private messages (Mumble TextMessage.session field).
+        target_sessions: Vec<u32>,
+        /// Target tree IDs for tree messages (Mumble TextMessage.tree_id field).
+        target_tree_ids: Vec<u32>,
+    },
     /// Mumble client changed channel.
     MumbleChannelChange { session: u32, channel_id: u32 },
     /// Mumble client changed mute/deaf state.
@@ -246,15 +253,52 @@ pub async fn run_bridge(
                 }
             }
 
-            BridgeEvent::MumbleChat { session, message } => {
+            BridgeEvent::MumbleChat {
+                session,
+                message,
+                target_sessions,
+                target_tree_ids,
+            } => {
                 // Look up the virtual user ID for per-user chat attribution
                 let virtual_user_id = {
                     let state = bridge_state.read().unwrap();
                     state.virtual_user_map.get(&session).copied()
                 };
 
-                if let Some(vid) = virtual_user_id {
-                    // Send as the virtual user via bridge protocol
+                if !target_sessions.is_empty() {
+                    // Private message targeting specific sessions.
+                    // Resolve Mumble session to Rumble user ID while holding the lock,
+                    // then drop the lock before the async send.
+                    let target_rumble_id = {
+                        let state = bridge_state.read().unwrap();
+                        target_sessions.iter().find_map(|&ts| {
+                            state
+                                .virtual_user_map
+                                .get(&ts)
+                                .copied()
+                                .or_else(|| state.users.get_rumble_id(ts))
+                        })
+                    };
+                    if let Some(target_id) = target_rumble_id {
+                        if let Err(e) = rumble_client::send_direct_message(rumble_send, target_id, &message).await {
+                            warn!(error = %e, "Failed to send DM to Rumble");
+                        }
+                    }
+                } else if !target_tree_ids.is_empty() {
+                    // Tree message - send as tree chat to Rumble
+                    let sender_name = {
+                        let state = bridge_state.read().unwrap();
+                        state
+                            .mumble_clients
+                            .get(&session)
+                            .map(|c| c.username.clone())
+                            .unwrap_or_else(|| format!("session-{}", session))
+                    };
+                    if let Err(e) = rumble_client::send_tree_chat(rumble_send, &sender_name, &message).await {
+                        warn!(error = %e, "Failed to send tree chat to Rumble");
+                    }
+                } else if let Some(vid) = virtual_user_id {
+                    // Normal channel message - send as the virtual user via bridge protocol
                     if let Err(e) = rumble_client::send_bridge_chat_message(rumble_send, vid, &message).await {
                         warn!(error = %e, "Failed to send BridgeChatMessage to Rumble");
                     }
@@ -506,6 +550,34 @@ fn handle_rumble_envelope(
                             ..Default::default()
                         };
                         broadcast_to_all_mumble(client_senders, MessageType::TextMessage, &text_msg);
+                    }
+
+                    proto::server_event::Kind::DirectMessageReceived(dm) => {
+                        // A DM directed at one of our virtual users.
+                        // Use target_user_id to find the correct Mumble session.
+                        let target_session = {
+                            let state = bridge_state.read().unwrap();
+                            state.reverse_virtual_user_map.get(&dm.target_user_id).copied()
+                        };
+
+                        if let Some(session) = target_session {
+                            let actor = {
+                                let state = bridge_state.read().unwrap();
+                                state.users.get_mumble_session(dm.sender_id)
+                            };
+                            let text = format!("[DM] {}: {}", dm.sender_name, dm.text);
+                            let text_msg = mumble::TextMessage {
+                                actor,
+                                message: Some(text),
+                                ..Default::default()
+                            };
+                            send_to_mumble_session(client_senders, session, MessageType::TextMessage, &text_msg);
+                        } else {
+                            debug!(
+                                target_user_id = dm.target_user_id,
+                                "DM target is not a virtual user on this bridge, ignoring"
+                            );
+                        }
                     }
 
                     proto::server_event::Kind::KeepAlive(_) => {}
@@ -886,6 +958,22 @@ fn handle_rumble_voice(
             }
             let _ = sender.tx.send(MumbleOutbound::Voice(voice_data.clone()));
         }
+    }
+}
+
+/// Send a protobuf message to a single Mumble client by session ID.
+fn send_to_mumble_session(
+    senders: &HashMap<u32, ClientSender>,
+    session: u32,
+    msg_type: MessageType,
+    msg: &impl Message,
+) {
+    if let Some(sender) = senders.get(&session) {
+        let payload = msg.encode_to_vec();
+        let _ = sender.tx.send(MumbleOutbound::Protobuf {
+            msg_type: msg_type as u16,
+            payload,
+        });
     }
 }
 
