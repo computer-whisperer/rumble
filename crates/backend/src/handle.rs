@@ -1058,7 +1058,7 @@ async fn run_connection_task(
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                             let timestamp_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as i64;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
@@ -1082,7 +1082,7 @@ async fn run_connection_task(
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                             let timestamp_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as i64;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
@@ -1107,7 +1107,7 @@ async fn run_connection_task(
                             let timestamp = std::time::SystemTime::now();
                             let timestamp_ms = timestamp
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as i64;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
@@ -1280,7 +1280,7 @@ async fn run_connection_task(
                                         let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                                         let timestamp_ms = SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_millis() as i64;
 
                                         let env = proto::Envelope {
@@ -1351,7 +1351,7 @@ async fn run_connection_task(
                                     let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                                     let timestamp_ms = SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
+                                        .unwrap_or_default()
                                         .as_millis() as i64;
 
                                     // Send to server as chat message
@@ -1657,7 +1657,7 @@ async fn run_connection_task(
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                             let timestamp_ms = SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as i64;
 
                             let env = proto::Envelope {
@@ -1739,7 +1739,7 @@ async fn run_connection_task(
                                         let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                                         let timestamp_ms = SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_millis() as i64;
 
                                         let env = proto::Envelope {
