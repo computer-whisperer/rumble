@@ -66,11 +66,32 @@ impl Codec for FileCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
+        const MAX_FILE_NAME_LEN: usize = 4096;
+        const MAX_FILE_DATA_LEN: usize = 256 * 1024 * 1024; // 256 MiB
+
         let mut header = [0u8; 11];
         AsyncReadExt::read_exact(io, &mut header).await?;
         let ok = header[0] == 1;
         let name_len = u16::from_be_bytes([header[1], header[2]]) as usize;
-        let data_len = u64::from_be_bytes(header[3..11].try_into().unwrap()) as usize;
+        let data_len = u64::from_be_bytes(
+            header[3..11]
+                .try_into()
+                .expect("11-byte header always has 8 bytes at [3..11]"),
+        ) as usize;
+
+        if name_len > MAX_FILE_NAME_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("file name length {} exceeds maximum {}", name_len, MAX_FILE_NAME_LEN),
+            ));
+        }
+        if data_len > MAX_FILE_DATA_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("file data length {} exceeds maximum {}", data_len, MAX_FILE_DATA_LEN),
+            ));
+        }
+
         let mut name_buf = vec![0u8; name_len];
         AsyncReadExt::read_exact(io, &mut name_buf).await?;
         let mut data = vec![0u8; data_len];
@@ -243,7 +264,7 @@ impl P2PManager {
                                         }
                                     }
                                     request_response::Event::OutboundFailure { request_id, error, .. } => {
-                                        println!("outbound failure: {error:?}");
+                                        tracing::warn!("outbound failure: {error:?}");
                                         if let Some(tx) = pending.remove(&request_id) {
                                             let _ = tx.send(Err(anyhow::anyhow!("request failed: {error}")));
                                         }
@@ -261,7 +282,6 @@ impl P2PManager {
                             }
                             SwarmEvent::OutgoingConnectionError { error, .. } => {
                                 tracing::warn!(%error, "p2p dial error");
-                                println!("dial error: {error}");
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                                 tracing::debug!(%peer_id, "p2p connected");

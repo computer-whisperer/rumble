@@ -467,7 +467,7 @@ impl AudioOutput {
                                 data.fill(0.0);
                                 return;
                             }
-                            let mut buffer = playback_buffer_clone.lock().unwrap();
+                            let mut buffer = playback_buffer_clone.lock().unwrap_or_else(|e| e.into_inner());
                             let buffer_len_before = buffer.len();
                             let was_in_underrun = in_underrun_clone.load(Ordering::Relaxed);
                             let mut samples_played = 0usize;
@@ -519,7 +519,7 @@ impl AudioOutput {
                             data.fill(0);
                             return;
                         }
-                        let mut buffer = playback_buffer_clone.lock().unwrap();
+                        let mut buffer = playback_buffer_clone.lock().unwrap_or_else(|e| e.into_inner());
                         for sample in data.iter_mut() {
                             let f = buffer.pop_front().unwrap_or(0.0);
                             *sample = (f * i16::MAX as f32) as i16;
@@ -535,7 +535,7 @@ impl AudioOutput {
                             data.fill(u16::MAX / 2);
                             return;
                         }
-                        let mut buffer = playback_buffer_clone.lock().unwrap();
+                        let mut buffer = playback_buffer_clone.lock().unwrap_or_else(|e| e.into_inner());
                         for sample in data.iter_mut() {
                             let f = buffer.pop_front().unwrap_or(0.0);
                             *sample = ((f + 1.0) / 2.0 * u16::MAX as f32) as u16;
@@ -552,7 +552,7 @@ impl AudioOutput {
                                 data.fill(128); // Silence for U8
                                 return;
                             }
-                            let mut buffer = playback_buffer_clone.lock().unwrap();
+                            let mut buffer = playback_buffer_clone.lock().unwrap_or_else(|e| e.into_inner());
                             for sample in data.iter_mut() {
                                 let f = buffer.pop_front().unwrap_or(0.0);
                                 // Convert f32 [-1, 1] to u8 [0, 255] with 128 as center
@@ -575,7 +575,7 @@ impl AudioOutput {
                         data.fill(0.0);
                         return;
                     }
-                    let mut buffer = playback_buffer_clone.lock().unwrap();
+                    let mut buffer = playback_buffer_clone.lock().unwrap_or_else(|e| e.into_inner());
                     for sample in data.iter_mut() {
                         *sample = buffer.pop_front().unwrap_or(0.0);
                     }
@@ -618,7 +618,7 @@ impl AudioOutput {
     /// Playback reads from the front (oldest) - FIFO order.
     /// If the buffer would exceed `max_buffer_size`, oldest samples are dropped.
     pub fn queue_samples(&self, samples: &[f32]) {
-        let mut buffer = self.playback_buffer.lock().unwrap();
+        let mut buffer = self.playback_buffer.lock().unwrap_or_else(|e| e.into_inner());
 
         // Add new samples to the back
         buffer.extend(samples.iter().copied());
@@ -649,7 +649,7 @@ impl AudioOutput {
 
     /// Get the number of samples currently buffered.
     pub fn buffered_samples(&self) -> usize {
-        self.playback_buffer.lock().unwrap().len()
+        self.playback_buffer.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Pause audio playback.
@@ -671,7 +671,7 @@ impl AudioOutput {
 
     /// Clear the playback buffer.
     pub fn clear_buffer(&self) {
-        self.playback_buffer.lock().unwrap().clear();
+        self.playback_buffer.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
