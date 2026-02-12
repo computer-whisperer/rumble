@@ -354,12 +354,19 @@ impl TorrentManager {
 
     /// Check if an address is a relay proxy, returning the original peer address if so.
     pub fn get_relay_original_addr(&self, proxy_addr: &SocketAddr) -> Option<SocketAddr> {
-        self.relay_proxy_addrs.read().unwrap().get(proxy_addr).copied()
+        self.relay_proxy_addrs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(proxy_addr)
+            .copied()
     }
 
     /// Check if an address is a relay proxy (localhost connection that we proxied).
     pub fn is_relay_proxy(&self, addr: &SocketAddr) -> bool {
-        self.relay_proxy_addrs.read().unwrap().contains_key(addr)
+        self.relay_proxy_addrs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(addr)
     }
 
     pub async fn share_file(&self, path: PathBuf) -> anyhow::Result<SharedFileInfo> {
@@ -409,7 +416,7 @@ impl TorrentManager {
         // This is needed because get_file_path() needs to return the original location,
         // not the default output_folder
         {
-            let mut shared_paths = self.shared_file_paths.write().unwrap();
+            let mut shared_paths = self.shared_file_paths.write().unwrap_or_else(|e| e.into_inner());
             shared_paths.insert(info_hash.0, path.clone());
         }
 
@@ -436,7 +443,7 @@ impl TorrentManager {
             .ok_or(anyhow::anyhow!("Invalid magnet link"))?
             .split('&')
             .next()
-            .unwrap();
+            .expect("magnet link always has content after xt=urn:btih:");
         let info_hash_bytes = hex::decode(info_hash_hex)?;
         let info_hash: [u8; 20] = info_hash_bytes
             .try_into()
@@ -587,7 +594,8 @@ impl TorrentManager {
                                             );
                                             // Track this proxy so we can identify relay connections
                                             {
-                                                let mut proxies = self.relay_proxy_addrs.write().unwrap();
+                                                let mut proxies =
+                                                    self.relay_proxy_addrs.write().unwrap_or_else(|e| e.into_inner());
                                                 proxies.insert(proxy_addr, direct_addr);
                                             }
                                             peers.push(proxy_addr);
@@ -898,7 +906,12 @@ impl TorrentManager {
             .map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
 
         // First check if this is a shared file (we have its original path stored)
-        if let Some(path) = self.shared_file_paths.read().unwrap().get(&hash) {
+        if let Some(path) = self
+            .shared_file_paths
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&hash)
+        {
             return Ok(path.clone());
         }
 

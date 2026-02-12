@@ -1058,7 +1058,7 @@ async fn run_connection_task(
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                             let timestamp_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as i64;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
@@ -1082,7 +1082,7 @@ async fn run_connection_task(
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                             let timestamp_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as i64;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
@@ -1107,7 +1107,7 @@ async fn run_connection_task(
                             let timestamp = std::time::SystemTime::now();
                             let timestamp_ms = timestamp
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as i64;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
@@ -1280,7 +1280,7 @@ async fn run_connection_task(
                                         let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                                         let timestamp_ms = SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_millis() as i64;
 
                                         let env = proto::Envelope {
@@ -1351,7 +1351,7 @@ async fn run_connection_task(
                                     let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                                     let timestamp_ms = SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
+                                        .unwrap_or_default()
                                         .as_millis() as i64;
 
                                     // Send to server as chat message
@@ -1657,7 +1657,7 @@ async fn run_connection_task(
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                             let timestamp_ms = SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as i64;
 
                             let env = proto::Envelope {
@@ -1739,7 +1739,7 @@ async fn run_connection_task(
                                         let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                                         let timestamp_ms = SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_millis() as i64;
 
                                         let env = proto::Envelope {
@@ -1939,7 +1939,10 @@ async fn connect_to_server(
     let session_signing = ed25519_dalek::SigningKey::from_bytes(&session_secret);
     let session_public_bytes: [u8; 32] = session_signing.verifying_key().to_bytes();
 
-    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
     let expires_ms = timestamp_ms + 24 * 60 * 60 * 1000; // 24h validity for session cert
 
     let cert_payload = build_session_cert_payload(&session_public_bytes, timestamp_ms, expires_ms, Some(client_name));
@@ -2680,9 +2683,9 @@ fn make_client_endpoint(
 ) -> anyhow::Result<Endpoint> {
     // Bind to the same address family as the remote address
     let bind_addr: std::net::SocketAddr = if remote_addr.is_ipv6() {
-        "[::]:0".parse().unwrap()
+        "[::]:0".parse().expect("valid IPv6 any address")
     } else {
-        "0.0.0.0:0".parse().unwrap()
+        "0.0.0.0:0".parse().expect("valid IPv4 any address")
     };
     let mut endpoint = Endpoint::client(bind_addr)?;
 
@@ -2751,7 +2754,11 @@ fn make_client_endpoint(
 
     // Configure transport
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(30)
+            .try_into()
+            .expect("30s is within idle timeout bounds"),
+    ));
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     transport_config.datagram_receive_buffer_size(Some(65536));
     client_config.transport_config(Arc::new(transport_config));

@@ -256,14 +256,14 @@ impl RpcServer {
     ) -> RpcResponse {
         match request {
             RpcRequest::GetState => {
-                let state = state.read().unwrap();
+                let state = state.read().unwrap_or_else(|e| e.into_inner());
                 match serde_json::to_value(&*state) {
                     Ok(value) => RpcResponse::ok_with_data(value),
                     Err(e) => RpcResponse::error(format!("Serialization error: {}", e)),
                 }
             }
             RpcRequest::GetStatus => {
-                let state = state.read().unwrap();
+                let state = state.read().unwrap_or_else(|e| e.into_inner());
                 let status = match &state.connection {
                     ConnectionState::Disconnected => serde_json::json!({
                         "connected": false,
