@@ -107,6 +107,51 @@ impl Default for ImageViewModalState {
     }
 }
 
+/// State for the kick user modal
+#[derive(Default)]
+struct KickModalState {
+    open: bool,
+    target_user_id: u64,
+    target_username: String,
+    reason: String,
+}
+
+/// State for the ban user modal
+struct BanModalState {
+    open: bool,
+    target_user_id: u64,
+    target_username: String,
+    reason: String,
+    duration_index: usize,
+}
+
+impl Default for BanModalState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            target_user_id: 0,
+            target_username: String::new(),
+            reason: String::new(),
+            duration_index: 0,
+        }
+    }
+}
+
+/// State for the elevate (sudo) modal
+#[derive(Default)]
+struct ElevateModalState {
+    open: bool,
+    password: String,
+}
+
+const BAN_DURATIONS: &[(&str, u64)] = &[
+    ("Permanent", 0),
+    ("1 hour", 3600),
+    ("1 day", 86400),
+    ("1 week", 604800),
+    ("30 days", 2592000),
+];
+
 /// Validate a magnet link format.
 fn is_valid_magnet(s: &str) -> bool {
     s.starts_with("magnet:?") && s.contains("xt=urn:btih:")
@@ -264,6 +309,15 @@ pub struct RumbleApp {
 
     // Image view modal state (click-to-enlarge)
     image_view_modal: ImageViewModalState,
+
+    // Kick user modal state
+    kick_modal: KickModalState,
+
+    // Ban user modal state
+    ban_modal: BanModalState,
+
+    // Elevate (sudo) modal state
+    elevate_modal: ElevateModalState,
 
     // Settings modal state with pending changes
     settings_modal: SettingsModalState,
@@ -545,6 +599,9 @@ impl RumbleApp {
             delete_room_modal: DeleteRoomModalState::default(),
             description_modal: DescriptionModalState::default(),
             image_view_modal: ImageViewModalState::default(),
+            kick_modal: KickModalState::default(),
+            ban_modal: BanModalState::default(),
+            elevate_modal: ElevateModalState::default(),
             settings_modal: SettingsModalState::default(),
             push_to_talk_active: false,
             hotkey_registration_status: std::collections::HashMap::new(),
@@ -3687,6 +3744,32 @@ impl RumbleApp {
                         }
                     });
 
+                // Elevate button (visible when connected and not already elevated)
+                if state.connection.is_connected() {
+                    let is_elevated = state
+                        .my_user_id
+                        .and_then(|my_id| {
+                            state
+                                .users
+                                .iter()
+                                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(my_id))
+                        })
+                        .map(|u| u.is_elevated)
+                        .unwrap_or(false);
+                    if !is_elevated {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("🔑").size(18.0)))
+                            .on_hover_text("Elevate to Superuser")
+                            .clicked()
+                        {
+                            self.elevate_modal = ElevateModalState {
+                                open: true,
+                                password: String::new(),
+                            };
+                        }
+                    }
+                }
+
                 ui.separator();
 
                 // Settings button
@@ -4207,6 +4290,8 @@ impl RumbleApp {
                 let mut pending_rename: Option<(Option<Uuid>, String)> = None;
                 let mut pending_delete: Option<(Uuid, String)> = None;
                 let mut pending_description: Option<(Uuid, String, String)> = None;
+                let mut pending_kick: Option<(u64, String)> = None;
+                let mut pending_ban: Option<(u64, String)> = None;
 
                 // Build set of rooms that have users in them or in any descendant
                 let mut rooms_with_users: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
@@ -4231,6 +4316,8 @@ impl RumbleApp {
                             pending_rename: &mut Option<(Option<Uuid>, String)>,
                             pending_delete: &mut Option<(Uuid, String)>,
                             pending_description: &mut Option<(Uuid, String, String)>,
+                            pending_kick: &mut Option<(u64, String)>,
+                            pending_ban: &mut Option<(u64, String)>,
                             builder: &mut egui_ltreeview::TreeViewBuilder<TreeNodeId>,
                         ) {
                             let Some(tree_node) = state.room_tree.get(room_id) else {
@@ -4323,7 +4410,15 @@ impl RumbleApp {
                             if is_open {
                                 // Render users in this room
                                 for user in state.users_in_room(room_id) {
-                                    render_user(room_id, user, state, pending_commands, builder);
+                                    render_user(
+                                        room_id,
+                                        user,
+                                        state,
+                                        pending_commands,
+                                        pending_kick,
+                                        pending_ban,
+                                        builder,
+                                    );
                                 }
 
                                 // Recursively render child rooms
@@ -4336,6 +4431,8 @@ impl RumbleApp {
                                         pending_rename,
                                         pending_delete,
                                         pending_description,
+                                        pending_kick,
+                                        pending_ban,
                                         builder,
                                     );
                                 }
@@ -4350,6 +4447,8 @@ impl RumbleApp {
                             user: &api::proto::User,
                             state: &backend::State,
                             pending_commands: &mut Vec<Command>,
+                            pending_kick: &mut Option<(u64, String)>,
+                            pending_ban: &mut Option<(u64, String)>,
                             builder: &mut egui_ltreeview::TreeViewBuilder<TreeNodeId>,
                         ) {
                             let user_id = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
@@ -4552,15 +4651,14 @@ impl RumbleApp {
                                         // ACL: Kick (requires KICK permission)
                                         if eff.contains(Permissions::KICK) {
                                             if ui.button("⚡ Kick").clicked() {
-                                                pending_commands.push(Command::KickUser {
-                                                    target_user_id: user_id,
-                                                    reason: String::new(),
-                                                });
+                                                *pending_kick = Some((user_id, username.clone()));
+                                                ui.close();
+                                            }
+                                            if ui.button("🚫 Ban").clicked() {
+                                                *pending_ban = Some((user_id, username.clone()));
                                                 ui.close();
                                             }
                                         }
-
-                                        // Ban dialog will be added in acl-ui-dialogs worktree
 
                                         ui.separator();
 
@@ -4588,6 +4686,8 @@ impl RumbleApp {
                                 &mut pending_rename,
                                 &mut pending_delete,
                                 &mut pending_description,
+                                &mut pending_kick,
+                                &mut pending_ban,
                                 builder,
                             );
                         }
@@ -4669,6 +4769,27 @@ impl RumbleApp {
                         room_uuid: Some(room_uuid),
                         room_name,
                         description,
+                    };
+                }
+
+                // Handle kick modal
+                if let Some((uid, uname)) = pending_kick {
+                    self.kick_modal = KickModalState {
+                        open: true,
+                        target_user_id: uid,
+                        target_username: uname,
+                        reason: String::new(),
+                    };
+                }
+
+                // Handle ban modal
+                if let Some((uid, uname)) = pending_ban {
+                    self.ban_modal = BanModalState {
+                        open: true,
+                        target_user_id: uid,
+                        target_username: uname,
+                        reason: String::new(),
+                        duration_index: 0,
                     };
                 }
             });
@@ -5128,6 +5249,131 @@ impl RumbleApp {
             });
             if modal.should_close() {
                 self.delete_room_modal.open = false;
+            }
+        }
+
+        // Kick user modal
+        if self.kick_modal.open {
+            let modal = Modal::new(egui::Id::new("kick_modal")).show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.heading(format!("Kick {}", self.kick_modal.target_username));
+                ui.add_space(8.0);
+                ui.label("Reason (optional):");
+                ui.text_edit_singleline(&mut self.kick_modal.reason);
+                ui.add_space(8.0);
+                ui.separator();
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        ui.style_mut().spacing.item_spacing.x = 8.0;
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("Kick").color(egui::Color32::RED)))
+                            .clicked()
+                        {
+                            self.backend.send(Command::KickUser {
+                                target_user_id: self.kick_modal.target_user_id,
+                                reason: self.kick_modal.reason.clone(),
+                            });
+                            ui.close();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ui.close();
+                        }
+                    },
+                );
+            });
+            if modal.should_close() {
+                self.kick_modal.open = false;
+            }
+        }
+
+        // Ban user modal
+        if self.ban_modal.open {
+            let modal = Modal::new(egui::Id::new("ban_modal")).show(ctx, |ui| {
+                ui.set_width(350.0);
+                ui.heading(format!("Ban {}", self.ban_modal.target_username));
+                ui.add_space(8.0);
+
+                ui.label("Reason:");
+                ui.text_edit_singleline(&mut self.ban_modal.reason);
+                ui.add_space(4.0);
+
+                ui.label("Duration:");
+                egui::ComboBox::from_id_salt("ban_duration")
+                    .selected_text(BAN_DURATIONS[self.ban_modal.duration_index].0)
+                    .show_ui(ui, |ui| {
+                        for (i, (label, _)) in BAN_DURATIONS.iter().enumerate() {
+                            ui.selectable_value(&mut self.ban_modal.duration_index, i, *label);
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.separator();
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        ui.style_mut().spacing.item_spacing.x = 8.0;
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("Ban").color(egui::Color32::RED)))
+                            .clicked()
+                        {
+                            let reason = self.ban_modal.reason.clone();
+
+                            // TODO: Send ban command when BanUser command is available.
+                            // For now, kick the user with the ban reason.
+                            self.backend.send(Command::KickUser {
+                                target_user_id: self.ban_modal.target_user_id,
+                                reason: if reason.is_empty() {
+                                    "Banned".to_string()
+                                } else {
+                                    format!("Banned: {}", reason)
+                                },
+                            });
+
+                            ui.close();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ui.close();
+                        }
+                    },
+                );
+            });
+            if modal.should_close() {
+                self.ban_modal.open = false;
+            }
+        }
+
+        // Elevate (sudo) modal
+        if self.elevate_modal.open {
+            let modal = Modal::new(egui::Id::new("elevate_modal")).show(ctx, |ui| {
+                ui.set_width(280.0);
+                ui.heading("Elevate to Superuser");
+                ui.add_space(8.0);
+                ui.label("Enter sudo password:");
+                ui.add(egui::TextEdit::singleline(&mut self.elevate_modal.password).password(true));
+                ui.add_space(8.0);
+                ui.separator();
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        ui.style_mut().spacing.item_spacing.x = 8.0;
+                        if ui.button("Elevate").clicked() {
+                            self.backend.send(Command::Elevate {
+                                password: self.elevate_modal.password.clone(),
+                            });
+                            ui.close();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ui.close();
+                        }
+                    },
+                );
+            });
+            if modal.should_close() {
+                self.elevate_modal.open = false;
             }
         }
 
