@@ -50,6 +50,7 @@
 //! }
 //! ```
 
+pub mod acl;
 pub mod config;
 pub mod handlers;
 pub mod persistence;

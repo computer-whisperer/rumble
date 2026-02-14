@@ -102,6 +102,14 @@ pub struct ClientHandle {
     pub authenticated: Arc<AtomicBool>,
     /// Whether this connection is a bridge (set after BridgeHello).
     pub is_bridge: AtomicBool,
+    /// Whether the user is server-muted (effective state: manual OR ACL-denied SPEAK).
+    pub server_muted: AtomicBool,
+    /// Whether the user was manually server-muted by an admin (persists across room changes).
+    pub manually_server_muted: AtomicBool,
+    /// Whether the user has elevated to superuser via sudo (session-only).
+    pub is_superuser: AtomicBool,
+    /// User's permission groups (cached from persistence after auth).
+    pub groups: Arc<RwLock<Vec<String>>>,
 }
 
 /// A virtual user managed by a bridge connection.
@@ -133,6 +141,10 @@ impl ClientHandle {
             public_key,
             authenticated,
             is_bridge: AtomicBool::new(false),
+            server_muted: AtomicBool::new(false),
+            manually_server_muted: AtomicBool::new(false),
+            is_superuser: AtomicBool::new(false),
+            groups: Arc::new(RwLock::new(vec!["default".to_string()])),
         }
     }
 
@@ -699,14 +711,17 @@ impl ServerState {
                 .unwrap_or_default();
 
             // Try real client first, then virtual user
-            let username = if let Some(client) = self.get_client(uid) {
+            let (username, sm, elevated) = if let Some(client) = self.get_client(uid) {
                 // Skip bridge connections - they are not visible users
                 if client.is_bridge.load(std::sync::atomic::Ordering::SeqCst) {
                     continue;
                 }
-                client.get_username().await
+                let name = client.get_username().await;
+                let sm = client.server_muted.load(std::sync::atomic::Ordering::Relaxed);
+                let el = client.is_superuser.load(std::sync::atomic::Ordering::Relaxed);
+                (name, sm, el)
             } else if let Some(vu) = self.get_virtual_user(uid) {
-                vu.username
+                (vu.username, false, false)
             } else {
                 continue;
             };
@@ -717,8 +732,8 @@ impl ServerState {
                 username,
                 is_muted: status.is_muted,
                 is_deafened: status.is_deafened,
-                server_muted: false,
-                is_elevated: false,
+                server_muted: sm,
+                is_elevated: elevated,
             });
         }
         users
