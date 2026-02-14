@@ -1287,6 +1287,8 @@ pub struct State {
     pub permission_denied: Option<String>,
     /// Kick reason if we were kicked (for disconnect dialog). Cleared after reading.
     pub kicked: Option<String>,
+    /// Server-defined permission group definitions (synced from ServerState).
+    pub group_definitions: Vec<api::proto::GroupInfo>,
 }
 
 impl State {
@@ -1550,6 +1552,33 @@ pub enum Command {
     Elevate {
         password: String,
     },
+    /// Create a new permission group.
+    CreateGroup {
+        name: String,
+        permissions: u32,
+    },
+    /// Delete a permission group.
+    DeleteGroup {
+        name: String,
+    },
+    /// Modify an existing permission group.
+    ModifyGroup {
+        name: String,
+        permissions: u32,
+    },
+    /// Add or remove a user from a group.
+    SetUserGroup {
+        target_user_id: u64,
+        group: String,
+        add: bool,
+        expires_at: u64,
+    },
+    /// Set room ACL entries.
+    SetRoomAcl {
+        room_id: Uuid,
+        inherit_acl: bool,
+        entries: Vec<api::proto::RoomAclEntry>,
+    },
 }
 
 // Implement Debug manually since SigningCallback doesn't implement Debug
@@ -1686,6 +1715,39 @@ impl std::fmt::Debug for Command {
                 .field("muted", muted)
                 .finish(),
             Command::Elevate { .. } => write!(f, "Elevate {{ .. }}"),
+            Command::CreateGroup { name, permissions } => f
+                .debug_struct("CreateGroup")
+                .field("name", name)
+                .field("permissions", permissions)
+                .finish(),
+            Command::DeleteGroup { name } => f.debug_struct("DeleteGroup").field("name", name).finish(),
+            Command::ModifyGroup { name, permissions } => f
+                .debug_struct("ModifyGroup")
+                .field("name", name)
+                .field("permissions", permissions)
+                .finish(),
+            Command::SetUserGroup {
+                target_user_id,
+                group,
+                add,
+                expires_at,
+            } => f
+                .debug_struct("SetUserGroup")
+                .field("target_user_id", target_user_id)
+                .field("group", group)
+                .field("add", add)
+                .field("expires_at", expires_at)
+                .finish(),
+            Command::SetRoomAcl {
+                room_id,
+                inherit_acl,
+                entries,
+            } => f
+                .debug_struct("SetRoomAcl")
+                .field("room_id", room_id)
+                .field("inherit_acl", inherit_acl)
+                .field("entries_count", &entries.len())
+                .finish(),
         }
     }
 }
@@ -1768,6 +1830,7 @@ mod tests {
             effective_permissions: 0,
             permission_denied: None,
             kicked: None,
+            group_definitions: vec![],
         };
 
         let users_in_room1 = state.users_in_room(room1_uuid);
