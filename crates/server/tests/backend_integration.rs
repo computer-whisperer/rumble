@@ -780,6 +780,22 @@ impl TestClient {
                         }
                     }
                 }
+                proto::state_update::Update::GroupChanged(_) => {}
+                proto::state_update::Update::UserGroupChanged(ugc) => {
+                    if let Some(user) = self
+                        .users
+                        .iter_mut()
+                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(ugc.user_id))
+                    {
+                        if ugc.added {
+                            if !user.groups.contains(&ugc.group) {
+                                user.groups.push(ugc.group);
+                            }
+                        } else {
+                            user.groups.retain(|g| g != &ugc.group);
+                        }
+                    }
+                }
             }
         }
     }

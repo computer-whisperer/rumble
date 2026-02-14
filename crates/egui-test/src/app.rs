@@ -4560,17 +4560,7 @@ impl RumbleApp {
                                             }
                                         }
 
-                                        // ACL: Ban (requires BAN permission)
-                                        if eff.contains(Permissions::BAN) {
-                                            if ui.button("⛔ Ban").clicked() {
-                                                pending_commands.push(Command::BanUser {
-                                                    target_user_id: user_id,
-                                                    reason: String::new(),
-                                                    duration_secs: 0,
-                                                });
-                                                ui.close();
-                                            }
-                                        }
+                                        // Ban dialog will be added in acl-ui-dialogs worktree
 
                                         ui.separator();
 

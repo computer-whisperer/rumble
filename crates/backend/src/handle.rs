@@ -978,16 +978,6 @@ async fn run_connection_task(
                             if let Err(e) = send.write_all(&frame).await {
                                 error!("Failed to send JoinRoom: {}", e);
                             }
-                            // Auto-query permissions for the new room
-                            let qp_frame = encode_frame(&proto::Envelope {
-                                state_hash: Vec::new(),
-                                payload: Some(Payload::QueryPermissions(proto::QueryPermissions {
-                                    room_id: room_id.as_bytes().to_vec(),
-                                })),
-                            });
-                            if let Err(e) = send.write_all(&qp_frame).await {
-                                error!("Failed to send QueryPermissions: {}", e);
-                            }
                         }
                     }
 
@@ -1816,25 +1806,6 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    Command::BanUser {
-                        target_user_id,
-                        reason,
-                        duration_secs,
-                    } => {
-                        if let Some(send) = &mut send_stream {
-                            let frame = encode_frame(&proto::Envelope {
-                                state_hash: vec![],
-                                payload: Some(Payload::BanUser(proto::BanUser {
-                                    target_user_id,
-                                    reason,
-                                    duration_secs,
-                                })),
-                            });
-                            if let Err(e) = send.write_all(&frame).await {
-                                error!("Failed to send BanUser: {}", e);
-                            }
-                        }
-                    }
                     Command::SetServerMute { target_user_id, muted } => {
                         if let Some(send) = &mut send_stream {
                             let frame = encode_frame(&proto::Envelope {
@@ -1860,20 +1831,6 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    Command::QueryPermissions { room_id } => {
-                        if let Some(send) = &mut send_stream {
-                            let frame = encode_frame(&proto::Envelope {
-                                state_hash: vec![],
-                                payload: Some(Payload::QueryPermissions(proto::QueryPermissions {
-                                    room_id: room_id.as_bytes().to_vec(),
-                                })),
-                            });
-                            if let Err(e) = send.write_all(&frame).await {
-                                error!("Failed to send QueryPermissions: {}", e);
-                            }
-                        }
-                    }
-
                     // PlaySfx is intercepted in BackendHandle::send() and never reaches here
                     Command::PlaySfx { .. } => {}
                 }
@@ -2520,12 +2477,6 @@ fn handle_server_message(
             }
             repaint();
         }
-        Some(Payload::PermissionsInfo(pi)) => {
-            let mut s = write_state(&state);
-            s.effective_permissions = pi.effective_permissions;
-            drop(s);
-            repaint();
-        }
         _ => {}
     }
 }
@@ -2722,6 +2673,26 @@ fn apply_state_update(
                         user.is_deafened = usc.is_deafened;
                         user.server_muted = usc.server_muted;
                         user.is_elevated = usc.is_elevated;
+                    }
+                }
+            }
+            proto::state_update::Update::GroupChanged(_gc) => {
+                // Group definitions changed - will be handled by client-side
+                // permission evaluation in Phase 2 (acl-ui-backend worktree)
+            }
+            proto::state_update::Update::UserGroupChanged(ugc) => {
+                // Update user's groups list in our local state
+                if let Some(user) = s
+                    .users
+                    .iter_mut()
+                    .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(ugc.user_id))
+                {
+                    if ugc.added {
+                        if !user.groups.contains(&ugc.group) {
+                            user.groups.push(ugc.group);
+                        }
+                    } else {
+                        user.groups.retain(|g| g != &ugc.group);
                     }
                 }
             }

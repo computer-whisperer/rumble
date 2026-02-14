@@ -28,6 +28,7 @@ bitflags! {
         const SELF_REGISTER  = 0x80000;
         const MANAGE_ACL     = 0x100000;
         const SUDO           = 0x200000;
+        const BANNED         = 0x400000;
     }
 }
 
@@ -49,7 +50,8 @@ pub const ALL_SERVER_SCOPED: Permissions = Permissions::KICK
     .union(Permissions::REGISTER)
     .union(Permissions::SELF_REGISTER)
     .union(Permissions::MANAGE_ACL)
-    .union(Permissions::SUDO);
+    .union(Permissions::SUDO)
+    .union(Permissions::BANNED);
 
 /// All permission bits.
 pub const ALL: Permissions = ALL_ROOM_SCOPED.union(ALL_SERVER_SCOPED);
@@ -60,7 +62,9 @@ pub const DEFAULT_PERMISSIONS: Permissions = Permissions::TRAVERSE
     .union(Permissions::SPEAK)
     .union(Permissions::TEXT_MESSAGE)
     .union(Permissions::SHARE_FILE)
-    .union(Permissions::SELF_REGISTER);
+    .union(Permissions::SELF_REGISTER)
+    .union(Permissions::MAKE_ROOM)
+    .union(Permissions::MODIFY_ROOM);
 
 /// Admin permissions (all bits set).
 pub const ADMIN_PERMISSIONS: Permissions = ALL;

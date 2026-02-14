@@ -7,7 +7,6 @@
 //! - Permission groups (group name → permissions)
 //! - User-group assignments (public_key → group names)
 //! - Room ACLs (room UUID → ACL data)
-//! - Bans (public_key → ban entry)
 //! - Sudo password (fixed key → bcrypt hash)
 
 use anyhow::Result;
@@ -62,15 +61,6 @@ pub struct PersistedAclEntry {
     pub apply_subs: bool,
 }
 
-/// A ban entry stored in the database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BanEntry {
-    pub reason: String,
-    pub banned_by: String,
-    /// Unix timestamp in seconds. None = permanent.
-    pub expires_at: Option<u64>,
-}
-
 /// Server persistence layer using sled.
 pub struct Persistence {
     #[allow(dead_code)]
@@ -87,8 +77,6 @@ pub struct Persistence {
     user_groups: sled::Tree,
     /// Tree for room ACLs: room UUID (16 bytes) → PersistedRoomAcl
     room_acls: sled::Tree,
-    /// Tree for bans: public_key (32 bytes) → BanEntry
-    bans: sled::Tree,
     /// Tree for sudo password: fixed key b"sudo" → bcrypt hash string
     sudo_password: sled::Tree,
 }
@@ -103,7 +91,6 @@ impl Persistence {
         let groups = db.open_tree("groups")?;
         let user_groups = db.open_tree("user_groups")?;
         let room_acls = db.open_tree("room_acls")?;
-        let bans = db.open_tree("bans")?;
         let sudo_password = db.open_tree("sudo_password")?;
 
         Ok(Self {
@@ -114,7 +101,6 @@ impl Persistence {
             groups,
             user_groups,
             room_acls,
-            bans,
             sudo_password,
         })
     }
@@ -128,7 +114,6 @@ impl Persistence {
         let groups = db.open_tree("groups")?;
         let user_groups = db.open_tree("user_groups")?;
         let room_acls = db.open_tree("room_acls")?;
-        let bans = db.open_tree("bans")?;
         let sudo_password = db.open_tree("sudo_password")?;
 
         Ok(Self {
@@ -139,7 +124,6 @@ impl Persistence {
             groups,
             user_groups,
             room_acls,
-            bans,
             sudo_password,
         })
     }
@@ -434,67 +418,6 @@ impl Persistence {
     pub fn delete_room_acl(&self, room_uuid: &[u8; 16]) -> Result<()> {
         self.room_acls.remove(room_uuid)?;
         Ok(())
-    }
-
-    // =========================================================================
-    // Bans
-    // =========================================================================
-
-    /// Add a ban entry.
-    pub fn add_ban(&self, public_key: &[u8; 32], entry: &BanEntry) -> Result<()> {
-        let data = bincode::serialize(entry)?;
-        self.bans.insert(public_key, data)?;
-        Ok(())
-    }
-
-    /// Remove a ban.
-    pub fn remove_ban(&self, public_key: &[u8; 32]) -> Result<()> {
-        self.bans.remove(public_key)?;
-        Ok(())
-    }
-
-    /// Get a ban entry.
-    pub fn get_ban(&self, public_key: &[u8; 32]) -> Option<BanEntry> {
-        self.bans
-            .get(public_key)
-            .ok()
-            .flatten()
-            .and_then(|data| bincode::deserialize(&data).ok())
-    }
-
-    /// List all bans.
-    pub fn list_bans(&self) -> Vec<([u8; 32], BanEntry)> {
-        self.bans
-            .iter()
-            .filter_map(|result| {
-                result.ok().and_then(|(key, value)| {
-                    let pk: [u8; 32] = key.as_ref().try_into().ok()?;
-                    let entry: BanEntry = bincode::deserialize(&value).ok()?;
-                    Some((pk, entry))
-                })
-            })
-            .collect()
-    }
-
-    /// Check if a public key is banned (also checks expiry).
-    pub fn is_banned(&self, public_key: &[u8; 32]) -> bool {
-        match self.get_ban(public_key) {
-            Some(entry) => {
-                if let Some(expires_at) = entry.expires_at {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if now >= expires_at {
-                        // Ban expired, remove it
-                        let _ = self.remove_ban(public_key);
-                        return false;
-                    }
-                }
-                true
-            }
-            None => false,
-        }
     }
 
     // =========================================================================
@@ -872,50 +795,6 @@ mod tests {
 
         persistence.delete_room_acl(&uuid).unwrap();
         assert!(persistence.get_room_acl(&uuid).is_none());
-    }
-
-    #[test]
-    fn test_bans() {
-        let persistence = Persistence::in_memory().unwrap();
-        let key = [12u8; 32];
-
-        assert!(!persistence.is_banned(&key));
-        assert!(persistence.list_bans().is_empty());
-
-        // Permanent ban
-        let entry = BanEntry {
-            reason: "spam".to_string(),
-            banned_by: "admin".to_string(),
-            expires_at: None,
-        };
-        persistence.add_ban(&key, &entry).unwrap();
-        assert!(persistence.is_banned(&key));
-
-        let bans = persistence.list_bans();
-        assert_eq!(bans.len(), 1);
-        assert_eq!(bans[0].1.reason, "spam");
-
-        // Remove ban
-        persistence.remove_ban(&key).unwrap();
-        assert!(!persistence.is_banned(&key));
-    }
-
-    #[test]
-    fn test_expired_ban() {
-        let persistence = Persistence::in_memory().unwrap();
-        let key = [13u8; 32];
-
-        // Ban that expired in the past
-        let entry = BanEntry {
-            reason: "temp".to_string(),
-            banned_by: "admin".to_string(),
-            expires_at: Some(1), // expired long ago
-        };
-        persistence.add_ban(&key, &entry).unwrap();
-
-        // is_banned should return false and auto-remove
-        assert!(!persistence.is_banned(&key));
-        assert!(persistence.get_ban(&key).is_none());
     }
 
     #[test]

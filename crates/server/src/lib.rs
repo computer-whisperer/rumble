@@ -61,7 +61,7 @@ pub mod tracker;
 
 // Re-export main types for convenience
 pub use config::{ServerConfig, generate_self_signed_cert, load_pem_certificates};
-pub use persistence::{BanEntry, PersistedGroup, PersistedRoom, PersistedRoomAcl, Persistence, RegisteredUser};
+pub use persistence::{PersistedGroup, PersistedRoom, PersistedRoomAcl, Persistence, RegisteredUser};
 pub use relay::{RelayConfig, RelayService, RelayTokenManager};
 pub use server::{Config, Server};
 pub use state::{ClientHandle, PeerCapabilitiesEntry, ServerState, StateData};

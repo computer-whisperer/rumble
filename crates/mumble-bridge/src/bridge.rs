@@ -892,6 +892,10 @@ fn handle_state_update(
             }
         }
 
+        // ACL state updates - not relevant to bridge
+        Some(proto::state_update::Update::GroupChanged(_)) => {}
+        Some(proto::state_update::Update::UserGroupChanged(_)) => {}
+
         None => {}
     }
 }

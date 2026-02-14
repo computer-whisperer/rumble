@@ -201,6 +201,8 @@ impl StateData {
                 name: "Root".to_string(),
                 parent_id: None,
                 description: None,
+                inherit_acl: true,
+                acls: vec![],
             }],
             memberships: Vec::new(),
             user_statuses: Vec::new(),
@@ -582,6 +584,8 @@ impl ServerState {
             name,
             parent_id: parent.map(room_id_from_uuid),
             description,
+            inherit_acl: true,
+            acls: vec![],
         });
         true
     }
@@ -610,6 +614,8 @@ impl ServerState {
             name,
             parent_id: parent.map(room_id_from_uuid),
             description,
+            inherit_acl: true,
+            acls: vec![],
         });
         new_uuid
     }
@@ -685,6 +691,35 @@ impl ServerState {
         self.state_data.read().await.rooms.clone()
     }
 
+    /// Build the room list with ACL data populated from persistence.
+    pub async fn build_room_list(
+        &self,
+        persistence: &Option<std::sync::Arc<crate::persistence::Persistence>>,
+    ) -> Vec<RoomInfo> {
+        let mut rooms = self.get_rooms().await;
+        if let Some(persist) = persistence {
+            for room in &mut rooms {
+                if let Some(uuid) = room.id.as_ref().and_then(uuid_from_room_id) {
+                    if let Some(acl) = persist.get_room_acl(uuid.as_bytes()) {
+                        room.inherit_acl = acl.inherit_acl;
+                        room.acls = acl
+                            .entries
+                            .iter()
+                            .map(|e| api::proto::RoomAclEntry {
+                                group: e.group.clone(),
+                                grant: e.grant,
+                                deny: e.deny,
+                                apply_here: e.apply_here,
+                                apply_subs: e.apply_subs,
+                            })
+                            .collect();
+                    }
+                }
+            }
+        }
+        rooms
+    }
+
     /// Get a snapshot of state data for building messages.
     /// Use this to avoid holding locks during I/O.
     pub async fn snapshot_state(&self) -> StateData {
@@ -715,7 +750,7 @@ impl ServerState {
                 .unwrap_or_default();
 
             // Try real client first, then virtual user
-            let (username, srv_muted, elevated) = if let Some(client) = self.get_client(uid) {
+            let (username, srv_muted, elevated, user_groups) = if let Some(client) = self.get_client(uid) {
                 // Skip bridge connections - they are not visible users
                 if client.is_bridge.load(std::sync::atomic::Ordering::SeqCst) {
                     continue;
@@ -723,9 +758,10 @@ impl ServerState {
                 let name = client.get_username().await;
                 let sm = client.server_muted.load(std::sync::atomic::Ordering::Relaxed);
                 let el = client.is_superuser.load(std::sync::atomic::Ordering::Relaxed);
-                (name, sm, el)
+                let groups = client.groups.read().await.clone();
+                (name, sm, el, groups)
             } else if let Some(vu) = self.get_virtual_user(uid) {
-                (vu.username, false, false)
+                (vu.username, false, false, vec![])
             } else {
                 continue;
             };
@@ -738,6 +774,7 @@ impl ServerState {
                 is_deafened: status.is_deafened,
                 server_muted: srv_muted,
                 is_elevated: elevated,
+                groups: user_groups,
             });
         }
         users

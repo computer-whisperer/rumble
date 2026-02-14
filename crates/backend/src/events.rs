@@ -1541,12 +1541,6 @@ pub enum Command {
         target_user_id: u64,
         reason: String,
     },
-    /// Ban a user from the server.
-    BanUser {
-        target_user_id: u64,
-        reason: String,
-        duration_secs: u64,
-    },
     /// Set server mute on another user.
     SetServerMute {
         target_user_id: u64,
@@ -1555,10 +1549,6 @@ pub enum Command {
     /// Elevate to superuser (sudo).
     Elevate {
         password: String,
-    },
-    /// Query effective permissions for a room.
-    QueryPermissions {
-        room_id: Uuid,
     },
 }
 
@@ -1690,25 +1680,12 @@ impl std::fmt::Debug for Command {
                 .field("target_user_id", target_user_id)
                 .field("reason", reason)
                 .finish(),
-            Command::BanUser {
-                target_user_id,
-                reason,
-                duration_secs,
-            } => f
-                .debug_struct("BanUser")
-                .field("target_user_id", target_user_id)
-                .field("reason", reason)
-                .field("duration_secs", duration_secs)
-                .finish(),
             Command::SetServerMute { target_user_id, muted } => f
                 .debug_struct("SetServerMute")
                 .field("target_user_id", target_user_id)
                 .field("muted", muted)
                 .finish(),
             Command::Elevate { .. } => write!(f, "Elevate {{ .. }}"),
-            Command::QueryPermissions { room_id } => {
-                f.debug_struct("QueryPermissions").field("room_id", room_id).finish()
-            }
         }
     }
 }
@@ -1738,12 +1715,16 @@ mod tests {
                     name: "Root".to_string(),
                     parent_id: None,
                     description: None,
+                    inherit_acl: true,
+                    acls: vec![],
                 },
                 RoomInfo {
                     id: Some(room_id_from_uuid(room2_uuid)),
                     name: "Room2".to_string(),
                     parent_id: None,
                     description: None,
+                    inherit_acl: true,
+                    acls: vec![],
                 },
             ],
             users: vec![
@@ -1755,6 +1736,7 @@ mod tests {
                     is_deafened: false,
                     server_muted: false,
                     is_elevated: false,
+                    groups: vec![],
                 },
                 User {
                     user_id: Some(UserId { value: 2 }),
@@ -1764,6 +1746,7 @@ mod tests {
                     is_deafened: false,
                     server_muted: false,
                     is_elevated: false,
+                    groups: vec![],
                 },
                 User {
                     user_id: Some(UserId { value: 3 }),
@@ -1773,6 +1756,7 @@ mod tests {
                     is_deafened: false,
                     server_muted: false,
                     is_elevated: false,
+                    groups: vec![],
                 },
             ],
             audio: AudioState::default(),
@@ -1803,6 +1787,8 @@ mod tests {
                 name: "Root".to_string(),
                 parent_id: None,
                 description: None,
+                inherit_acl: true,
+                acls: vec![],
             }],
             ..Default::default()
         };
@@ -1827,24 +1813,32 @@ mod tests {
                 name: "Root".to_string(),
                 parent_id: None,
                 description: None,
+                inherit_acl: true,
+                acls: vec![],
             },
             RoomInfo {
                 id: Some(room_id_from_uuid(child1_uuid)),
                 name: "Alpha Channel".to_string(),
                 parent_id: Some(room_id_from_uuid(root_uuid)),
                 description: None,
+                inherit_acl: true,
+                acls: vec![],
             },
             RoomInfo {
                 id: Some(room_id_from_uuid(child2_uuid)),
                 name: "Beta Channel".to_string(),
                 parent_id: Some(room_id_from_uuid(root_uuid)),
                 description: None,
+                inherit_acl: true,
+                acls: vec![],
             },
             RoomInfo {
                 id: Some(room_id_from_uuid(grandchild_uuid)),
                 name: "Private".to_string(),
                 parent_id: Some(room_id_from_uuid(child1_uuid)),
                 description: None,
+                inherit_acl: true,
+                acls: vec![],
             },
         ];
 
