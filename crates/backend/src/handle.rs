@@ -48,7 +48,9 @@ use crate::{
     cert_verifier::{
         CapturedCert, InteractiveCertVerifier, is_cert_verification_error, new_captured_cert, take_captured_cert,
     },
-    events::{AudioState, Command, ConnectionState, PendingCertificate, SigningCallback, State, VoiceMode},
+    events::{
+        AudioState, Command, ConnectionState, GroupDefinition, PendingCertificate, SigningCallback, State, VoiceMode,
+    },
 };
 use api::{
     ROOT_ROOM_UUID, build_auth_payload, build_session_cert_payload, compute_cert_hash, compute_session_id,
@@ -255,6 +257,7 @@ impl BackendHandle {
             effective_permissions: 0,
             permission_denied: None,
             kicked: None,
+            group_definitions: Vec::new(),
         };
 
         let state = Arc::new(RwLock::new(state));
@@ -680,7 +683,7 @@ async fn run_connection_task(
 
                         // Attempt connection with Ed25519 auth
                         match connect_to_server(&addr, &name, &public_key, &signer, password.as_deref(), &config, captured_cert.clone()).await {
-                            Ok((conn, send, recv, recv_buf, user_id, rooms, users, session_info)) => {
+                            Ok((conn, send, recv, recv_buf, user_id, rooms, users, groups, session_info)) => {
                                 // Update state to Connected
                                 {
                                     let mut s = write_state(&state);
@@ -699,6 +702,11 @@ async fn run_connection_task(
                                     s.my_session_id = Some(session_info.session_id);
                                     s.rooms = rooms;
                                     s.users = users;
+                                    s.group_definitions = groups.into_iter().map(|g| GroupDefinition {
+                                        name: g.name,
+                                        permissions: g.permissions,
+                                        is_builtin: g.is_builtin,
+                                    }).collect();
                                     s.rebuild_room_tree();
                                 }
                                 repaint();
@@ -835,7 +843,7 @@ async fn run_connection_task(
                                 &new_config,
                                 captured_cert,
                             ).await {
-                                Ok((conn, send, recv, recv_buf, user_id, rooms, users, session_info)) => {
+                                Ok((conn, send, recv, recv_buf, user_id, rooms, users, groups, session_info)) => {
                                     // Success! Update state
                                     {
                                         let mut s = write_state(&state);
@@ -853,6 +861,11 @@ async fn run_connection_task(
                                         s.my_session_id = Some(session_info.session_id);
                                         s.rooms = rooms;
                                         s.users = users;
+                                        s.group_definitions = groups.into_iter().map(|g| GroupDefinition {
+                                            name: g.name,
+                                            permissions: g.permissions,
+                                            is_builtin: g.is_builtin,
+                                        }).collect();
                                         s.rebuild_room_tree();
                                     }
                                     repaint();
@@ -1831,6 +1844,70 @@ async fn run_connection_task(
                             }
                         }
                     }
+                    Command::CreateGroup { name, permissions } => {
+                        if let Some(send) = &mut send_stream {
+                            let frame = encode_frame(&proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::CreateGroup(proto::CreateGroup { name, permissions })),
+                            });
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send CreateGroup: {}", e);
+                            }
+                        }
+                    }
+                    Command::DeleteGroup { name } => {
+                        if let Some(send) = &mut send_stream {
+                            let frame = encode_frame(&proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::DeleteGroup(proto::DeleteGroup { name })),
+                            });
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send DeleteGroup: {}", e);
+                            }
+                        }
+                    }
+                    Command::ModifyGroup { name, permissions } => {
+                        if let Some(send) = &mut send_stream {
+                            let frame = encode_frame(&proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::ModifyGroup(proto::ModifyGroup { name, permissions })),
+                            });
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send ModifyGroup: {}", e);
+                            }
+                        }
+                    }
+                    Command::SetRoomAcl { room_id, inherit_acl, entries } => {
+                        if let Some(send) = &mut send_stream {
+                            let frame = encode_frame(&proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::SetRoomAcl(proto::SetRoomAcl {
+                                    room_id: room_id.as_bytes().to_vec(),
+                                    inherit_acl,
+                                    entries,
+                                })),
+                            });
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send SetRoomAcl: {}", e);
+                            }
+                        }
+                    }
+                    Command::SetUserGroup { target_user_id, group, add } => {
+                        if let Some(send) = &mut send_stream {
+                            let frame = encode_frame(&proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::SetUserGroup(proto::SetUserGroup {
+                                    target_user_id,
+                                    group,
+                                    add,
+                                    expires_at: 0,
+                                })),
+                            });
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send SetUserGroup: {}", e);
+                            }
+                        }
+                    }
                     // PlaySfx is intercepted in BackendHandle::send() and never reaches here
                     Command::PlaySfx { .. } => {}
                 }
@@ -1923,6 +2000,7 @@ async fn connect_to_server(
     u64,      // user_id
     Vec<proto::RoomInfo>,
     Vec<proto::User>,
+    Vec<proto::GroupInfo>,
     SessionIdentity,
 )> {
     use std::net::SocketAddr;
@@ -2022,7 +2100,7 @@ async fn connect_to_server(
     debug!("Sent Authenticate");
 
     // Step 8: Wait for ServerState or AuthFailed
-    let (rooms, users) = wait_for_auth_result(&mut recv, &mut buf).await?;
+    let (rooms, users, groups) = wait_for_auth_result(&mut recv, &mut buf).await?;
 
     let session_identity = SessionIdentity {
         signing_key: session_signing,
@@ -2032,7 +2110,7 @@ async fn connect_to_server(
         _expires_ms: expires_ms,
     };
 
-    Ok((conn, send, recv, buf, user_id, rooms, users, session_identity))
+    Ok((conn, send, recv, buf, user_id, rooms, users, groups, session_identity))
 }
 
 /// Wait for ServerHello message and extract nonce and user_id.
@@ -2071,7 +2149,7 @@ async fn wait_for_server_hello(recv: &mut quinn::RecvStream, buf: &mut BytesMut)
 async fn wait_for_auth_result(
     recv: &mut quinn::RecvStream,
     buf: &mut BytesMut,
-) -> anyhow::Result<(Vec<proto::RoomInfo>, Vec<proto::User>)> {
+) -> anyhow::Result<(Vec<proto::RoomInfo>, Vec<proto::User>, Vec<proto::GroupInfo>)> {
     loop {
         let mut chunk = [0u8; 4096];
         match recv.read(&mut chunk).await? {
@@ -2085,7 +2163,7 @@ async fn wait_for_auth_result(
                             }
                             Some(Payload::ServerEvent(se)) => {
                                 if let Some(proto::server_event::Kind::ServerState(ss)) = se.kind {
-                                    return Ok((ss.rooms, ss.users));
+                                    return Ok((ss.rooms, ss.users, ss.groups));
                                 }
                             }
                             _ => {}
@@ -2238,6 +2316,15 @@ fn handle_server_message(
                         let mut s = write_state(&state);
                         s.rooms = ss.rooms;
                         s.users = ss.users.clone();
+                        s.group_definitions = ss
+                            .groups
+                            .into_iter()
+                            .map(|g| GroupDefinition {
+                                name: g.name,
+                                permissions: g.permissions,
+                                is_builtin: g.is_builtin,
+                            })
+                            .collect();
                         s.rebuild_room_tree();
 
                         // Notify audio task about users in our room (for proactive decoder creation)
@@ -2676,9 +2763,21 @@ fn apply_state_update(
                     }
                 }
             }
-            proto::state_update::Update::GroupChanged(_gc) => {
-                // Group definitions changed - will be handled by client-side
-                // permission evaluation in Phase 2 (acl-ui-backend worktree)
+            proto::state_update::Update::GroupChanged(gc) => {
+                if let Some(group) = gc.group {
+                    if gc.deleted {
+                        s.group_definitions.retain(|g| g.name != group.name);
+                    } else if let Some(existing) = s.group_definitions.iter_mut().find(|g| g.name == group.name) {
+                        existing.permissions = group.permissions;
+                        existing.is_builtin = group.is_builtin;
+                    } else {
+                        s.group_definitions.push(GroupDefinition {
+                            name: group.name,
+                            permissions: group.permissions,
+                            is_builtin: group.is_builtin,
+                        });
+                    }
+                }
             }
             proto::state_update::Update::UserGroupChanged(ugc) => {
                 // Update user's groups list in our local state
