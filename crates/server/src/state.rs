@@ -203,6 +203,7 @@ impl StateData {
                 description: None,
                 inherit_acl: true,
                 acls: vec![],
+                effective_permissions: 0,
             }],
             memberships: Vec::new(),
             user_statuses: Vec::new(),
@@ -586,6 +587,7 @@ impl ServerState {
             description,
             inherit_acl: true,
             acls: vec![],
+            effective_permissions: 0,
         });
         true
     }
@@ -616,6 +618,7 @@ impl ServerState {
             description,
             inherit_acl: true,
             acls: vec![],
+            effective_permissions: 0,
         });
         new_uuid
     }
@@ -664,6 +667,19 @@ impl ServerState {
         for r in data.rooms.iter_mut() {
             if uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid) {
                 r.parent_id = Some(room_id_from_uuid(new_parent_uuid));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Update a room's ACL data in-memory. Returns true if the room was found.
+    pub async fn set_room_acl(&self, room_uuid: Uuid, inherit_acl: bool, acls: Vec<api::proto::RoomAclEntry>) -> bool {
+        let mut data = self.state_data.write().await;
+        for r in data.rooms.iter_mut() {
+            if uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid) {
+                r.inherit_acl = inherit_acl;
+                r.acls = acls;
                 return true;
             }
         }

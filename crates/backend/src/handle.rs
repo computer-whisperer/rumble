@@ -253,6 +253,7 @@ impl BackendHandle {
             file_transfers: Vec::new(),
             file_transfer_settings: Default::default(),
             effective_permissions: 0,
+            per_room_permissions: HashMap::new(),
             permission_denied: None,
             kicked: None,
             group_definitions: vec![],
@@ -2321,10 +2322,26 @@ fn handle_server_message(
                     proto::server_event::Kind::ServerState(ss) => {
                         // Full state replacement
                         let mut s = write_state(&state);
+
+                        // Extract per-room effective permissions from server-computed values
+                        s.per_room_permissions.clear();
+                        for room in &ss.rooms {
+                            if let Some(room_uuid) = room.id.as_ref().and_then(api::uuid_from_room_id) {
+                                s.per_room_permissions.insert(room_uuid, room.effective_permissions);
+                            }
+                        }
+
                         s.rooms = ss.rooms;
                         s.users = ss.users.clone();
                         s.group_definitions = ss.groups;
                         s.rebuild_room_tree();
+
+                        // Update effective_permissions from per-room data for current room
+                        if let Some(my_room) = s.my_room_id {
+                            if let Some(&perms) = s.per_room_permissions.get(&my_room) {
+                                s.effective_permissions = perms;
+                            }
+                        }
 
                         // Notify audio task about users in our room (for proactive decoder creation)
                         if let Some(my_room_id) = &s.my_room_id {
@@ -2347,6 +2364,7 @@ fn handle_server_message(
                         } else {
                             drop(s);
                         }
+                        // Still do client-side recalculation as fallback
                         recalculate_effective_permissions(state);
                         repaint();
                     }
@@ -2812,22 +2830,37 @@ fn apply_state_update(
                     return;
                 }
             }
+            proto::state_update::Update::RoomAclChanged(rac) => {
+                if let Some(rid) = rac.room_id.and_then(|r| api::uuid_from_room_id(&r)) {
+                    // Update the room's ACL data in our local state
+                    if let Some(room) = s
+                        .rooms
+                        .iter_mut()
+                        .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(rid))
+                    {
+                        room.inherit_acl = rac.inherit_acl;
+                        room.acls = rac.entries;
+                    }
+                    drop(s);
+                    // Recalculate permissions since ACLs changed
+                    recalculate_effective_permissions(state);
+                    repaint();
+                    return;
+                }
+            }
         }
         drop(s);
         repaint();
     }
 }
 
-/// Recalculate the effective permissions for the current user in their current room.
+/// Recalculate the effective permissions for the current user in all rooms.
 ///
-/// This acquires the state lock internally, so the caller must NOT hold it.
+/// Updates both `effective_permissions` (for current room) and `per_room_permissions`
+/// (for all rooms). This acquires the state lock internally, so the caller must NOT hold it.
 fn recalculate_effective_permissions(state: &Arc<RwLock<State>>) {
     let s = state.read().unwrap();
     let my_user_id = match s.my_user_id {
-        Some(id) => id,
-        None => return,
-    };
-    let my_room_id = match s.my_room_id {
         Some(id) => id,
         None => return,
     };
@@ -2859,9 +2892,6 @@ fn recalculate_effective_permissions(state: &Arc<RwLock<State>>) {
         );
     }
 
-    // Build room chain (root to target)
-    let room_chain = build_client_room_chain(&s.rooms, my_room_id);
-
     // Check superuser status
     let is_elevated = s
         .users
@@ -2870,14 +2900,38 @@ fn recalculate_effective_permissions(state: &Arc<RwLock<State>>) {
         .map(|u| u.is_elevated)
         .unwrap_or(false);
 
+    let my_room_id = s.my_room_id;
+
+    // Collect all room UUIDs
+    let room_uuids: Vec<Uuid> = s
+        .rooms
+        .iter()
+        .filter_map(|r| r.id.as_ref().and_then(api::uuid_from_room_id))
+        .collect();
+
+    // Clone rooms for chain building (we'll release the read lock)
+    let rooms_snapshot = s.rooms.clone();
     drop(s);
 
-    let ref_chain: Vec<(Uuid, Option<&api::permissions::RoomAclData>)> =
-        room_chain.iter().map(|(uuid, acl)| (*uuid, acl.as_ref())).collect();
-    let effective = api::permissions::effective_permissions(&user_groups, &group_perms, &ref_chain, is_elevated);
+    // Compute per-room effective permissions
+    let mut per_room = HashMap::new();
+    for room_uuid in &room_uuids {
+        let room_chain = build_client_room_chain(&rooms_snapshot, *room_uuid);
+        let ref_chain: Vec<(Uuid, Option<&api::permissions::RoomAclData>)> =
+            room_chain.iter().map(|(uuid, acl)| (*uuid, acl.as_ref())).collect();
+        let effective = api::permissions::effective_permissions(&user_groups, &group_perms, &ref_chain, is_elevated);
+        per_room.insert(*room_uuid, effective.bits());
+    }
 
     let mut s = state.write().unwrap();
-    s.effective_permissions = effective.bits();
+    s.per_room_permissions = per_room;
+
+    // Update the current room's effective_permissions for backward compatibility
+    if let Some(my_room) = my_room_id {
+        if let Some(&perms) = s.per_room_permissions.get(&my_room) {
+            s.effective_permissions = perms;
+        }
+    }
 }
 
 /// Build the room chain from root to target room, with ACL data for each room.

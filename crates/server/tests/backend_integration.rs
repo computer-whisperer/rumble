@@ -796,6 +796,18 @@ impl TestClient {
                         }
                     }
                 }
+                proto::state_update::Update::RoomAclChanged(rac) => {
+                    if let Some(rid) = rac.room_id.and_then(|r| api::uuid_from_room_id(&r)) {
+                        if let Some(room) = self
+                            .rooms
+                            .iter_mut()
+                            .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(rid))
+                        {
+                            room.inherit_acl = rac.inherit_acl;
+                            room.acls = rac.entries;
+                        }
+                    }
+                }
             }
         }
     }

@@ -1283,6 +1283,9 @@ pub struct State {
     // ACL state
     /// Effective permissions for our current room (bitmask from PermissionsInfo).
     pub effective_permissions: u32,
+    /// Per-room effective permissions (room UUID -> permission bitmask).
+    /// Populated from server-computed values in ServerState and updated on ACL changes.
+    pub per_room_permissions: HashMap<Uuid, u32>,
     /// Last permission denied message (for UI toast display). Cleared after reading.
     pub permission_denied: Option<String>,
     /// Kick reason if we were kicked (for disconnect dialog). Cleared after reading.
@@ -1779,6 +1782,7 @@ mod tests {
                     description: None,
                     inherit_acl: true,
                     acls: vec![],
+                    effective_permissions: 0,
                 },
                 RoomInfo {
                     id: Some(room_id_from_uuid(room2_uuid)),
@@ -1787,6 +1791,7 @@ mod tests {
                     description: None,
                     inherit_acl: true,
                     acls: vec![],
+                    effective_permissions: 0,
                 },
             ],
             users: vec![
@@ -1828,6 +1833,7 @@ mod tests {
             room_tree: RoomTree::default(),
             p2p_peers: HashMap::new(),
             effective_permissions: 0,
+            per_room_permissions: HashMap::new(),
             permission_denied: None,
             kicked: None,
             group_definitions: vec![],
@@ -1852,6 +1858,7 @@ mod tests {
                 description: None,
                 inherit_acl: true,
                 acls: vec![],
+                effective_permissions: 0,
             }],
             ..Default::default()
         };
@@ -1878,6 +1885,7 @@ mod tests {
                 description: None,
                 inherit_acl: true,
                 acls: vec![],
+                effective_permissions: 0,
             },
             RoomInfo {
                 id: Some(room_id_from_uuid(child1_uuid)),
@@ -1886,6 +1894,7 @@ mod tests {
                 description: None,
                 inherit_acl: true,
                 acls: vec![],
+                effective_permissions: 0,
             },
             RoomInfo {
                 id: Some(room_id_from_uuid(child2_uuid)),
@@ -1894,6 +1903,7 @@ mod tests {
                 description: None,
                 inherit_acl: true,
                 acls: vec![],
+                effective_permissions: 0,
             },
             RoomInfo {
                 id: Some(room_id_from_uuid(grandchild_uuid)),
@@ -1902,6 +1912,7 @@ mod tests {
                 description: None,
                 inherit_acl: true,
                 acls: vec![],
+                effective_permissions: 0,
             },
         ];
 

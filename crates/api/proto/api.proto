@@ -49,6 +49,9 @@ message RoomInfo {
   bool inherit_acl = 5;
   // Per-room ACL entries (grant/deny deltas).
   repeated RoomAclEntry acls = 6;
+  // Effective permissions for the receiving client in this room (bitmask).
+  // Computed per-client by the server; not included in state hash.
+  uint32 effective_permissions = 7;
 }
 
 // Full state snapshot sent on initial sync and resync.
@@ -374,6 +377,8 @@ message StateUpdate {
     GroupChanged group_changed = 20;
     // A user's group membership changed
     UserGroupChanged user_group_changed = 21;
+    // A room's ACL entries changed
+    RoomAclChanged room_acl_changed = 22;
   }
 }
 
@@ -680,6 +685,13 @@ message GroupInfo {
   string name = 1;
   uint32 permissions = 2;
   bool is_builtin = 3;
+}
+
+// State update: room ACL entries changed.
+message RoomAclChanged {
+  RoomId room_id = 1;
+  bool inherit_acl = 2;
+  repeated RoomAclEntry entries = 3;
 }
 
 // State update: group created/modified/deleted.

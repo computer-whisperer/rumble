@@ -1255,6 +1255,7 @@ async fn handle_create_room(
         description,
         inherit_acl: true,
         acls: vec![],
+        effective_permissions: 0,
     };
     broadcast_state_update(
         &state,
@@ -1620,7 +1621,7 @@ async fn send_server_state_to_client(
     state: &ServerState,
     persistence: &Option<Arc<Persistence>>,
 ) -> Result<()> {
-    let rooms = state.build_room_list(persistence).await;
+    let mut rooms = state.build_room_list(persistence).await;
     let users = state.build_user_list().await;
 
     // Build group definitions for client-side ACL evaluation
@@ -1639,15 +1640,26 @@ async fn send_server_state_to_client(
         vec![]
     };
 
-    // Build the ServerState message
-    let server_state = ProtoServerState {
+    // Build the ServerState message (without per-client effective_permissions for hash)
+    let server_state_for_hash = ProtoServerState {
         rooms: rooms.clone(),
         users: users.clone(),
-        groups,
+        groups: groups.clone(),
     };
 
-    // Compute the state hash
-    let state_hash = compute_server_state_hash(&server_state);
+    // Compute the state hash BEFORE setting per-client effective_permissions
+    let state_hash = compute_server_state_hash(&server_state_for_hash);
+
+    // Now compute per-room effective permissions for this specific client
+    for room in &mut rooms {
+        if let Some(room_uuid) = room.id.as_ref().and_then(uuid_from_room_id) {
+            let perms = acl::evaluate_user_permissions(state, client, room_uuid, persistence).await;
+            room.effective_permissions = perms.bits();
+        }
+    }
+
+    // Build the actual message with effective_permissions set
+    let server_state = ProtoServerState { rooms, users, groups };
 
     let env = proto::Envelope {
         state_hash,
@@ -1657,45 +1669,24 @@ async fn send_server_state_to_client(
     };
     let frame = encode_frame(&env);
 
-    info!(
-        rooms = rooms.len(),
-        users = users.len(),
-        "server: sending initial ServerState with state_hash"
-    );
+    info!("server: sending initial ServerState with state_hash and per-room permissions");
     client.send_frame(&frame).await?;
 
     Ok(())
 }
 
 /// Broadcast current server state to all connected clients.
-pub async fn broadcast_server_state(state: &Arc<ServerState>) -> Result<()> {
-    let rooms = state.get_rooms().await;
-    let users = state.build_user_list().await;
-
-    // Build the ServerState message
-    let server_state = ProtoServerState {
-        rooms,
-        users,
-        groups: vec![],
-    };
-
-    // Compute the state hash
-    let state_hash = compute_server_state_hash(&server_state);
-
-    let env = proto::Envelope {
-        state_hash,
-        payload: Some(Payload::ServerEvent(proto::ServerEvent {
-            kind: Some(proto::server_event::Kind::ServerState(server_state)),
-        })),
-    };
-    let frame = encode_frame(&env);
-
-    // Snapshot clients, then send without holding state locks
+///
+/// Unlike `send_server_state_to_client`, this sends to every client.
+/// Each client receives per-room effective permissions computed for them.
+pub async fn broadcast_server_state(state: &Arc<ServerState>, persistence: &Option<Arc<Persistence>>) -> Result<()> {
+    // Send per-client state (with per-room effective permissions) to each client
     let clients = state.snapshot_clients();
-    for h in clients {
-        let _ = h.send_frame(&frame).await;
+    for client in clients {
+        if let Err(e) = send_server_state_to_client(&client, state, persistence).await {
+            debug!(user_id = client.user_id, "failed to send server state: {e:?}");
+        }
     }
-
     Ok(())
 }
 
@@ -2376,10 +2367,16 @@ async fn handle_set_room_acl(
     state: Arc<ServerState>,
     persistence: Option<Arc<Persistence>>,
 ) -> Result<()> {
+    // Validate room_id — return error instead of silently falling back to root
     let room_uuid = if sra.room_id.len() == 16 {
-        Uuid::from_slice(&sra.room_id).unwrap_or(ROOT_ROOM_UUID)
+        match Uuid::from_slice(&sra.room_id) {
+            Ok(u) => u,
+            Err(_) => {
+                return send_command_result(&sender, "SetRoomAcl", false, "Invalid room ID").await;
+            }
+        }
     } else {
-        ROOT_ROOM_UUID
+        return send_command_result(&sender, "SetRoomAcl", false, "Missing or invalid room ID").await;
     };
 
     // Permission check: WRITE on the target room
@@ -2392,27 +2389,44 @@ async fn handle_set_room_acl(
         return send_command_result(&sender, "SetRoomAcl", false, "Persistence not enabled").await;
     };
 
-    // Serialize the ACL data using the api types
-    let acl_data = api::permissions::RoomAclData {
+    // Build the persisted ACL data using the correct persistence type
+    let persisted_acl = crate::persistence::PersistedRoomAcl {
         inherit_acl: sra.inherit_acl,
         entries: sra
             .entries
             .iter()
-            .map(|e| api::permissions::AclEntry {
+            .map(|e| crate::persistence::PersistedAclEntry {
                 group: e.group.clone(),
-                grant: Permissions::from_bits_truncate(e.grant),
-                deny: Permissions::from_bits_truncate(e.deny),
+                grant: e.grant,
+                deny: e.deny,
                 apply_here: e.apply_here,
                 apply_subs: e.apply_subs,
             })
             .collect(),
     };
 
-    if let Ok(data) = bincode::serialize(&acl_data) {
-        let _ = persist.store_raw("room_acls", room_uuid.as_bytes(), &data);
+    if let Err(e) = persist.set_room_acl(room_uuid.as_bytes(), &persisted_acl) {
+        error!(room = %room_uuid, "Failed to persist room ACL: {e:?}");
+        return send_command_result(&sender, "SetRoomAcl", false, "Failed to persist ACL").await;
     }
 
+    // Update in-memory room state with new ACL data
+    state
+        .set_room_acl(room_uuid, sra.inherit_acl, sra.entries.clone())
+        .await;
+
     info!(room = %room_uuid, entries = sra.entries.len(), "SetRoomAcl");
+
+    // Broadcast RoomAclChanged to all clients
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::RoomAclChanged(proto::RoomAclChanged {
+            room_id: Some(room_id_from_uuid(room_uuid)),
+            inherit_acl: sra.inherit_acl,
+            entries: sra.entries.clone(),
+        }),
+    )
+    .await?;
 
     // Re-evaluate SPEAK permission for all users in this room
     let room_members = state.get_room_members(room_uuid).await;

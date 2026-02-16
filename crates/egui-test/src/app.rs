@@ -4633,7 +4633,12 @@ impl RumbleApp {
                                 .default_open(has_users_in_subtree)
                                 .activatable(true)
                                 .context_menu(|ui| {
-                                    let eff = Permissions::from_bits_truncate(state.effective_permissions);
+                                    let room_perms = state
+                                        .per_room_permissions
+                                        .get(&room_id)
+                                        .copied()
+                                        .unwrap_or(state.effective_permissions);
+                                    let eff = Permissions::from_bits_truncate(room_perms);
                                     ui.set_min_width(200.0);
                                     ui.label(format!("Room: {}", room_name));
                                     ui.separator();
@@ -4762,7 +4767,11 @@ impl RumbleApp {
                             let username = user.username.clone();
                             let self_muted = state.audio.self_muted;
                             let self_deafened = state.audio.self_deafened;
-                            let effective_permissions = state.effective_permissions;
+                            let effective_permissions = state
+                                .per_room_permissions
+                                .get(&room_id)
+                                .copied()
+                                .unwrap_or(state.effective_permissions);
                             let user_volume_db = state
                                 .audio
                                 .per_user_rx

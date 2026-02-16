@@ -101,6 +101,11 @@ pub fn compute_server_state_hash(server_state: &proto::ServerState) -> Vec<u8> {
         a_id.cmp(b_id)
     });
 
+    // Zero out effective_permissions — it is per-client and must not affect the hash
+    for room in &mut canonical.rooms {
+        room.effective_permissions = 0;
+    }
+
     // Sort users by user_id for deterministic ordering
     canonical.users.sort_by(|a, b| {
         let a_id = a.user_id.as_ref().map(|u| u.value).unwrap_or(0);
