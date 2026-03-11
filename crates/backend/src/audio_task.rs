@@ -35,6 +35,7 @@ use api::proto::VoiceDatagram;
 use bytes::Bytes;
 use pipeline;
 use prost::Message;
+use rumble_client::DatagramTransport;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, RwLock, atomic::AtomicBool},
@@ -47,7 +48,7 @@ use tracing::{debug, error, info, trace, warn};
 pub enum AudioCommand {
     /// A QUIC connection was established - start datagram handling.
     ConnectionEstablished {
-        connection: quinn::Connection,
+        datagram: Arc<dyn DatagramTransport>,
         my_user_id: u64,
     },
     /// Connection was closed - stop datagram handling.
@@ -470,8 +471,8 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     // Audio system for device access (not Send, so lives on this thread)
     let audio_system = AudioSystem::new();
 
-    // Current connection state
-    let mut connection: Option<quinn::Connection> = None;
+    // Current connection state (datagram handle for voice I/O)
+    let mut connection: Option<Arc<dyn DatagramTransport>> = None;
     let mut my_user_id: u64 = 0;
 
     // Voice mode and mute state (orthogonal controls)
@@ -642,7 +643,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
             // Handle commands
             Some(cmd) = command_rx.recv() => {
                 match cmd {
-                    AudioCommand::ConnectionEstablished { connection: conn, my_user_id: uid } => {
+                    AudioCommand::ConnectionEstablished { datagram: conn, my_user_id: uid } => {
                         info!("Audio task: connection established, user_id={}", uid);
                         connection = Some(conn);
                         my_user_id = uid;
@@ -1255,7 +1256,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             bytes_sent += size_bytes as u64;
                         }
 
-                        if let Err(e) = conn.send_datagram(Bytes::from(datagram_bytes)) {
+                        if let Err(e) = conn.send_datagram(&datagram_bytes) {
                             warn!("Failed to send voice datagram: {}", e);
                             // Connection might be closed - will be detected by read_datagram
                         }
@@ -1265,16 +1266,16 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
             // Receive voice datagrams
             datagram = async {
-                if let Some(conn) = &connection {
-                    conn.read_datagram().await
+                if let Some(conn) = connection.as_ref() {
+                    conn.recv_datagram().await
                 } else {
                     // No connection, just wait
                     std::future::pending().await
                 }
             } => {
                 match datagram {
-                    Ok(data) => {
-                        if let Ok(voice) = VoiceDatagram::decode(data.as_ref()) {
+                    Ok(Some(data)) => {
+                        if let Ok(voice) = VoiceDatagram::decode(data.as_slice()) {
                             if let Some(sender_id) = voice.sender_id {
                                 // Don't play back our own audio or audio from muted users
                                 if sender_id != my_user_id && !muted_users.contains(&sender_id) {
@@ -1295,6 +1296,10 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                                 }
                             }
                         }
+                    }
+                    Ok(None) => {
+                        // Connection closed - the connection task will handle cleanup
+                        debug!("Datagram stream closed");
                     }
                     Err(e) => {
                         // Connection error - the connection task will handle cleanup

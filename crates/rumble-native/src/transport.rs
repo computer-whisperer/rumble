@@ -10,10 +10,41 @@ use anyhow::Context;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
-use rumble_client::transport::{TlsConfig, Transport};
+use rumble_client::transport::{DatagramTransport, TlsConfig, Transport};
 use rustls::RootCertStore;
 
 use crate::cert_verifier::{AcceptAllVerifier, FingerprintVerifier};
+
+/// Datagram handle for QUIC voice data, wrapping a cloneable `quinn::Connection`.
+///
+/// This is passed to the audio task so it can send/receive voice datagrams
+/// independently of the connection task's reliable stream operations.
+#[derive(Clone)]
+pub struct QuinnDatagramHandle {
+    connection: quinn::Connection,
+}
+
+impl QuinnDatagramHandle {
+    /// Create a datagram handle from a quinn connection.
+    pub fn new(connection: quinn::Connection) -> Self {
+        Self { connection }
+    }
+}
+
+#[async_trait]
+impl DatagramTransport for QuinnDatagramHandle {
+    fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()> {
+        self.connection.send_datagram(Bytes::copy_from_slice(data))?;
+        Ok(())
+    }
+
+    async fn recv_datagram(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        match self.connection.read_datagram().await {
+            Ok(bytes) => Ok(Some(bytes.to_vec())),
+            Err(_) => Ok(None),
+        }
+    }
+}
 
 /// QUIC transport backed by the quinn library.
 pub struct QuinnTransport {
@@ -25,6 +56,8 @@ pub struct QuinnTransport {
 
 #[async_trait]
 impl Transport for QuinnTransport {
+    type Datagram = QuinnDatagramHandle;
+
     async fn connect(addr: &str, tls_config: TlsConfig) -> anyhow::Result<Self> {
         const DEFAULT_PORT: u16 = 5000;
 
@@ -181,6 +214,10 @@ impl Transport for QuinnTransport {
             Ok(bytes) => Ok(Some(bytes.to_vec())),
             Err(_) => Ok(None),
         }
+    }
+
+    fn datagram_handle(&self) -> Self::Datagram {
+        QuinnDatagramHandle::new(self.connection.clone())
     }
 
     fn peer_certificate_der(&self) -> Option<Vec<u8>> {

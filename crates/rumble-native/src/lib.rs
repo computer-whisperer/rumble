@@ -18,7 +18,7 @@ pub use audio::{CpalAudioBackend, CpalCaptureStream, CpalPlaybackStream};
 pub use codec::{NativeOpusCodec, NativeOpusDecoder, NativeOpusEncoder};
 pub use keys::NativeKeySigning;
 pub use storage::FileStorage;
-pub use transport::QuinnTransport;
+pub use transport::{QuinnDatagramHandle, QuinnTransport};
 
 use rumble_client::Platform;
 

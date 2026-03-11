@@ -1019,6 +1019,8 @@ dependencies = [
  "quinn 0.11.9",
  "rand 0.10.0-rc.6",
  "rand_core 0.10.0-rc-3",
+ "rumble-client",
+ "rumble-native",
  "rustls 0.23.35",
  "rustls-pemfile",
  "serde",
@@ -7347,6 +7349,41 @@ dependencies = [
  "pipeline",
  "serde",
  "uuid",
+]
+
+[[package]]
+name = "rumble-native"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "api",
+ "argon2",
+ "async-trait",
+ "bytes",
+ "chacha20poly1305",
+ "cpal",
+ "directories",
+ "ed25519-dalek 3.0.0-pre.4",
+ "hex 0.4.3",
+ "opus",
+ "prost",
+ "quinn 0.11.9",
+ "rand 0.10.0-rc.6",
+ "rand_core 0.10.0-rc-3",
+ "rumble-client",
+ "rustls 0.23.35",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "service-binding",
+ "sha2 0.10.9",
+ "ssh-agent-lib",
+ "ssh-key",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+ "webpki-roots",
 ]
 
 [[package]]

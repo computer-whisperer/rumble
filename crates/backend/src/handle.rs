@@ -709,7 +709,7 @@ async fn run_connection_task(
 
                                 // Notify audio task of new connection
                                 audio_task.send(AudioCommand::ConnectionEstablished {
-                                    connection: conn.clone(),
+                                    datagram: Arc::new(rumble_native::QuinnDatagramHandle::new(conn.clone())),
                                     my_user_id: user_id,
                                 });
 
@@ -865,7 +865,7 @@ async fn run_connection_task(
 
                                     // Notify audio task
                                     audio_task.send(AudioCommand::ConnectionEstablished {
-                                        connection: conn.clone(),
+                                        datagram: Arc::new(rumble_native::QuinnDatagramHandle::new(conn.clone())),
                                         my_user_id: user_id,
                                     });
 

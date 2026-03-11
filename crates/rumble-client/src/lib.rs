@@ -19,4 +19,4 @@ pub use file_transfer::{FileOffer, FileTransferPlugin, TransferId, TransferStatu
 pub use keys::{KeyInfo, KeySigning, KeySource};
 pub use platform::Platform;
 pub use storage::PersistentStorage;
-pub use transport::{TlsConfig, Transport};
+pub use transport::{DatagramTransport, TlsConfig, Transport};
