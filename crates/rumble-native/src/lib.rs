@@ -20,5 +20,15 @@ pub use keys::NativeKeySigning;
 pub use storage::FileStorage;
 pub use transport::QuinnTransport;
 
-// NOTE: The Platform impl is added once all trait implementations are complete.
-// See the end of this file for the planned NativePlatform definition.
+use rumble_client::Platform;
+
+/// Native desktop platform using quinn, cpal, opus, and filesystem storage.
+pub struct NativePlatform;
+
+impl Platform for NativePlatform {
+    type Transport = QuinnTransport;
+    type AudioBackend = CpalAudioBackend;
+    type Codec = NativeOpusCodec;
+    type Storage = FileStorage;
+    type KeyManager = NativeKeySigning;
+}
