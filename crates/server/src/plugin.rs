@@ -10,7 +10,7 @@ use crate::{
 };
 use anyhow::Result;
 use api::proto::Envelope;
-use quinn::RecvStream;
+use quinn::{RecvStream, SendStream};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -86,6 +86,21 @@ impl ServerCtx {
             .await
             .map_err(|e| anyhow::anyhow!("failed to send to client {user_id}: {e}"))?;
         Ok(())
+    }
+
+    /// Open a new bi-directional QUIC stream to a connected client.
+    ///
+    /// Writes the given [`StreamHeader`] as the first frame so the remote end
+    /// can dispatch it to the correct plugin. Returns the raw stream pair for
+    /// the caller to use.
+    pub async fn open_stream_to(&self, user_id: u64, header: StreamHeader) -> Result<(SendStream, RecvStream)> {
+        let client = self
+            .state
+            .get_client(user_id)
+            .ok_or_else(|| anyhow::anyhow!("client {user_id} not found"))?;
+        let (mut send, recv) = client.conn.open_bi().await?;
+        send.write_all(&header.encode()).await?;
+        Ok((send, recv))
     }
 
     /// Broadcast an envelope to all clients in a room.

@@ -5,7 +5,7 @@
 use crate::{
     handlers::{cleanup_client, handle_datagrams, handle_envelope},
     persistence::Persistence,
-    plugin::{ServerCtx, ServerPlugin},
+    plugin::{ServerCtx, ServerPlugin, StreamHeader},
     relay::{RelayConfig, RelayService},
     state::{ClientHandle, ServerState},
 };
@@ -293,12 +293,11 @@ pub async fn handle_connection(
 
     loop {
         match conn.accept_bi().await {
-            Ok((send_stream, mut recv)) => {
+            Ok((send_stream, recv)) => {
                 info!("new bi stream opened (first={})", is_first_stream);
 
-                // Create or reuse client handle
-                let handle = if is_first_stream {
-                    // First stream - create and register the client
+                if is_first_stream {
+                    // First stream - create and register the client (control stream)
                     let handle = Arc::new(ClientHandle::new(
                         send_stream,
                         user_id,
@@ -315,93 +314,49 @@ pub async fn handle_connection(
 
                     client_handle = Some(handle.clone());
                     is_first_stream = false;
-                    handle
+
+                    let persistence = persistence.clone();
+                    let state_clone = state.clone();
+                    let plugins_clone = plugins.clone();
+                    let ctx_clone = plugin_ctx.clone();
+
+                    tokio::spawn(async move {
+                        run_envelope_stream(recv, handle, state_clone, persistence, plugins_clone, ctx_clone, true)
+                            .await;
+                    });
+                } else if let Some(ref primary_handle) = client_handle {
+                    // Additional stream - probe for plugin stream header
+                    let primary_handle = primary_handle.clone();
+                    let plugins_clone = plugins.clone();
+                    let ctx_clone = plugin_ctx.clone();
+                    let persistence = persistence.clone();
+                    let state_clone = state.clone();
+                    let conn_clone = conn.clone();
+                    let username_clone = username.clone();
+                    let public_key_clone = public_key.clone();
+                    let authenticated_clone = authenticated.clone();
+
+                    tokio::spawn(async move {
+                        dispatch_secondary_stream(
+                            send_stream,
+                            recv,
+                            user_id,
+                            conn_clone,
+                            username_clone,
+                            public_key_clone,
+                            authenticated_clone,
+                            primary_handle,
+                            state_clone,
+                            persistence,
+                            plugins_clone,
+                            ctx_clone,
+                        )
+                        .await;
+                    });
                 } else {
-                    // Additional stream (e.g., tracker announce) - create handle for
-                    // this stream but don't register as a new client
-                    Arc::new(ClientHandle::new(
-                        send_stream,
-                        user_id,
-                        conn.clone(),
-                        username.clone(),
-                        public_key.clone(),
-                        authenticated.clone(),
-                    ))
-                };
-
-                let persistence = persistence.clone();
-                let state_clone = state.clone();
-                let is_primary = client_handle.as_ref().map(|h| Arc::ptr_eq(h, &handle)).unwrap_or(false);
-                let plugins_clone = plugins.clone();
-                let ctx_clone = plugin_ctx.clone();
-
-                tokio::spawn(async move {
-                    let mut buf = BytesMut::new();
-
-                    // Read loop - handle errors gracefully
-                    loop {
-                        let mut chunk = [0u8; 1024];
-                        let read_result =
-                            tokio::time::timeout(std::time::Duration::from_secs(30), recv.read(&mut chunk)).await;
-
-                        match read_result {
-                            Ok(Ok(Some(n))) => {
-                                info!(bytes = n, "server: received bytes on stream");
-                                buf.extend_from_slice(&chunk[..n]);
-                                while let Some(frame) = try_decode_frame(&mut buf) {
-                                    match Envelope::decode(&*frame) {
-                                        Ok(env) => {
-                                            info!(frame_len = frame.len(), "server: decoded envelope frame");
-                                            if let Err(e) = handle_envelope(
-                                                env,
-                                                handle.clone(),
-                                                state_clone.clone(),
-                                                persistence.clone(),
-                                                &plugins_clone,
-                                                &ctx_clone,
-                                            )
-                                            .await
-                                            {
-                                                error!("handle_envelope error: {e:?}");
-                                            }
-                                        }
-                                        Err(e) => error!("failed to decode envelope: {e:?}"),
-                                    }
-                                }
-                            }
-                            Ok(Ok(None)) => {
-                                info!("stream closed by peer (primary={})", is_primary);
-                                break;
-                            }
-                            Ok(Err(e)) => {
-                                info!("stream read error (likely disconnect): {e:?}");
-                                break;
-                            }
-                            Err(_) => {
-                                // Read timeout - check if connection is still alive
-                                info!("read timeout, checking connection health");
-                                let env = proto::Envelope {
-                                    state_hash: Vec::new(),
-                                    payload: None,
-                                };
-                                let frame = api::encode_frame(&env);
-                                // Use the send_frame helper method
-                                if handle.send_frame(&frame).await.is_err() {
-                                    info!("connection dead after read timeout");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Only cleanup if this was the primary stream
-                    if is_primary {
-                        for plugin in &plugins_clone {
-                            plugin.on_disconnect(&handle, &ctx_clone).await;
-                        }
-                        cleanup_client(&handle, &state_clone).await;
-                    }
-                });
+                    // Non-primary stream but no client_handle yet (shouldn't happen)
+                    error!("received non-primary stream before client was registered");
+                }
             }
             Err(e) => {
                 info!("connection closed: {e:?}");
@@ -419,4 +374,207 @@ pub async fn handle_connection(
     }
 
     Ok(())
+}
+
+/// Run the envelope read loop on a stream (used for control streams and
+/// secondary streams that are not plugin-owned).
+async fn run_envelope_stream(
+    recv: quinn::RecvStream,
+    handle: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+    plugins: Vec<Arc<dyn ServerPlugin>>,
+    ctx: Arc<ServerCtx>,
+    is_primary: bool,
+) {
+    run_envelope_stream_with_prefix(
+        recv,
+        handle,
+        state,
+        persistence,
+        plugins,
+        ctx,
+        is_primary,
+        BytesMut::new(),
+    )
+    .await;
+}
+
+/// Like [`run_envelope_stream`] but seeds the read buffer with already-consumed
+/// bytes (used when plugin header probing consumed bytes that turned out to be
+/// envelope data).
+async fn run_envelope_stream_with_prefix(
+    mut recv: quinn::RecvStream,
+    handle: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+    plugins: Vec<Arc<dyn ServerPlugin>>,
+    ctx: Arc<ServerCtx>,
+    is_primary: bool,
+    initial_buf: BytesMut,
+) {
+    let mut buf = initial_buf;
+
+    // Process any frames already present in the seed buffer
+    while let Some(frame) = try_decode_frame(&mut buf) {
+        match Envelope::decode(&*frame) {
+            Ok(env) => {
+                info!(frame_len = frame.len(), "server: decoded envelope frame");
+                if let Err(e) =
+                    handle_envelope(env, handle.clone(), state.clone(), persistence.clone(), &plugins, &ctx).await
+                {
+                    error!("handle_envelope error: {e:?}");
+                }
+            }
+            Err(e) => error!("failed to decode envelope: {e:?}"),
+        }
+    }
+
+    // Read loop
+    loop {
+        let mut chunk = [0u8; 1024];
+        let read_result = tokio::time::timeout(std::time::Duration::from_secs(30), recv.read(&mut chunk)).await;
+
+        match read_result {
+            Ok(Ok(Some(n))) => {
+                info!(bytes = n, "server: received bytes on stream");
+                buf.extend_from_slice(&chunk[..n]);
+                while let Some(frame) = try_decode_frame(&mut buf) {
+                    match Envelope::decode(&*frame) {
+                        Ok(env) => {
+                            info!(frame_len = frame.len(), "server: decoded envelope frame");
+                            if let Err(e) =
+                                handle_envelope(env, handle.clone(), state.clone(), persistence.clone(), &plugins, &ctx)
+                                    .await
+                            {
+                                error!("handle_envelope error: {e:?}");
+                            }
+                        }
+                        Err(e) => error!("failed to decode envelope: {e:?}"),
+                    }
+                }
+            }
+            Ok(Ok(None)) => {
+                info!("stream closed by peer (primary={})", is_primary);
+                break;
+            }
+            Ok(Err(e)) => {
+                info!("stream read error (likely disconnect): {e:?}");
+                break;
+            }
+            Err(_) => {
+                // Read timeout - check if connection is still alive
+                info!("read timeout, checking connection health");
+                let env = proto::Envelope {
+                    state_hash: Vec::new(),
+                    payload: None,
+                };
+                let frame = api::encode_frame(&env);
+                if handle.send_frame(&frame).await.is_err() {
+                    info!("connection dead after read timeout");
+                    break;
+                }
+            }
+        }
+    }
+
+    // Only cleanup if this was the primary stream
+    if is_primary {
+        for plugin in &plugins {
+            plugin.on_disconnect(&handle, &ctx).await;
+        }
+        cleanup_client(&handle, &state).await;
+    }
+}
+
+/// Maximum plugin name length we consider valid when probing stream headers.
+const MAX_PLUGIN_NAME_LEN: u16 = 255;
+
+/// Dispatch a secondary (non-primary) stream. Probes the first bytes to
+/// determine if it carries a [`StreamHeader`] addressed to a registered plugin.
+/// If so, the stream is handed off to that plugin. Otherwise it falls back to
+/// the normal envelope processing loop.
+async fn dispatch_secondary_stream(
+    send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    user_id: u64,
+    conn: quinn::Connection,
+    username: Arc<RwLock<String>>,
+    public_key: Arc<RwLock<Option<[u8; 32]>>>,
+    authenticated: Arc<AtomicBool>,
+    primary_handle: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+    plugins: Vec<Arc<dyn ServerPlugin>>,
+    ctx: Arc<ServerCtx>,
+) {
+    // --- Step 1: Read the 2-byte name-length prefix ---
+    let mut len_buf = [0u8; 2];
+    match recv.read_exact(&mut len_buf).await {
+        Ok(()) => {}
+        Err(e) => {
+            info!("secondary stream closed before header could be read: {e:?}");
+            return;
+        }
+    }
+    let name_len = u16::from_be_bytes(len_buf) as usize;
+
+    // --- Step 2: Sanity-check the length ---
+    if name_len > 0 && name_len <= MAX_PLUGIN_NAME_LEN as usize {
+        // Read the candidate plugin name
+        let mut name_buf = vec![0u8; name_len];
+        match recv.read_exact(&mut name_buf).await {
+            Ok(()) => {}
+            Err(e) => {
+                info!("secondary stream closed while reading plugin name: {e:?}");
+                return;
+            }
+        }
+
+        // Check for valid UTF-8 and matching plugin
+        if let Ok(plugin_name) = std::str::from_utf8(&name_buf) {
+            if let Some(plugin) = plugins.iter().find(|p| p.name() == plugin_name) {
+                // It's a plugin stream -- build header and dispatch
+                info!(plugin = plugin_name, "routing secondary stream to plugin");
+                let header = StreamHeader {
+                    plugin: plugin_name.to_owned(),
+                    metadata: Vec::new(), // plugin reads its own metadata from recv
+                };
+                if let Err(e) = plugin.on_stream(header, send, recv, &primary_handle, &ctx).await {
+                    error!(plugin = plugin_name, "plugin on_stream error: {e:?}");
+                }
+                return;
+            }
+        }
+
+        // Not a plugin stream -- fall back to envelope processing.
+        // Re-assemble the bytes we already consumed into the read buffer.
+        let mut seed = BytesMut::with_capacity(2 + name_len);
+        seed.extend_from_slice(&len_buf);
+        seed.extend_from_slice(&name_buf);
+
+        let handle = Arc::new(ClientHandle::new(
+            send,
+            user_id,
+            conn,
+            username,
+            public_key,
+            authenticated,
+        ));
+        run_envelope_stream_with_prefix(recv, handle, state, persistence, plugins, ctx, false, seed).await;
+    } else {
+        // name_len was 0 or too large -- definitely not a plugin header.
+        let mut seed = BytesMut::with_capacity(2);
+        seed.extend_from_slice(&len_buf);
+
+        let handle = Arc::new(ClientHandle::new(
+            send,
+            user_id,
+            conn,
+            username,
+            public_key,
+            authenticated,
+        ));
+        run_envelope_stream_with_prefix(recv, handle, state, persistence, plugins, ctx, false, seed).await;
+    }
 }
