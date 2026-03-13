@@ -1,6 +1,6 @@
 # V2 Architecture Migration — Progress & Remaining Work
 
-**Last updated:** 2026-03-12
+**Last updated:** 2026-03-13
 **Design doc:** `docs/v2-architecture.md`
 
 ---
@@ -21,9 +21,9 @@
 | **5d** | Switch `egui-test` to rumble-client | Done (via alias) | `7b5485d` |
 | **5e** | Switch `mumble-bridge` to rumble-client | Done | `7b5485d` |
 | **5f** | Backend dead code removal | Done | `7b5485d` |
-| **5g** | Auth deduplication | In progress | — |
-| **5h** | Extract torrent.rs to rumble-native | In progress | — |
-| **5i** | File-transfer-relay plugin | In progress | — |
+| **5g** | Auth deduplication | Done | `7a568be` |
+| **5h** | Extract torrent.rs to rumble-native | Done | `31f87cd` |
+| **5i** | File-transfer-relay plugin | Done | `d5b9e55` |
 | **6** | WASM platform | Deferred indefinitely | — |
 
 ---
@@ -122,32 +122,33 @@ All Platform trait impls with `NativePlatform` bundle:
 
 ---
 
-## In Progress
-
 ### Phase 5g — Auth deduplication
 
-Extract shared auth handshake helpers from handle.rs and mumble-bridge to `rumble-client/src/auth.rs`:
-- `send_envelope<T: Transport>()`
-- `wait_for_server_hello<T: Transport>()`
-- `wait_for_auth_result<T: Transport>()` (bridge version was missing `groups` — bug fix)
+Extracted shared auth handshake helpers to `rumble-client/src/auth.rs`:
+- `send_envelope<T: Transport>()`, `wait_for_server_hello<T: Transport>()`, `wait_for_auth_result<T: Transport>()`
+- Both `handle.rs` and `mumble-bridge/rumble_client.rs` call shared versions
+- Fixed bug: bridge was dropping `groups` from `wait_for_auth_result`
 
 ### Phase 5h — Extract torrent.rs to rumble-native
 
-- Move `backend/torrent.rs` to `rumble-native/src/torrent.rs`
-- Wrap as `BitTorrentFileTransfer` implementing `FileTransferPlugin` trait
-- Update `BackendHandle` to accept `Option<Box<dyn FileTransferPlugin>>` (remove `dyn Any` downcast hack)
-- Move librqbit dependency from backend to rumble-native
+- Moved `backend/torrent.rs` to `rumble-native/src/torrent.rs`
+- `BitTorrentFileTransfer` wraps `TorrentManager` implementing `FileTransferPlugin` trait
+- `BackendHandle` accepts `Option<Arc<dyn FileTransferPlugin>>` — `dyn Any` downcast hack removed
+- `FileTransferPlugin` trait expanded: `pause()`, `resume()`, `get_file_path()`, enriched `TransferStatus`
+- `librqbit` dependency moved from backend to rumble-native
 
 ### Phase 5i — File-transfer-relay plugin
 
-Server-side:
-- `relay_plugin.rs`: First plugin to use `on_stream()` dispatch
-- Simple QUIC stream pipe between sender and recipient
-- Proto messages for relay coordination
+Server-side (`relay_plugin.rs`):
+- `FileTransferRelayPlugin` — first plugin to use `on_stream()` dispatch
+- Sender opens stream → server pipes to recipient via `ctx.open_stream_to()`
+- Bidirectional copy with CancellationToken, DashMap tracking, disconnect cleanup
+- Proto: `RelayRequest`, `RelayOffer`, `RelayStatus` (field 94)
 
-Client-side:
-- `rumble-native/src/file_transfer_relay.rs` implementing `FileTransferPlugin`
-- Uses QUIC streams tagged with StreamHeader "file-relay"
+Client-side (`rumble-native/src/file_transfer_relay.rs`):
+- `FileTransferRelayPlugin` implementing `FileTransferPlugin`
+- Background worker for outgoing sends, incoming stream listener for downloads
+- Progress tracking via shared `HashMap<String, TransferEntry>`
 
 ---
 
