@@ -16,7 +16,7 @@ pub trait AudioPlaybackStream: Send {}
 ///
 /// Implementations use the platform's native audio API (e.g. cpal on
 /// desktop, Web Audio on browser).
-pub trait AudioBackend: Send + 'static {
+pub trait AudioBackend: Send + Default + 'static {
     type CaptureStream: AudioCaptureStream;
     type PlaybackStream: AudioPlaybackStream;
 

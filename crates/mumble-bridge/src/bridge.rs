@@ -102,8 +102,8 @@ pub async fn run_bridge(
     config: Arc<BridgeConfig>,
     bridge_state: Arc<RwLock<BridgeState>>,
     mut bridge_rx: mpsc::UnboundedReceiver<BridgeEvent>,
-    rumble_conn: quinn::Connection,
-    rumble_send: &mut quinn::SendStream,
+    rumble_conn: rumble_native::QuinnConnection,
+    rumble_send: &mut rumble_native::QuinnTransport,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     loop_state: &mut BridgeLoopState,
 ) -> (Result<()>, mpsc::UnboundedReceiver<BridgeEvent>) {

@@ -18,7 +18,11 @@ pub use audio::{CpalAudioBackend, CpalCaptureStream, CpalPlaybackStream};
 pub use codec::{NativeOpusCodec, NativeOpusDecoder, NativeOpusEncoder};
 pub use keys::NativeKeySigning;
 pub use storage::FileStorage;
-pub use transport::{QuinnDatagramHandle, QuinnTransport};
+pub use transport::{QuinnDatagramHandle, QuinnRecvStream, QuinnTransport};
+
+// Re-export quinn::Connection for downstream crates that need raw QUIC access
+// (e.g., mumble-bridge for datagrams and close detection)
+pub use quinn::Connection as QuinnConnection;
 
 use rumble_client::Platform;
 

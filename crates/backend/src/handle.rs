@@ -42,29 +42,27 @@
 use crate::p2p::{P2PManager, build_p2p_magnet, parse_p2p_magnet};
 use crate::{
     ConnectConfig,
-    audio::AudioSystem,
     audio_dump::AudioDumper,
     audio_task::{AudioCommand, AudioTaskConfig, AudioTaskHandle, spawn_audio_task},
-    cert_verifier::{
-        CapturedCert, InteractiveCertVerifier, is_cert_verification_error, new_captured_cert, take_captured_cert,
-    },
     events::{AudioState, Command, ConnectionState, PendingCertificate, SigningCallback, State, VoiceMode},
 };
 use api::{
     ROOT_ROOM_UUID, build_auth_payload, build_session_cert_payload, compute_cert_hash, compute_session_id,
-    encode_frame,
     proto::{self, envelope::Payload},
-    room_id_from_uuid, try_decode_frame,
+    room_id_from_uuid,
 };
-use bytes::BytesMut;
 use ed25519_dalek::SigningKey;
 #[cfg(feature = "p2p")]
 use libp2p::{Multiaddr, identity};
 use prost::Message;
-use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
+use rumble_client::{
+    AudioBackend, Platform,
+    cert::{CapturedCert, is_cert_error_message, new_captured_cert, take_captured_cert},
+    transport::{TlsConfig, Transport, TransportRecvStream},
+};
+use rumble_native::QuinnTransport;
 use std::{
     collections::{HashMap, HashSet},
-    net::ToSocketAddrs,
     sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -150,7 +148,7 @@ fn friendly_download_error(raw: &str) -> String {
 /// This type manages the tokio runtime, async connection, audio subsystem,
 /// and provides a state-driven interface for the UI. The UI reads state
 /// via `state()` and sends commands via `send()`.
-pub struct BackendHandle {
+pub struct BackendHandle<P: Platform> {
     /// Shared state that the UI reads.
     state: Arc<RwLock<State>>,
     /// Channel to send commands to the connection task.
@@ -163,9 +161,11 @@ pub struct BackendHandle {
     _connect_config: ConnectConfig,
     /// Pre-generated sound effects library.
     sfx_library: crate::sfx::SfxLibrary,
+    /// Marker for the platform type parameter.
+    _phantom: std::marker::PhantomData<P>,
 }
 
-impl BackendHandle {
+impl<P: Platform> BackendHandle<P> {
     /// Create a new backend handle with the given repaint callback.
     ///
     /// The repaint callback is called whenever state changes, allowing
@@ -215,10 +215,10 @@ impl BackendHandle {
         let repaint_callback = Arc::new(repaint_callback);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
-        // Initialize audio system (on main thread) and get device lists
-        let audio_system = AudioSystem::new();
-        let input_devices = audio_system.list_input_devices();
-        let output_devices = audio_system.list_output_devices();
+        // Initialize audio backend (on main thread) and get device lists
+        let audio_backend = P::AudioBackend::default();
+        let input_devices = audio_backend.list_input_devices();
+        let output_devices = audio_backend.list_output_devices();
 
         // Initialize state with audio info
         let state = State {
@@ -262,7 +262,7 @@ impl BackendHandle {
         let state = Arc::new(RwLock::new(state));
 
         // Spawn the audio task (runs on its own thread)
-        let audio_task = spawn_audio_task(AudioTaskConfig {
+        let audio_task = spawn_audio_task::<P>(AudioTaskConfig {
             state: state.clone(),
             repaint: repaint_callback.clone(),
             audio_dumper,
@@ -279,7 +279,7 @@ impl BackendHandle {
         let runtime_thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
             rt.block_on(async move {
-                run_connection_task(
+                run_connection_task::<P>(
                     command_rx,
                     command_tx_for_task,
                     state_for_task,
@@ -298,6 +298,7 @@ impl BackendHandle {
             _runtime_thread: runtime_thread,
             _connect_config: connect_config,
             sfx_library: crate::sfx::SfxLibrary::new(),
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -473,6 +474,12 @@ pub(crate) fn write_state(state: &Arc<RwLock<State>>) -> RwLockWriteGuard<'_, St
     }
 }
 
+/// Send a protobuf envelope via the transport.
+async fn send_envelope<T: Transport>(transport: &mut T, env: &proto::Envelope) -> anyhow::Result<()> {
+    let data = env.encode_to_vec();
+    transport.send(&data).await
+}
+
 /// The main connection task that handles QUIC communication (reliable streams only).
 ///
 /// This task manages:
@@ -481,7 +488,7 @@ pub(crate) fn write_state(state: &Arc<RwLock<State>>) -> RwLockWriteGuard<'_, St
 /// - State synchronization
 ///
 /// It notifies the audio task when a connection is established or closed.
-async fn run_connection_task(
+async fn run_connection_task<P: Platform>(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     command_tx: mpsc::UnboundedSender<Command>,
     state: Arc<RwLock<State>>,
@@ -490,8 +497,7 @@ async fn run_connection_task(
     audio_task: AudioTaskHandle,
 ) {
     // Connection state
-    let mut connection: Option<quinn::Connection> = None;
-    let mut send_stream: Option<quinn::SendStream> = None;
+    let mut transport: Option<P::Transport> = None;
     let mut client_name = String::new();
     let mut torrent_manager: Option<Arc<crate::torrent::TorrentManager>> = None;
     let mut shared_infohashes: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -657,8 +663,8 @@ async fn run_connection_task(
                 let Some(cmd) = cmd else {
                     // Channel closed, handle is dropped, exit task
                     debug!("Command channel closed, shutting down connection task");
-                    if let Some(conn) = connection.take() {
-                        conn.close(quinn::VarInt::from_u32(0), b"shutdown");
+                    if let Some(t) = transport.take() {
+                        t.close().await;
                     }
                     #[cfg(feature = "p2p")]
                     if let Some(p2p) = p2p_manager.take() {
@@ -681,8 +687,8 @@ async fn run_connection_task(
                         let captured_cert = new_captured_cert();
 
                         // Attempt connection with Ed25519 auth
-                        match connect_to_server(&addr, &name, &public_key, &signer, password.as_deref(), &config, captured_cert.clone()).await {
-                            Ok((conn, send, recv, recv_buf, user_id, rooms, users, groups, session_info)) => {
+                        match connect_to_server::<P::Transport>(&addr, &name, &public_key, &signer, password.as_deref(), &config, captured_cert.clone()).await {
+                            Ok((mut new_transport, user_id, rooms, users, groups, session_info)) => {
                                 // Update state to Connected
                                 {
                                     let mut s = write_state(&state);
@@ -709,12 +715,10 @@ async fn run_connection_task(
 
                                 // Notify audio task of new connection
                                 audio_task.send(AudioCommand::ConnectionEstablished {
-                                    datagram: Arc::new(rumble_native::QuinnDatagramHandle::new(conn.clone())),
+                                    datagram: Arc::new(new_transport.datagram_handle()),
                                     my_user_id: user_id,
                                 });
 
-                                connection = Some(conn.clone());
-                                send_stream = Some(send);
                                 _session_identity = Some(session_info);
 
                                 #[cfg(feature = "p2p")]
@@ -728,25 +732,34 @@ async fn run_connection_task(
                                     // Send PeerCapabilities to server
                                     if let Some(ref p2p) = p2p_manager {
                                         send_peer_capabilities(
-                                            send_stream.as_mut().unwrap(),
+                                            &mut new_transport,
                                             p2p.clone(),
                                         )
                                         .await;
                                     }
                                 }
 
-                                // Initialize TorrentManager
+                                // Initialize TorrentManager (still needs raw quinn connection — Phase 5f)
+                                // Downcast transport to QuinnTransport to get the raw connection.
                                 let temp_dir = config.download_dir.clone()
                                     .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
-                                match crate::torrent::TorrentManager::new(conn.clone(), temp_dir).await {
-                                    Ok(tm) => {
-                                        tm.set_needs_relay(config.prefer_relay);
-                                        torrent_manager = Some(Arc::new(tm));
+                                if let Some(qt) = (&new_transport as &dyn std::any::Any).downcast_ref::<QuinnTransport>() {
+                                    match crate::torrent::TorrentManager::new(qt.connection().clone(), temp_dir).await {
+                                        Ok(tm) => {
+                                            tm.set_needs_relay(config.prefer_relay);
+                                            torrent_manager = Some(Arc::new(tm));
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to initialize TorrentManager: {}", e);
+                                        }
                                     }
-                                    Err(e) => {
-                                        error!("Failed to initialize TorrentManager: {}", e);
-                                    }
+                                } else {
+                                    warn!("TorrentManager requires QuinnTransport — skipping file transfer support");
                                 }
+
+                                // Split off the receive stream for the receiver task
+                                let recv_stream = new_transport.take_recv();
+                                transport = Some(new_transport);
 
                                 // Spawn receiver task for reliable messages
                                 let state_clone = state.clone();
@@ -756,7 +769,7 @@ async fn run_connection_task(
                                 let command_tx_clone = command_tx.clone();
                                 let shared_infohashes_clone = shared_infohashes.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, shared_infohashes_clone).await;
+                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, shared_infohashes_clone).await;
                                 });
                             }
                             Err(e) => {
@@ -778,7 +791,7 @@ async fn run_connection_task(
                                         s.connection = ConnectionState::CertificatePending { cert_info: pending };
                                     }
                                     repaint();
-                                } else if is_cert_verification_error(&e) {
+                                } else if is_cert_error_message(&e) {
                                     // Cert verification error but we didn't capture the cert - shouldn't happen
                                     // but log and treat as connection failure
                                     error!("Certificate verification error but no cert captured: {}", e);
@@ -830,7 +843,7 @@ async fn run_connection_task(
                             let captured_cert = new_captured_cert();
 
                             // Retry connection with the certificate trusted
-                            match connect_to_server(
+                            match connect_to_server::<P::Transport>(
                                 &pending.server_addr,
                                 &pending.username,
                                 &pending.public_key,
@@ -839,7 +852,7 @@ async fn run_connection_task(
                                 &new_config,
                                 captured_cert,
                             ).await {
-                                Ok((conn, send, recv, recv_buf, user_id, rooms, users, groups, session_info)) => {
+                                Ok((mut new_transport, user_id, rooms, users, groups, session_info)) => {
                                     // Success! Update state
                                     {
                                         let mut s = write_state(&state);
@@ -865,12 +878,10 @@ async fn run_connection_task(
 
                                     // Notify audio task
                                     audio_task.send(AudioCommand::ConnectionEstablished {
-                                        datagram: Arc::new(rumble_native::QuinnDatagramHandle::new(conn.clone())),
+                                        datagram: Arc::new(new_transport.datagram_handle()),
                                         my_user_id: user_id,
                                     });
 
-                                    connection = Some(conn.clone());
-                                    send_stream = Some(send);
                                     client_name = pending.username;
                                     _session_identity = Some(session_info);
 
@@ -885,25 +896,33 @@ async fn run_connection_task(
                                         // Send PeerCapabilities to server
                                         if let Some(ref p2p) = p2p_manager {
                                             send_peer_capabilities(
-                                                send_stream.as_mut().unwrap(),
+                                                &mut new_transport,
                                                 p2p.clone(),
                                             )
                                             .await;
                                         }
                                     }
 
-                                    // Initialize TorrentManager
+                                    // Initialize TorrentManager (still needs raw quinn connection — Phase 5f)
                                     let temp_dir = new_config.download_dir.clone()
                                         .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
-                                    match crate::torrent::TorrentManager::new(conn.clone(), temp_dir).await {
-                                        Ok(tm) => {
-                                            tm.set_needs_relay(new_config.prefer_relay);
-                                            torrent_manager = Some(Arc::new(tm));
+                                    if let Some(qt) = (&new_transport as &dyn std::any::Any).downcast_ref::<QuinnTransport>() {
+                                        match crate::torrent::TorrentManager::new(qt.connection().clone(), temp_dir).await {
+                                            Ok(tm) => {
+                                                tm.set_needs_relay(new_config.prefer_relay);
+                                                torrent_manager = Some(Arc::new(tm));
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to initialize TorrentManager: {}", e);
+                                            }
                                         }
-                                        Err(e) => {
-                                            error!("Failed to initialize TorrentManager: {}", e);
-                                        }
+                                    } else {
+                                        warn!("TorrentManager requires QuinnTransport — skipping file transfer support");
                                     }
+
+                                    // Split off the receive stream for the receiver task
+                                    let recv_stream = new_transport.take_recv();
+                                    transport = Some(new_transport);
 
                                     // Spawn receiver task
                                     let state_clone = state.clone();
@@ -913,7 +932,7 @@ async fn run_connection_task(
                                     let command_tx_clone = command_tx.clone();
                                     let shared_infohashes_clone = shared_infohashes.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, shared_infohashes_clone).await;
+                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, shared_infohashes_clone).await;
                                     });
                                 }
                                 Err(e) => {
@@ -949,10 +968,9 @@ async fn run_connection_task(
                         // Notify audio task before closing
                         audio_task.send(AudioCommand::ConnectionClosed);
 
-                        if let Some(conn) = connection.take() {
-                            conn.close(quinn::VarInt::from_u32(0), b"disconnect");
+                        if let Some(t) = transport.take() {
+                            t.close().await;
                         }
-                        send_stream = None;
                         torrent_manager = None;
                         #[cfg(feature = "p2p")]
                         if let Some(p2p) = p2p_manager.take() {
@@ -973,22 +991,21 @@ async fn run_connection_task(
                     }
 
                     Command::JoinRoom { room_id } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::JoinRoom(proto::JoinRoom {
                                     room_id: Some(room_id_from_uuid(room_id)),
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send JoinRoom: {}", e);
                             }
                         }
                     }
 
                     Command::CreateRoom { name, parent_id } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::CreateRoom(proto::CreateRoom {
@@ -997,30 +1014,28 @@ async fn run_connection_task(
                                     description: None,
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send CreateRoom: {}", e);
                             }
                         }
                     }
 
                     Command::DeleteRoom { room_id } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::DeleteRoom(proto::DeleteRoom {
                                     room_id: Some(room_id_from_uuid(room_id)),
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send DeleteRoom: {}", e);
                             }
                         }
                     }
 
                     Command::RenameRoom { room_id, new_name } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::RenameRoom(proto::RenameRoom {
@@ -1028,15 +1043,14 @@ async fn run_connection_task(
                                     new_name,
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send RenameRoom: {}", e);
                             }
                         }
                     }
 
                     Command::MoveRoom { room_id, new_parent_id } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::MoveRoom(proto::MoveRoom {
@@ -1044,15 +1058,14 @@ async fn run_connection_task(
                                     new_parent_id: Some(room_id_from_uuid(new_parent_id)),
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send MoveRoom: {}", e);
                             }
                         }
                     }
 
                     Command::SetRoomDescription { room_id, description } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::SetRoomDescription(proto::SetRoomDescription {
@@ -1060,15 +1073,14 @@ async fn run_connection_task(
                                     description,
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send SetRoomDescription: {}", e);
                             }
                         }
                     }
 
                     Command::SendChat { text } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                             let timestamp_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1084,15 +1096,14 @@ async fn run_connection_task(
                                     tree: None,
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send ChatMessage: {}", e);
                             }
                         }
                     }
 
                     Command::SendTreeChat { text } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                             let timestamp_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1108,15 +1119,14 @@ async fn run_connection_task(
                                     tree: Some(true),
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send tree ChatMessage: {}", e);
                             }
                         }
                     }
 
                     Command::SendDirectMessage { target_user_id, target_username, text } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let message_id = uuid::Uuid::new_v4().into_bytes();
                             let timestamp = std::time::SystemTime::now();
                             let timestamp_ms = timestamp
@@ -1132,8 +1142,7 @@ async fn run_connection_task(
                                     timestamp_ms,
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send DirectMessage: {}", e);
                             }
                             // Add local message so the sender sees their own DM
@@ -1178,7 +1187,7 @@ async fn run_connection_task(
                     // Audio commands are routed to audio task in BackendHandle::send()
                     Command::SetMuted { muted } => {
                         // Send status update to server
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let s = read_state(&state);
                             let is_deafened = s.audio.self_deafened;
                             drop(s);
@@ -1189,8 +1198,7 @@ async fn run_connection_task(
                                     is_deafened,
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send SetUserStatus: {}", e);
                             }
                         }
@@ -1199,7 +1207,7 @@ async fn run_connection_task(
                     Command::SetDeafened { deafened } => {
                         // Send status update to server
                         // Note: deafen implies mute
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let s = read_state(&state);
                             let is_muted = s.audio.self_muted || deafened;
                             drop(s);
@@ -1210,8 +1218,7 @@ async fn run_connection_task(
                                     is_deafened: deafened,
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send SetUserStatus: {}", e);
                             }
                         }
@@ -1237,30 +1244,28 @@ async fn run_connection_task(
                     }
 
                     Command::RegisterUser { user_id } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::RegisterUser(proto::RegisterUser {
                                     user_id: Some(proto::UserId { value: user_id }),
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send RegisterUser: {}", e);
                             }
                         }
                     }
 
                     Command::UnregisterUser { user_id } => {
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::UnregisterUser(proto::UnregisterUser {
                                     user_id: Some(proto::UserId { value: user_id }),
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send UnregisterUser: {}", e);
                             }
                         }
@@ -1273,8 +1278,6 @@ async fn run_connection_task(
                             let repaint = repaint.clone();
                             let client = client_name.clone();
                             let path = path.clone();
-                            let mut send_opt = send_stream.as_mut();
-
                             match p2p.share_file(path.clone()).await {
                                 Ok(shared) => {
                                     shared_infohashes.insert(hex::encode(shared.id));
@@ -1290,7 +1293,7 @@ async fn run_connection_task(
                                         addr_strings,
                                     );
 
-                                    if let Some(send) = send_opt.as_mut() {
+                                    if let Some(t) = &mut transport {
                                         let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                                         let timestamp_ms = SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -1306,8 +1309,7 @@ async fn run_connection_task(
                                                 text: msg.to_json(),
                                             })),
                                         };
-                                        let frame = encode_frame(&env);
-                                        if let Err(e) = send.write_all(&frame).await {
+                                        if let Err(e) = send_envelope(t, &env).await {
                                             error!("Failed to send p2p file share message: {}", e);
                                         }
                                     }
@@ -1341,7 +1343,7 @@ async fn run_connection_task(
                             }
                         }
 
-                        if let (Some(tm), Some(send)) = (&torrent_manager, &mut send_stream) {
+                        if let (Some(tm), Some(t)) = (&torrent_manager, &mut transport) {
                             let tm = tm.clone();
                             let path = path.clone();
                             let state = state.clone();
@@ -1379,8 +1381,7 @@ async fn run_connection_task(
                                             tree: None,
                                         })),
                                     };
-                                    let frame = encode_frame(&env);
-                                    if let Err(e) = send.write_all(&frame).await {
+                                    if let Err(e) = send_envelope(t, &env).await {
                                         error!("Failed to send file share message: {}", e);
                                     }
 
@@ -1666,7 +1667,7 @@ async fn run_connection_task(
 
                     Command::RequestChatHistory => {
                         // Send a chat history request to the room
-                        if let Some(send) = &mut send_stream {
+                        if let Some(t) = &mut transport {
                             let request = crate::events::ChatHistoryRequestMessage::new();
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                             let timestamp_ms = SystemTime::now()
@@ -1684,8 +1685,7 @@ async fn run_connection_task(
                                     tree: None,
                                 })),
                             };
-                            let frame = encode_frame(&env);
-                            if let Err(e) = send.write_all(&frame).await {
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send chat history request: {}", e);
                             } else {
                                 info!("Sent chat history request to room");
@@ -1749,7 +1749,7 @@ async fn run_connection_task(
                                     );
 
                                     // Send as chat message
-                                    if let Some(send) = &mut send_stream {
+                                    if let Some(t) = &mut transport {
                                         let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                                         let timestamp_ms = SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -1765,8 +1765,7 @@ async fn run_connection_task(
                                                 text: msg.to_json(),
                                             })),
                                         };
-                                        let frame = encode_frame(&env);
-                                        if let Err(e) = send.write_all(&frame).await {
+                                        if let Err(e) = send_envelope(t, &env).await {
                                             error!("Failed to send chat history share message: {}", e);
                                         } else {
                                             info!(
@@ -1799,79 +1798,79 @@ async fn run_connection_task(
 
                     // ACL Commands
                     Command::KickUser { target_user_id, reason } => {
-                        if let Some(send) = &mut send_stream {
-                            let frame = encode_frame(&proto::Envelope {
+                        if let Some(t) = &mut transport {
+                            let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::KickUser(proto::KickUser {
                                     target_user_id,
                                     reason,
                                 })),
-                            });
-                            if let Err(e) = send.write_all(&frame).await {
+                            };
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send KickUser: {}", e);
                             }
                         }
                     }
                     Command::SetServerMute { target_user_id, muted } => {
-                        if let Some(send) = &mut send_stream {
-                            let frame = encode_frame(&proto::Envelope {
+                        if let Some(t) = &mut transport {
+                            let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::SetServerMute(proto::SetServerMute {
                                     target_user_id,
                                     muted,
                                 })),
-                            });
-                            if let Err(e) = send.write_all(&frame).await {
+                            };
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send SetServerMute: {}", e);
                             }
                         }
                     }
                     Command::Elevate { password } => {
-                        if let Some(send) = &mut send_stream {
-                            let frame = encode_frame(&proto::Envelope {
+                        if let Some(t) = &mut transport {
+                            let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::Elevate(proto::Elevate { password })),
-                            });
-                            if let Err(e) = send.write_all(&frame).await {
+                            };
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send Elevate: {}", e);
                             }
                         }
                     }
                     Command::CreateGroup { name, permissions } => {
-                        if let Some(send) = &mut send_stream {
-                            let frame = encode_frame(&proto::Envelope {
+                        if let Some(t) = &mut transport {
+                            let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::CreateGroup(proto::CreateGroup {
                                     name,
                                     permissions,
                                 })),
-                            });
-                            if let Err(e) = send.write_all(&frame).await {
+                            };
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send CreateGroup: {e}");
                             }
                         }
                     }
                     Command::DeleteGroup { name } => {
-                        if let Some(send) = &mut send_stream {
-                            let frame = encode_frame(&proto::Envelope {
+                        if let Some(t) = &mut transport {
+                            let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::DeleteGroup(proto::DeleteGroup { name })),
-                            });
-                            if let Err(e) = send.write_all(&frame).await {
+                            };
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send DeleteGroup: {e}");
                             }
                         }
                     }
                     Command::ModifyGroup { name, permissions } => {
-                        if let Some(send) = &mut send_stream {
-                            let frame = encode_frame(&proto::Envelope {
+                        if let Some(t) = &mut transport {
+                            let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::ModifyGroup(proto::ModifyGroup {
                                     name,
                                     permissions,
                                 })),
-                            });
-                            if let Err(e) = send.write_all(&frame).await {
+                            };
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send ModifyGroup: {e}");
                             }
                         }
@@ -1882,8 +1881,8 @@ async fn run_connection_task(
                         add,
                         expires_at,
                     } => {
-                        if let Some(send) = &mut send_stream {
-                            let frame = encode_frame(&proto::Envelope {
+                        if let Some(t) = &mut transport {
+                            let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::SetUserGroup(proto::SetUserGroup {
                                     target_user_id,
@@ -1891,8 +1890,8 @@ async fn run_connection_task(
                                     add,
                                     expires_at,
                                 })),
-                            });
-                            if let Err(e) = send.write_all(&frame).await {
+                            };
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send SetUserGroup: {e}");
                             }
                         }
@@ -1902,16 +1901,16 @@ async fn run_connection_task(
                         inherit_acl,
                         entries,
                     } => {
-                        if let Some(send) = &mut send_stream {
-                            let frame = encode_frame(&proto::Envelope {
+                        if let Some(t) = &mut transport {
+                            let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::SetRoomAcl(proto::SetRoomAcl {
                                     room_id: room_id.as_bytes().to_vec(),
                                     inherit_acl,
                                     entries,
                                 })),
-                            });
-                            if let Err(e) = send.write_all(&frame).await {
+                            };
+                            if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send SetRoomAcl: {e}");
                             }
                         }
@@ -1959,7 +1958,7 @@ async fn start_p2p_manager_from_session(
 
 /// Send PeerCapabilities message to the server after P2P manager is initialized.
 #[cfg(feature = "p2p")]
-async fn send_peer_capabilities(send: &mut quinn::SendStream, p2p: Arc<P2PManager>) {
+async fn send_peer_capabilities<T: Transport>(transport: &mut T, p2p: Arc<P2PManager>) {
     // Wait a moment for listen addresses to be discovered
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -1979,9 +1978,8 @@ async fn send_peer_capabilities(send: &mut quinn::SendStream, p2p: Arc<P2PManage
         state_hash: Vec::new(),
         payload: Some(Payload::PeerCapabilities(capabilities)),
     };
-    let frame = encode_frame(&envelope);
 
-    if let Err(e) = send.write_all(&frame).await {
+    if let Err(e) = send_envelope(transport, &envelope).await {
         warn!("Failed to send PeerCapabilities: {}", e);
     } else {
         info!("Sent PeerCapabilities to server");
@@ -1990,9 +1988,9 @@ async fn send_peer_capabilities(send: &mut quinn::SendStream, p2p: Arc<P2PManage
 
 /// Connect to a server and perform handshake with Ed25519 authentication.
 ///
-/// Returns the negotiated connection handles plus the generated session
-/// identity (ephemeral keypair) used for P2P features.
-async fn connect_to_server(
+/// Uses the Transport trait for QUIC connection and protocol framing.
+/// Returns the connected transport plus handshake results.
+async fn connect_to_server<T: Transport>(
     addr: &str,
     client_name: &str,
     public_key: &[u8; 32],
@@ -2001,51 +1999,56 @@ async fn connect_to_server(
     config: &ConnectConfig,
     captured_cert: CapturedCert,
 ) -> anyhow::Result<(
-    quinn::Connection,
-    quinn::SendStream,
-    quinn::RecvStream,
-    BytesMut, // remaining buffer after handshake
-    u64,      // user_id
+    T,
+    u64, // user_id
     Vec<proto::RoomInfo>,
     Vec<proto::User>,
     Vec<proto::GroupInfo>,
     SessionIdentity,
 )> {
-    use std::net::SocketAddr;
-    use url::Url;
-
-    const DEFAULT_PORT: u16 = 5000;
-
     info!(server_addr = %addr, client_name, "Connecting to server");
 
-    // Parse address using URL crate with rumble:// scheme
-    // Supports: "rumble://host:port", "rumble://host", "host:port", "host", IP addresses
-    let addr_as_url = if addr.contains("://") {
-        addr.to_string()
-    } else {
-        format!("rumble://{}", addr)
+    // Build TlsConfig from ConnectConfig
+    let mut additional_ca_certs = Vec::new();
+
+    // Load additional certificates from file paths
+    for cert_path in &config.additional_certs {
+        match std::fs::read(cert_path) {
+            Ok(cert_bytes) => {
+                if cert_bytes.starts_with(b"-----BEGIN") {
+                    let mut reader = std::io::BufReader::new(cert_bytes.as_slice());
+                    let certs: Vec<Vec<u8>> = rustls_pemfile::certs(&mut reader)
+                        .filter_map(|r| r.ok())
+                        .map(|c| c.to_vec())
+                        .collect();
+                    additional_ca_certs.extend(certs);
+                    info!("Loaded PEM certificate(s) from {:?}", cert_path);
+                } else {
+                    additional_ca_certs.push(cert_bytes);
+                    info!("Loaded DER certificate from {:?}", cert_path);
+                }
+            }
+            Err(e) => {
+                error!("Failed to load cert from {:?}: {}", cert_path, e);
+            }
+        }
+    }
+
+    // Add user-accepted certificates (from interactive prompts)
+    for cert_der in &config.accepted_certs {
+        additional_ca_certs.push(cert_der.clone());
+    }
+
+    let tls_config = TlsConfig {
+        accept_invalid_certs: false,
+        additional_ca_certs,
+        accepted_fingerprints: Vec::new(),
+        captured_cert: Some(captured_cert),
     };
 
-    let url = Url::parse(&addr_as_url).map_err(|e| anyhow::anyhow!("Invalid server address: {}", e))?;
-
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("No host in server address"))?;
-    let port = url.port().unwrap_or(DEFAULT_PORT);
-
-    let socket_addr: SocketAddr = format!("{}:{}", host, port)
-        .to_socket_addrs()
-        .map_err(|e| anyhow::anyhow!("Failed to resolve address: {}", e))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No addresses found for hostname"))?;
-
-    let endpoint = make_client_endpoint(socket_addr, config, captured_cert)?;
-
-    let conn = endpoint.connect(socket_addr, "localhost")?.await?;
-    info!(remote = %conn.remote_address(), "Connected to server");
-
-    let (mut send, mut recv) = conn.open_bi().await?;
-    info!("Opened bi stream");
+    // Connect via Transport trait (handles QUIC handshake + bi-stream setup)
+    let mut transport = T::connect(addr, tls_config).await?;
+    info!("Connected to server via Transport");
 
     // Step 1: Send ClientHello with public key
     let hello = proto::Envelope {
@@ -2056,17 +2059,20 @@ async fn connect_to_server(
             password: password.map(|s| s.to_string()),
         })),
     };
-    let frame = encode_frame(&hello);
-    send.write_all(&frame).await?;
+    send_envelope(&mut transport, &hello).await?;
     debug!("Sent ClientHello");
 
     // Step 2: Wait for ServerHello with nonce
-    let mut buf = BytesMut::new();
-    let (nonce, user_id) = wait_for_server_hello(&mut recv, &mut buf).await?;
+    let (nonce, user_id) = wait_for_server_hello(&mut transport).await?;
     info!(user_id, "Received ServerHello with nonce");
 
-    // Step 3: Compute server certificate hash
-    let server_cert_hash = compute_server_cert_hash(&conn);
+    // Step 3: Compute server certificate hash from transport
+    let server_cert_hash = if let Some(cert_der) = transport.peer_certificate_der() {
+        compute_cert_hash(&cert_der)
+    } else {
+        warn!("Could not get server certificate for hash computation");
+        [0u8; 32]
+    };
 
     // Step 4: Generate session keypair and certificate signed by long-term key
     let session_secret: [u8; 32] = rand::random();
@@ -2103,12 +2109,11 @@ async fn connect_to_server(
             }),
         })),
     };
-    let frame = encode_frame(&auth);
-    send.write_all(&frame).await?;
+    send_envelope(&mut transport, &auth).await?;
     debug!("Sent Authenticate");
 
     // Step 8: Wait for ServerState or AuthFailed
-    let (rooms, users, groups) = wait_for_auth_result(&mut recv, &mut buf).await?;
+    let (rooms, users, groups) = wait_for_auth_result(&mut transport).await?;
 
     let session_identity = SessionIdentity {
         signing_key: session_signing,
@@ -2118,31 +2123,27 @@ async fn connect_to_server(
         _expires_ms: expires_ms,
     };
 
-    Ok((conn, send, recv, buf, user_id, rooms, users, groups, session_identity))
+    Ok((transport, user_id, rooms, users, groups, session_identity))
 }
 
 /// Wait for ServerHello message and extract nonce and user_id.
-async fn wait_for_server_hello(recv: &mut quinn::RecvStream, buf: &mut BytesMut) -> anyhow::Result<([u8; 32], u64)> {
+async fn wait_for_server_hello<T: Transport>(transport: &mut T) -> anyhow::Result<([u8; 32], u64)> {
     loop {
-        let mut chunk = [0u8; 4096];
-        match recv.read(&mut chunk).await? {
-            Some(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                while let Some(frame) = try_decode_frame(buf) {
-                    if let Ok(env) = proto::Envelope::decode(&*frame) {
-                        match env.payload {
-                            Some(Payload::ServerHello(sh)) => {
-                                if sh.nonce.len() != 32 {
-                                    return Err(anyhow::anyhow!("Invalid nonce length in ServerHello"));
-                                }
-                                let nonce: [u8; 32] = sh.nonce.try_into().unwrap();
-                                return Ok((nonce, sh.user_id));
+        match transport.recv().await? {
+            Some(frame) => {
+                if let Ok(env) = proto::Envelope::decode(&*frame) {
+                    match env.payload {
+                        Some(Payload::ServerHello(sh)) => {
+                            if sh.nonce.len() != 32 {
+                                return Err(anyhow::anyhow!("Invalid nonce length in ServerHello"));
                             }
-                            Some(Payload::AuthFailed(af)) => {
-                                return Err(anyhow::anyhow!("Authentication failed: {}", af.error));
-                            }
-                            _ => {}
+                            let nonce: [u8; 32] = sh.nonce.try_into().unwrap();
+                            return Ok((nonce, sh.user_id));
                         }
+                        Some(Payload::AuthFailed(af)) => {
+                            return Err(anyhow::anyhow!("Authentication failed: {}", af.error));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2154,28 +2155,23 @@ async fn wait_for_server_hello(recv: &mut quinn::RecvStream, buf: &mut BytesMut)
 }
 
 /// Wait for authentication result (ServerState or AuthFailed).
-async fn wait_for_auth_result(
-    recv: &mut quinn::RecvStream,
-    buf: &mut BytesMut,
+async fn wait_for_auth_result<T: Transport>(
+    transport: &mut T,
 ) -> anyhow::Result<(Vec<proto::RoomInfo>, Vec<proto::User>, Vec<proto::GroupInfo>)> {
     loop {
-        let mut chunk = [0u8; 4096];
-        match recv.read(&mut chunk).await? {
-            Some(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                while let Some(frame) = try_decode_frame(buf) {
-                    if let Ok(env) = proto::Envelope::decode(&*frame) {
-                        match env.payload {
-                            Some(Payload::AuthFailed(af)) => {
-                                return Err(anyhow::anyhow!("Authentication failed: {}", af.error));
-                            }
-                            Some(Payload::ServerEvent(se)) => {
-                                if let Some(proto::server_event::Kind::ServerState(ss)) = se.kind {
-                                    return Ok((ss.rooms, ss.users, ss.groups));
-                                }
-                            }
-                            _ => {}
+        match transport.recv().await? {
+            Some(frame) => {
+                if let Ok(env) = proto::Envelope::decode(&*frame) {
+                    match env.payload {
+                        Some(Payload::AuthFailed(af)) => {
+                            return Err(anyhow::anyhow!("Authentication failed: {}", af.error));
                         }
+                        Some(Payload::ServerEvent(se)) => {
+                            if let Some(proto::server_event::Kind::ServerState(ss)) = se.kind {
+                                return Ok((ss.rooms, ss.users, ss.groups));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2186,32 +2182,12 @@ async fn wait_for_auth_result(
     }
 }
 
-/// Compute the SHA256 hash of the server's TLS certificate from the connection.
-fn compute_server_cert_hash(conn: &quinn::Connection) -> [u8; 32] {
-    // Get peer certificates from the connection
-    if let Some(peer_identity) = conn.peer_identity() {
-        if let Some(certs) = peer_identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'_>>>() {
-            if let Some(cert) = certs.first() {
-                return compute_cert_hash(cert.as_ref());
-            }
-        }
-    }
-    // Fallback: return zeros (should not happen with proper TLS)
-    warn!("Could not get server certificate for hash computation");
-    [0u8; 32]
-}
-
 /// Background task that receives reliable messages from the server.
 ///
-/// This task handles:
-/// - Server events (state updates, user joins/leaves, chat messages)
-/// - Connection loss detection
-///
-/// Voice datagrams are handled by the audio task, not here.
+/// Uses `TransportRecvStream` for framed message reception. Connection loss
+/// is detected when `recv()` returns `None` or an error.
 async fn run_receiver_task(
-    conn: quinn::Connection,
-    mut recv: quinn::RecvStream,
-    mut buf: BytesMut,
+    mut recv: impl TransportRecvStream,
     state: Arc<RwLock<State>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
     audio_task: AudioTaskHandle,
@@ -2220,26 +2196,21 @@ async fn run_receiver_task(
     shared_infohashes: std::collections::HashSet<String>,
 ) {
     loop {
-        let mut chunk = [0u8; 4096];
-        match recv.read(&mut chunk).await {
-            Ok(Some(n)) => {
-                buf.extend_from_slice(&chunk[..n]);
-                while let Some(frame) = try_decode_frame(&mut buf) {
-                    if let Ok(env) = proto::Envelope::decode(&*frame) {
-                        handle_server_message(
-                            env,
-                            &state,
-                            &repaint,
-                            &audio_task,
-                            &torrent_manager,
-                            &command_tx,
-                            &shared_infohashes,
-                        );
-                    }
+        match recv.recv().await {
+            Ok(Some(frame)) => {
+                if let Ok(env) = proto::Envelope::decode(&*frame) {
+                    handle_server_message(
+                        env,
+                        &state,
+                        &repaint,
+                        &audio_task,
+                        &torrent_manager,
+                        &command_tx,
+                        &shared_infohashes,
+                    );
                 }
             }
             Ok(None) => {
-                // Stream closed normally
                 info!("Server closed the receive stream");
                 break;
             }
@@ -2250,11 +2221,6 @@ async fn run_receiver_task(
         }
     }
 
-    // Connection closed or error - wait for the actual connection close
-    let error = conn.closed().await;
-
-    warn!("Connection closed: {}", error);
-
     // Notify audio task
     audio_task.send(AudioCommand::ConnectionClosed);
 
@@ -2263,7 +2229,7 @@ async fn run_receiver_task(
         let mut s = write_state(&state);
         if !matches!(s.connection, ConnectionState::Disconnected) {
             s.connection = ConnectionState::ConnectionLost {
-                error: error.to_string(),
+                error: "Connection closed".to_string(),
             };
             s.my_user_id = None;
             s.my_room_id = None;
@@ -3060,101 +3026,5 @@ fn handle_relay_allocation(
     let _ = (state, repaint); // Suppress unused warnings for now
 }
 
-/// Create a QUIC client endpoint with custom certificate verification.
-///
-/// This endpoint uses an interactive certificate verifier that:
-/// 1. Accepts certificates from standard webpki roots
-/// 2. Accepts certificates from configured additional_certs paths
-/// 3. Accepts certificates from the accepted_certs list (user-accepted)
-/// 4. For other self-signed certs, stores the cert in `captured_cert` and returns an error
-///    that allows the UI to prompt the user for acceptance
-fn make_client_endpoint(
-    remote_addr: std::net::SocketAddr,
-    config: &ConnectConfig,
-    captured_cert: CapturedCert,
-) -> anyhow::Result<Endpoint> {
-    // Bind to the same address family as the remote address
-    let bind_addr: std::net::SocketAddr = if remote_addr.is_ipv6() {
-        "[::]:0".parse().expect("valid IPv6 any address")
-    } else {
-        "0.0.0.0:0".parse().expect("valid IPv4 any address")
-    };
-    let mut endpoint = Endpoint::client(bind_addr)?;
-
-    // Start with webpki system roots
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // Load additional configured certificates from files (supports both PEM and DER formats)
-    for cert_path in &config.additional_certs {
-        match std::fs::read(cert_path) {
-            Ok(cert_bytes) => {
-                // Try to detect if it's PEM format (starts with "-----BEGIN")
-                if cert_bytes.starts_with(b"-----BEGIN") {
-                    // Parse as PEM - may contain multiple certificates
-                    let mut reader = std::io::BufReader::new(cert_bytes.as_slice());
-                    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-                        rustls_pemfile::certs(&mut reader).filter_map(|r| r.ok()).collect();
-                    for cert in certs {
-                        let _ = root_store.add(cert);
-                    }
-                    info!("Loaded PEM certificate(s) from {:?}", cert_path);
-                } else {
-                    // Assume DER format
-                    let cert = rustls::pki_types::CertificateDer::from(cert_bytes);
-                    let _ = root_store.add(cert);
-                    info!("Loaded DER certificate from {:?}", cert_path);
-                }
-            }
-            Err(e) => {
-                error!("Failed to load cert from {:?}: {}", cert_path, e);
-            }
-        }
-    }
-
-    // Add user-accepted certificates (from interactive prompts)
-    for cert_der in &config.accepted_certs {
-        let cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
-        if let Err(e) = root_store.add(cert) {
-            warn!("Failed to add accepted certificate to root store: {:?}", e);
-        } else {
-            debug!("Added user-accepted certificate to trust store");
-        }
-    }
-
-    // Create the crypto provider
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-
-    // Create the custom interactive verifier with the shared captured cert storage
-    let verifier = Arc::new(InteractiveCertVerifier::new(
-        root_store,
-        provider.clone(),
-        captured_cert,
-    ));
-
-    // Build client config with the custom verifier using dangerous() API
-    let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-
-    client_cfg.alpn_protocols = vec![b"rumble".to_vec()];
-    let rustls_config = Arc::new(client_cfg);
-    let crypto = QuicClientConfig::try_from(rustls_config)?;
-    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-
-    // Configure transport
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(
-        std::time::Duration::from_secs(30)
-            .try_into()
-            .expect("30s is within idle timeout bounds"),
-    ));
-    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    transport_config.datagram_receive_buffer_size(Some(65536));
-    client_config.transport_config(Arc::new(transport_config));
-
-    endpoint.set_default_client_config(client_config);
-    Ok(endpoint)
-}
+// make_client_endpoint removed — connection setup is now handled by
+// QuinnTransport::connect() in rumble-native (v2 Phase 5b).

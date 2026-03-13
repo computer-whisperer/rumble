@@ -10,10 +10,10 @@ use anyhow::Context;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
-use rumble_client::transport::{DatagramTransport, TlsConfig, Transport};
+use rumble_client::transport::{DatagramTransport, TlsConfig, Transport, TransportRecvStream};
 use rustls::RootCertStore;
 
-use crate::cert_verifier::{AcceptAllVerifier, FingerprintVerifier};
+use crate::cert_verifier::{AcceptAllVerifier, FingerprintVerifier, InteractiveCertVerifier};
 
 /// Datagram handle for QUIC voice data, wrapping a cloneable `quinn::Connection`.
 ///
@@ -46,17 +46,55 @@ impl DatagramTransport for QuinnDatagramHandle {
     }
 }
 
-/// QUIC transport backed by the quinn library.
-pub struct QuinnTransport {
-    connection: quinn::Connection,
-    send: quinn::SendStream,
+/// The receive half of a QUIC transport, split off for a separate receiver task.
+pub struct QuinnRecvStream {
     recv: quinn::RecvStream,
     buf: BytesMut,
 }
 
 #[async_trait]
+impl TransportRecvStream for QuinnRecvStream {
+    async fn recv(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        loop {
+            if let Some(frame) = api::try_decode_frame(&mut self.buf) {
+                return Ok(Some(frame));
+            }
+
+            let mut tmp = [0u8; 8192];
+            match self.recv.read(&mut tmp).await? {
+                Some(0) => continue,
+                Some(n) => {
+                    self.buf.extend_from_slice(&tmp[..n]);
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// QUIC transport backed by the quinn library.
+pub struct QuinnTransport {
+    connection: quinn::Connection,
+    send: quinn::SendStream,
+    recv: Option<quinn::RecvStream>,
+    buf: BytesMut,
+}
+
+impl QuinnTransport {
+    /// Access the underlying quinn connection.
+    ///
+    /// This is needed for quinn-specific operations like TorrentManager
+    /// which opens its own bi-directional streams. This accessor will be
+    /// removed when TorrentManager is extracted (Phase 5f).
+    pub fn connection(&self) -> &quinn::Connection {
+        &self.connection
+    }
+}
+
+#[async_trait]
 impl Transport for QuinnTransport {
     type Datagram = QuinnDatagramHandle;
+    type RecvStream = QuinnRecvStream;
 
     async fn connect(addr: &str, tls_config: TlsConfig) -> anyhow::Result<Self> {
         const DEFAULT_PORT: u16 = 5000;
@@ -86,40 +124,46 @@ impl Transport for QuinnTransport {
         // Build rustls ClientConfig
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
 
+        // Build root store with additional CAs
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for cert_der in &tls_config.additional_ca_certs {
+            let cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
+            let _ = root_store.add(cert);
+        }
+
         let mut client_cfg = if tls_config.accept_invalid_certs {
             // Danger: accept any certificate
             let verifier = Arc::new(AcceptAllVerifier::new());
-            rustls::ClientConfig::builder_with_provider(provider)
+            rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth()
+        } else if let Some(captured_cert) = tls_config.captured_cert {
+            // Interactive verification: captures unknown certs for user confirmation
+            let verifier = Arc::new(InteractiveCertVerifier::new(
+                root_store,
+                provider.clone(),
+                captured_cert,
+            ));
+            rustls::ClientConfig::builder_with_provider(provider.clone())
                 .with_protocol_versions(&[&rustls::version::TLS13])?
                 .dangerous()
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth()
         } else if !tls_config.accepted_fingerprints.is_empty() {
             // Fingerprint-pinned verification
-            let mut root_store = RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            for cert_der in &tls_config.additional_ca_certs {
-                let cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
-                let _ = root_store.add(cert);
-            }
-
             let verifier =
                 Arc::new(FingerprintVerifier::new(tls_config.accepted_fingerprints).with_additional_roots(root_store));
-            rustls::ClientConfig::builder_with_provider(provider)
+            rustls::ClientConfig::builder_with_provider(provider.clone())
                 .with_protocol_versions(&[&rustls::version::TLS13])?
                 .dangerous()
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth()
         } else {
-            // Standard WebPKI verification with optional additional CAs
-            let mut root_store = RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            for cert_der in &tls_config.additional_ca_certs {
-                let cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
-                let _ = root_store.add(cert);
-            }
-
-            rustls::ClientConfig::builder_with_provider(provider)
+            // Standard WebPKI verification
+            rustls::ClientConfig::builder_with_provider(provider.clone())
                 .with_protocol_versions(&[&rustls::version::TLS13])?
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
@@ -166,43 +210,43 @@ impl Transport for QuinnTransport {
         Ok(QuinnTransport {
             connection,
             send,
-            recv,
+            recv: Some(recv),
             buf: BytesMut::new(),
         })
     }
 
     async fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        // Use the same varint length-delimited framing as api::encode_frame /
-        // api::try_decode_frame so that QuinnTransport is wire-compatible with
-        // the existing Rumble protocol.
         let frame = api::encode_frame_raw(data);
         self.send.write_all(&frame).await?;
         Ok(())
     }
 
     async fn recv(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        let recv = self
+            .recv
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("recv stream already taken via take_recv()"))?;
+
         loop {
-            // Try to extract a complete frame from the buffer
             if let Some(frame) = api::try_decode_frame(&mut self.buf) {
                 return Ok(Some(frame));
             }
 
-            // Read more data from the stream
             let mut tmp = [0u8; 8192];
-            match self.recv.read(&mut tmp).await? {
-                Some(0) => {
-                    // No bytes read but stream still open — continue
-                    continue;
-                }
+            match recv.read(&mut tmp).await? {
+                Some(0) => continue,
                 Some(n) => {
                     self.buf.extend_from_slice(&tmp[..n]);
                 }
-                None => {
-                    // Stream closed
-                    return Ok(None);
-                }
+                None => return Ok(None),
             }
         }
+    }
+
+    fn take_recv(&mut self) -> Self::RecvStream {
+        let recv = self.recv.take().expect("take_recv() called more than once");
+        let buf = std::mem::take(&mut self.buf);
+        QuinnRecvStream { recv, buf }
     }
 
     fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()> {

@@ -7,6 +7,7 @@ use prost::Message;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
+use ::rumble_client::transport::{Transport, TransportRecvStream};
 use mumble_bridge::{
     bridge::{self, BridgeEvent, BridgeLoopState, read_bridge, write_bridge},
     config::BridgeConfig,
@@ -145,7 +146,7 @@ async fn main() -> Result<()> {
         info!(user_id = rumble_conn.user_id, "Connected to Rumble server");
 
         // Declare this connection as a bridge
-        if let Err(e) = rumble_client::send_bridge_hello(&mut rumble_conn.send, &config.bridge_name).await {
+        if let Err(e) = rumble_client::send_bridge_hello(&mut rumble_conn.transport, &config.bridge_name).await {
             error!(error = %e, "Failed to send BridgeHello");
             info!(backoff_secs, "Reconnecting after backoff");
             let mut shutdown_wait = shutdown_rx.clone();
@@ -211,7 +212,7 @@ async fn main() -> Result<()> {
                     let mut state = write_bridge(&bridge_state);
                     state.pending_registrations.push((username.clone(), *session));
                 }
-                if let Err(e) = rumble_client::send_bridge_register_user(&mut rumble_conn.send, username).await {
+                if let Err(e) = rumble_client::send_bridge_register_user(&mut rumble_conn.transport, username).await {
                     warn!(error = %e, %username, "Failed to re-register virtual user");
                 }
             }
@@ -220,11 +221,11 @@ async fn main() -> Result<()> {
             // (pending_join_rooms logic + MumbleMuteDeafChange events)
         }
 
-        // Decompose the Rumble connection
-        let rumble_conn_handle = rumble_conn.conn;
-        let mut rumble_send = rumble_conn.send;
-        let mut rumble_recv = rumble_conn.recv;
-        let mut rumble_buf = rumble_conn.buf;
+        // Split the transport: recv stream for receiver task, transport for sending,
+        // raw quinn::Connection for datagrams + closed detection.
+        let mut rumble_transport = rumble_conn.transport;
+        let rumble_conn_handle = rumble_transport.connection().clone();
+        let mut rumble_recv = rumble_transport.take_recv();
 
         // Spawn the Rumble receiver task (reliable stream + datagrams -> bridge events)
         let rumble_bridge_tx = bridge_tx.clone();
@@ -232,12 +233,17 @@ async fn main() -> Result<()> {
         let recv_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    result = rumble_client::read_envelope(&mut rumble_recv, &mut rumble_buf) => {
+                    result = rumble_recv.recv() => {
                         match result {
-                            Ok(Some(env)) => {
-                                let _ = rumble_bridge_tx.send(BridgeEvent::RumbleEnvelope(env));
+                            Ok(Some(frame)) => {
+                                if let Ok(env) = prost::Message::decode(&*frame) {
+                                    let _ = rumble_bridge_tx.send(BridgeEvent::RumbleEnvelope(env));
+                                }
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                error!("Rumble connection closed");
+                                break;
+                            }
                             Err(e) => {
                                 error!(error = %e, "Rumble connection error");
                                 break;
@@ -268,7 +274,7 @@ async fn main() -> Result<()> {
             bridge_state.clone(),
             bridge_rx,
             rumble_conn_handle,
-            &mut rumble_send,
+            &mut rumble_transport,
             shutdown_rx.clone(),
             &mut loop_state,
         )

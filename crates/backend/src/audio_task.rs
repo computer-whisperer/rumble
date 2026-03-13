@@ -25,24 +25,35 @@
 //! - Clean shutdown of either component independently
 
 use crate::{
-    audio::{AudioConfig, AudioInput, AudioOutput, AudioSystem, FRAME_SIZE},
     audio_dump::AudioDumper,
-    codec::{EncoderSettings, OPUS_FRAME_SIZE, VoiceDecoder, VoiceEncoder, is_dtx_frame},
+    codec::{OPUS_FRAME_SIZE, is_dtx_frame},
     events::{AudioSettings, AudioStats, State, VoiceMode},
     handle::{read_state, write_state},
 };
-use api::proto::VoiceDatagram;
+use api::{EncoderSettings, OPUS_MAX_PACKET_SIZE, proto::VoiceDatagram};
 use bytes::Bytes;
 use pipeline;
 use prost::Message;
-use rumble_client::DatagramTransport;
+use rumble_client::{
+    AudioBackend, AudioCaptureStream, DatagramTransport, Platform, VoiceCodec, VoiceDecoder as VoiceDecoderTrait,
+    VoiceEncoder as VoiceEncoderTrait,
+};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    sync::{Arc, RwLock, atomic::AtomicBool},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
+
+/// Type aliases to reduce verbosity with deeply nested associated types.
+type Enc<P> = <<P as Platform>::Codec as VoiceCodec>::Encoder;
+type Dec<P> = <<P as Platform>::Codec as VoiceCodec>::Decoder;
+type CapStream<P> = <<P as Platform>::AudioBackend as AudioBackend>::CaptureStream;
+type PlayStream<P> = <<P as Platform>::AudioBackend as AudioBackend>::PlaybackStream;
+
+/// Maximum playback buffer size in samples before dropping old samples.
+const MAX_PLAYBACK_BUFFER_SAMPLES: usize = 9600;
 
 /// Audio-task command channel.
 pub enum AudioCommand {
@@ -162,9 +173,9 @@ impl std::fmt::Debug for AudioCommand {
 ///
 /// The jitter buffer stores incoming Opus packets by sequence number,
 /// allowing reordering and providing a delay to absorb network jitter.
-struct UserAudioState {
-    /// Opus decoder for this user.
-    decoder: VoiceDecoder,
+struct UserAudioState<D: VoiceDecoderTrait> {
+    /// Opus decoder for this user (platform-specific via VoiceCodec trait).
+    decoder: D,
     /// Jitter buffer: maps sequence number to Opus packet data.
     /// Uses BTreeMap to maintain ordering by sequence number.
     jitter_buffer: BTreeMap<u32, Vec<u8>>,
@@ -213,10 +224,10 @@ enum CaptureMessage {
     EndOfStream,
 }
 
-impl UserAudioState {
-    fn new(jitter_buffer_delay: u32) -> Result<Self, String> {
-        Ok(Self {
-            decoder: VoiceDecoder::new().map_err(|e| e.to_string())?,
+impl<D: VoiceDecoderTrait> UserAudioState<D> {
+    fn new(decoder: D, jitter_buffer_delay: u32) -> Self {
+        Self {
+            decoder,
             jitter_buffer: BTreeMap::new(),
             next_play_seq: 0,
             started: false,
@@ -232,7 +243,7 @@ impl UserAudioState {
             volume_db: 0.0,
             stream_ended: false,
             needs_plc_prime: false,
-        })
+        }
     }
 
     /// Apply volume adjustment to samples.
@@ -355,7 +366,8 @@ impl UserAudioState {
         if self.needs_plc_prime {
             self.needs_plc_prime = false;
             // Run PLC to prime decoder state - discard the output
-            let _ = self.decoder.conceal(OPUS_FRAME_SIZE);
+            let mut discard = [0.0f32; OPUS_FRAME_SIZE];
+            let _ = self.decoder.decode_plc(&mut discard);
             debug!("Primed decoder with PLC frame before first real frame");
         }
 
@@ -366,8 +378,10 @@ impl UserAudioState {
 
         if let Some(opus_data) = self.jitter_buffer.remove(&seq) {
             // Packet present - decode it
-            match self.decoder.decode(&opus_data) {
-                Ok(pcm) => {
+            let mut pcm = vec![0.0f32; OPUS_FRAME_SIZE];
+            match self.decoder.decode(&opus_data, &mut pcm) {
+                Ok(samples) => {
+                    pcm.truncate(samples);
                     // Log first frame for diagnostics
                     if is_first_frame && pcm.len() >= 8 {
                         debug!(
@@ -381,7 +395,14 @@ impl UserAudioState {
                     warn!("Decode error for seq {}: {}", seq, e);
                     // Try PLC on decode error
                     self.frames_concealed += 1;
-                    self.decoder.conceal(OPUS_FRAME_SIZE).ok()
+                    let mut plc_buf = vec![0.0f32; OPUS_FRAME_SIZE];
+                    match self.decoder.decode_plc(&mut plc_buf) {
+                        Ok(samples) => {
+                            plc_buf.truncate(samples);
+                            Some(plc_buf)
+                        }
+                        Err(_) => None,
+                    }
                 }
             }
         } else {
@@ -399,22 +420,38 @@ impl UserAudioState {
             if let Some(next_opus_data) = self.jitter_buffer.get(&next_seq) {
                 // We have the next packet - use its FEC data to recover this frame
                 warn!("Missing packet seq {}, recovering with FEC from seq {}", seq, next_seq);
-                match self.decoder.decode_fec(next_opus_data) {
-                    Ok(pcm) => {
+                let mut fec_buf = vec![0.0f32; OPUS_FRAME_SIZE];
+                match self.decoder.decode_fec(next_opus_data, &mut fec_buf) {
+                    Ok(samples) => {
+                        fec_buf.truncate(samples);
                         self.packets_recovered_fec += 1;
-                        Some(pcm)
+                        Some(fec_buf)
                     }
                     Err(e) => {
                         warn!("FEC recovery failed for seq {}: {}, falling back to PLC", seq, e);
                         self.frames_concealed += 1;
-                        self.decoder.conceal(OPUS_FRAME_SIZE).ok()
+                        let mut plc_buf = vec![0.0f32; OPUS_FRAME_SIZE];
+                        match self.decoder.decode_plc(&mut plc_buf) {
+                            Ok(samples) => {
+                                plc_buf.truncate(samples);
+                                Some(plc_buf)
+                            }
+                            Err(_) => None,
+                        }
                     }
                 }
             } else {
                 // No next packet available - fall back to pure PLC
                 warn!("Missing packet seq {}, no FEC available, using PLC", seq);
                 self.frames_concealed += 1;
-                self.decoder.conceal(OPUS_FRAME_SIZE).ok()
+                let mut plc_buf = vec![0.0f32; OPUS_FRAME_SIZE];
+                match self.decoder.decode_plc(&mut plc_buf) {
+                    Ok(samples) => {
+                        plc_buf.truncate(samples);
+                        Some(plc_buf)
+                    }
+                    Err(_) => None,
+                }
             }
         }
     }
@@ -447,7 +484,7 @@ pub struct AudioTaskConfig {
 ///
 /// The audio task runs on a separate thread with its own tokio runtime
 /// to avoid any blocking from audio I/O affecting other async tasks.
-pub fn spawn_audio_task(config: AudioTaskConfig) -> AudioTaskHandle {
+pub fn spawn_audio_task<P: Platform>(config: AudioTaskConfig) -> AudioTaskHandle {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     std::thread::spawn(move || {
@@ -456,20 +493,20 @@ pub fn spawn_audio_task(config: AudioTaskConfig) -> AudioTaskHandle {
             .build()
             .expect("create audio tokio runtime");
 
-        rt.block_on(run_audio_task(command_rx, config));
+        rt.block_on(run_audio_task::<P>(command_rx, config));
     });
 
     AudioTaskHandle { command_tx }
 }
 
 /// Main audio task loop.
-async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, config: AudioTaskConfig) {
+async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, config: AudioTaskConfig) {
     let state = config.state;
     let repaint = config.repaint;
     let audio_dumper = config.audio_dumper.unwrap_or_else(AudioDumper::disabled);
 
-    // Audio system for device access (not Send, so lives on this thread)
-    let audio_system = AudioSystem::new();
+    // Audio backend for device access (lives on this thread)
+    let audio_backend = P::AudioBackend::default();
 
     // Current connection state (datagram handle for voice I/O)
     let mut connection: Option<Arc<dyn DatagramTransport>> = None;
@@ -484,18 +521,22 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     // Per-user local mutes
     let mut muted_users: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-    // Audio I/O handles
-    let mut audio_input: Option<AudioInput> = None;
+    // Audio I/O handles (generic over Platform)
+    let mut audio_input: Option<CapStream<P>> = None;
+    // Shared playback buffer: audio task writes mixed samples here,
+    // the output stream's callback reads from it.
+    let playback_buffer: Arc<Mutex<VecDeque<f32>>> =
+        Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PLAYBACK_BUFFER_SAMPLES)));
     // Start audio output immediately so SFX can play even when disconnected.
     // The output is cheap when idle (just outputs silence).
-    // (Initialized below after audio_system and selected_output are set up.)
-    let mut audio_output: Option<AudioOutput>;
+    // (Initialized below after audio_backend and selected_output are set up.)
+    let mut playback_stream: Option<PlayStream<P>> = None;
 
     // Sound effects sample queue - mixed into playback output each frame
     let mut sfx_queue: VecDeque<f32> = VecDeque::new();
 
     // Per-user decoders and jitter buffers
-    let mut user_audio: HashMap<u64, UserAudioState> = HashMap::new();
+    let mut user_audio: HashMap<u64, UserAudioState<Dec<P>>> = HashMap::new();
 
     // Selected devices
     let mut selected_input: Option<String> = None;
@@ -544,7 +585,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     // The encoder is created when a connection is established and persists for the
     // entire connection lifetime. It is NOT reset between PTT presses or voice
     // activations - this allows Opus to maintain state for better DTX behavior.
-    let encoder: Arc<std::sync::Mutex<Option<VoiceEncoder>>> = Arc::new(std::sync::Mutex::new(None));
+    let encoder: Arc<std::sync::Mutex<Option<Enc<P>>>> = Arc::new(std::sync::Mutex::new(None));
 
     // =============================================================================
     // DTX (Discontinuous Transmission) Handling
@@ -588,9 +629,10 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
         }
     }
 
-    // Shared flag: when true, the capture callback processes samples; when false, it discards them.
-    let capture_active = Arc::new(AtomicBool::new(false));
-    let capture_active_for_callback = capture_active.clone();
+    // Whether the capture callback should process samples or discard them.
+    // This is a local bool because the callback uses AudioCaptureStream::set_active()
+    // to be gated, rather than checking a shared atomic flag.
+    let mut capture_is_active = false;
 
     // Interval for cleaning up stale talking_users
     let mut cleanup_interval = tokio::time::interval(Duration::from_millis(500));
@@ -602,32 +644,37 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     let mut stats_interval = tokio::time::interval(Duration::from_millis(500));
 
     // Start audio output at startup so SFX can play without a connection
-    audio_output = start_audio_output(&audio_system, &selected_output);
+    playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone());
 
     info!("Audio task started");
 
-    /// Macro to sync the capture_active flag after any state change.
-    /// This toggles whether captured samples are processed or discarded,
-    /// WITHOUT creating/destroying the audio input stream.
-    /// The audio input stream lifecycle is managed separately (connection-scoped).
+    /// Macro to sync the capture state after any state change.
+    /// This toggles whether captured samples are processed or discarded
+    /// via `AudioCaptureStream::set_active()`, WITHOUT creating/destroying
+    /// the audio input stream.
     macro_rules! sync_transmission {
         () => {{
             let want = should_capture(voice_mode, self_muted, ptt_active, connection.is_some());
-            let have = capture_active.load(std::sync::atomic::Ordering::Relaxed);
 
-            if want && !have {
-                capture_active.store(true, std::sync::atomic::Ordering::Relaxed);
+            if want && !capture_is_active {
+                capture_is_active = true;
+                if let Some(stream) = audio_input.as_ref() {
+                    stream.set_active(true);
+                }
                 {
                     let mut s = write_state(&state);
                     s.audio.is_transmitting = true;
                 }
                 repaint();
                 info!("Capture activated (samples will be processed)");
-            } else if !want && have {
+            } else if !want && capture_is_active {
                 // Send end-of-stream before deactivating
                 // (PTT released, muted, disconnected, etc.)
                 let _ = encoded_tx.send(CaptureMessage::EndOfStream);
-                capture_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                capture_is_active = false;
+                if let Some(stream) = audio_input.as_ref() {
+                    stream.set_active(false);
+                }
                 {
                     let mut s = write_state(&state);
                     s.audio.is_transmitting = false;
@@ -658,7 +705,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             dtx_enabled: true,
                             vbr_enabled: true,
                         };
-                        match VoiceEncoder::with_settings(encoder_settings) {
+                        match P::Codec::create_encoder(&encoder_settings) {
                             Ok(enc) => {
                                 if let Ok(mut guard) = encoder.lock() {
                                     *guard = Some(enc);
@@ -676,23 +723,22 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         }
 
                         // Start audio output for receiving (unless deafened)
-                        if audio_output.is_none() && !self_deafened {
-                            audio_output = start_audio_output(&audio_system, &selected_output);
+                        if playback_stream.is_none() && !self_deafened {
+                            playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone());
                         }
 
                         // Create connection-scoped audio input stream (unless muted).
                         // The stream stays alive for the entire connection to avoid
                         // ALSA device enumeration on every PTT press.
                         if audio_input.is_none() && !self_muted {
-                            start_transmission(
-                                &audio_system,
+                            start_transmission::<P>(
+                                &audio_backend,
                                 &selected_input,
                                 &encoded_tx,
                                 &audio_settings,
                                 &tx_pipeline_config,
                                 &processor_registry,
                                 &encoder,
-                                &capture_active_for_callback,
                                 &mut audio_input,
                                 &state,
                                 &repaint,
@@ -713,7 +759,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         sync_transmission!();
 
                         // Destroy connection-scoped audio input stream
-                        stop_transmission(&mut audio_input, &state, &repaint);
+                        stop_transmission::<P>(&mut audio_input, &state, &repaint);
 
                         // Destroy connection-scoped encoder
                         if let Ok(mut guard) = encoder.lock() {
@@ -744,18 +790,17 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
                         // Restart input stream if connected (need to use new device)
                         if audio_input.is_some() {
-                            stop_transmission(&mut audio_input, &state, &repaint);
+                            stop_transmission::<P>(&mut audio_input, &state, &repaint);
                         }
                         if connection.is_some() && !self_muted {
-                            start_transmission(
-                                &audio_system,
+                            start_transmission::<P>(
+                                &audio_backend,
                                 &selected_input,
                                 &encoded_tx,
                                 &audio_settings,
                                 &tx_pipeline_config,
                                 &processor_registry,
                                 &encoder,
-                                &capture_active_for_callback,
                                 &mut audio_input,
                                 &state,
                                 &repaint,
@@ -773,10 +818,10 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         }
                         repaint();
 
-                        // Restart output
-                        audio_output = None;
-                        if connection.is_some() && !self_deafened {
-                            audio_output = start_audio_output(&audio_system, &selected_output);
+                        // Restart output (always, even when disconnected — SFX need it)
+                        playback_stream = None;
+                        if !self_deafened {
+                            playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone());
                         }
                     }
 
@@ -813,17 +858,16 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         // Unmuted + connected -> create stream
                         if muted {
                             sync_transmission!();
-                            stop_transmission(&mut audio_input, &state, &repaint);
+                            stop_transmission::<P>(&mut audio_input, &state, &repaint);
                         } else if connection.is_some() && audio_input.is_none() {
-                            start_transmission(
-                                &audio_system,
+                            start_transmission::<P>(
+                                &audio_backend,
                                 &selected_input,
                                 &encoded_tx,
                                 &audio_settings,
                                 &tx_pipeline_config,
                                 &processor_registry,
                                 &encoder,
-                                &capture_active_for_callback,
                                 &mut audio_input,
                                 &state,
                                 &repaint,
@@ -849,30 +893,29 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
                         // Handle audio output based on deafen state
                         if deafened {
-                            audio_output = None;
+                            playback_stream = None;
                             user_audio.clear();
                             {
                                 let mut s = write_state(&state);
                                 s.audio.talking_users.clear();
                             }
-                        } else if connection.is_some() && audio_output.is_none() {
-                            audio_output = start_audio_output(&audio_system, &selected_output);
+                        } else if connection.is_some() && playback_stream.is_none() {
+                            playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone());
                         }
 
                         // Manage stream lifecycle on mute state change
                         if self_muted && !was_muted {
                             sync_transmission!();
-                            stop_transmission(&mut audio_input, &state, &repaint);
+                            stop_transmission::<P>(&mut audio_input, &state, &repaint);
                         } else if !self_muted && was_muted && connection.is_some() && audio_input.is_none() {
-                            start_transmission(
-                                &audio_system,
+                            start_transmission::<P>(
+                                &audio_backend,
                                 &selected_input,
                                 &encoded_tx,
                                 &audio_settings,
                                 &tx_pipeline_config,
                                 &processor_registry,
                                 &encoder,
-                                &capture_active_for_callback,
                                 &mut audio_input,
                                 &state,
                                 &repaint,
@@ -903,8 +946,8 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     }
 
                     AudioCommand::RefreshDevices => {
-                        let input_devices = audio_system.list_input_devices();
-                        let output_devices = audio_system.list_output_devices();
+                        let input_devices = audio_backend.list_input_devices();
+                        let output_devices = audio_backend.list_output_devices();
                         {
                             let mut s = write_state(&state);
                             s.audio.input_devices = input_devices;
@@ -926,18 +969,17 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
                         // Recreate stream with new settings if connected
                         if audio_input.is_some() {
-                            stop_transmission(&mut audio_input, &state, &repaint);
+                            stop_transmission::<P>(&mut audio_input, &state, &repaint);
                         }
                         if connection.is_some() && !self_muted {
-                            start_transmission(
-                                &audio_system,
+                            start_transmission::<P>(
+                                &audio_backend,
                                 &selected_input,
                                 &encoded_tx,
                                 &audio_settings,
                                 &tx_pipeline_config,
                                 &processor_registry,
                                 &encoder,
-                                &capture_active_for_callback,
                                 &mut audio_input,
                                 &state,
                                 &repaint,
@@ -979,18 +1021,17 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
                         // Recreate stream to rebuild pipeline with new config
                         if audio_input.is_some() {
-                            stop_transmission(&mut audio_input, &state, &repaint);
+                            stop_transmission::<P>(&mut audio_input, &state, &repaint);
                         }
                         if connection.is_some() && !self_muted {
-                            start_transmission(
-                                &audio_system,
+                            start_transmission::<P>(
+                                &audio_backend,
                                 &selected_input,
                                 &encoded_tx,
                                 &audio_settings,
                                 &tx_pipeline_config,
                                 &processor_registry,
                                 &encoder,
-                                &capture_active_for_callback,
                                 &mut audio_input,
                                 &state,
                                 &repaint,
@@ -1105,10 +1146,13 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                                 }
                             };
 
-                            if let Ok(mut user_state) = UserAudioState::new(jitter_delay) {
+                            if let Ok(decoder) = P::Codec::create_decoder() {
+                                let mut user_state = UserAudioState::new(decoder, jitter_delay);
                                 user_state.rx_pipeline = rx_pipeline;
                                 user_state.volume_db = volume_db;
                                 user_audio.insert(user_id, user_state);
+                            } else {
+                                error!("Failed to create decoder for user {}", user_id);
                             }
                         }
                     }
@@ -1164,10 +1208,13 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                                     }
                                 };
 
-                                if let Ok(mut user_state) = UserAudioState::new(jitter_delay) {
+                                if let Ok(decoder) = P::Codec::create_decoder() {
+                                    let mut user_state = UserAudioState::new(decoder, jitter_delay);
                                     user_state.rx_pipeline = rx_pipeline;
                                     user_state.volume_db = volume_db;
                                     user_audio.insert(user_id, user_state);
+                                } else {
+                                    error!("Failed to create decoder for user {}", user_id);
                                 }
                             }
                         }
@@ -1279,7 +1326,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             if let Some(sender_id) = voice.sender_id {
                                 // Don't play back our own audio or audio from muted users
                                 if sender_id != my_user_id && !muted_users.contains(&sender_id) {
-                                    handle_voice_datagram(
+                                    handle_voice_datagram::<P::Codec>(
                                         sender_id,
                                         voice.sequence,
                                         voice.opus_data,
@@ -1310,7 +1357,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
             // Mix audio from all users' jitter buffers every 20ms
             _ = mix_interval.tick() => {
-                mix_and_play_audio(&mut user_audio, &mut sfx_queue, &audio_output, &audio_dumper);
+                mix_and_play_audio(&mut user_audio, &mut sfx_queue, &playback_buffer, &audio_dumper);
             }
 
             // Periodic cleanup of stale talking_users (does not destroy decoders)
@@ -1332,16 +1379,15 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 /// The `capture_active` flag controls whether captured samples are processed and
 /// encoded (true) or silently discarded (false). This avoids ALSA device
 /// enumeration errors on every PTT press/release cycle.
-fn start_transmission(
-    audio_system: &AudioSystem,
+fn start_transmission<P: Platform>(
+    audio_backend: &P::AudioBackend,
     selected_input: &Option<String>,
     encoded_tx: &mpsc::UnboundedSender<CaptureMessage>,
     audio_settings: &AudioSettings,
     tx_pipeline_config: &pipeline::PipelineConfig,
     processor_registry: &pipeline::ProcessorRegistry,
-    encoder: &Arc<std::sync::Mutex<Option<VoiceEncoder>>>,
-    capture_active: &Arc<AtomicBool>,
-    audio_input: &mut Option<AudioInput>,
+    encoder: &Arc<std::sync::Mutex<Option<Enc<P>>>>,
+    audio_input: &mut Option<CapStream<P>>,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_dumper: &AudioDumper,
@@ -1349,20 +1395,6 @@ fn start_transmission(
     if audio_input.is_some() {
         return; // Stream already exists
     }
-
-    // Get input device
-    let device = match selected_input {
-        Some(id) => audio_system.get_input_device_by_id(id),
-        None => audio_system.default_input_device(),
-    };
-
-    let device = match device {
-        Some(d) => d,
-        None => {
-            error!("No input device available");
-            return;
-        }
-    };
 
     // Use the connection-scoped encoder (already created on ConnectionEstablished)
     // We just verify it exists and update settings if needed
@@ -1384,7 +1416,7 @@ fn start_transmission(
             }
             // Update settings if they've changed
             if let Some(enc) = guard.as_mut() {
-                if let Err(e) = enc.update_settings(encoder_settings) {
+                if let Err(e) = enc.apply_settings(&encoder_settings) {
                     warn!("Failed to update encoder settings: {}", e);
                 }
             }
@@ -1396,7 +1428,6 @@ fn start_transmission(
 
     // Clone Arc for use in callback
     let encoder_for_callback = encoder.clone();
-    let capture_active_for_callback = capture_active.clone();
 
     // Build the TX pipeline from config
     let tx_pipeline = match pipeline::AudioPipeline::from_config(tx_pipeline_config, processor_registry) {
@@ -1427,105 +1458,96 @@ fn start_transmission(
     // Audio dumper for debugging
     let dumper_for_callback = audio_dumper.clone();
 
-    // Audio config uses defaults - audio processing (denoise, VAD, etc.)
-    // is handled by the TX pipeline, not by AudioConfig
-    let audio_config = AudioConfig::default();
-
-    // Create audio input with pipeline + encoding callback
+    // Create audio input via AudioBackend trait
     let encoded_tx = encoded_tx.clone();
-    let input = AudioInput::new(&device, &audio_config, move |samples| {
-        // Discard first few frames to avoid stale hardware buffer samples
-        let remaining = frames_to_discard_for_callback.load(std::sync::atomic::Ordering::Relaxed);
-        if remaining > 0 {
-            frames_to_discard_for_callback.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
+    let input = audio_backend.open_input(
+        selected_input.as_deref(),
+        Box::new(move |samples| {
+            // Discard first few frames to avoid stale hardware buffer samples
+            let remaining = frames_to_discard_for_callback.load(std::sync::atomic::Ordering::Relaxed);
+            if remaining > 0 {
+                frames_to_discard_for_callback.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
 
-        // Check if capture is active (PTT pressed, continuous mode, etc.)
-        // When inactive, silently discard samples to keep the stream alive
-        // without triggering ALSA device re-enumeration.
-        if !capture_active_for_callback.load(std::sync::atomic::Ordering::Relaxed) {
-            // Still send EOS if we were previously transmitting
+            // Dump raw mic samples (before any processing)
+            dumper_for_callback.write_mic_raw(samples);
+
+            // Run samples through the TX pipeline
+            // We make a mutable copy since the callback receives &[f32]
+            let mut processed_samples = samples.to_vec();
+
+            let pipeline_result = if let Ok(mut pipe) = pipeline_mutex.lock() {
+                pipe.process(&mut processed_samples, 48000)
+            } else {
+                pipeline::ProcessorResult::default()
+            };
+
+            // Track previous transmitting state to detect changes
             let was_tx = was_transmitting_for_callback.load(std::sync::atomic::Ordering::Relaxed);
-            if was_tx {
-                was_transmitting_for_callback.store(false, std::sync::atomic::Ordering::Relaxed);
-                let _ = encoded_tx.send(CaptureMessage::EndOfStream);
+            let is_tx_now = !pipeline_result.suppress;
+
+            // Update input level and transmitting state in state (for UI metering)
+            // is_transmitting reflects whether audio is actually being transmitted
+            // (not suppressed by VAD or other pipeline processors)
+            if let Ok(mut s) = state_for_callback.write() {
+                if let Some(level_db) = pipeline_result.level_db {
+                    s.audio.input_level_db = Some(level_db);
+                }
+                // Update is_transmitting to reflect actual transmission state
+                s.audio.is_transmitting = is_tx_now;
             }
-            return;
-        }
 
-        // Dump raw mic samples (before any processing)
-        dumper_for_callback.write_mic_raw(samples);
-
-        // Run samples through the TX pipeline
-        // We make a mutable copy since the callback receives &[f32]
-        let mut processed_samples = samples.to_vec();
-
-        let pipeline_result = if let Ok(mut pipe) = pipeline_mutex.lock() {
-            pipe.process(&mut processed_samples, 48000)
-        } else {
-            pipeline::ProcessorResult::default()
-        };
-
-        // Track previous transmitting state to detect changes
-        let was_tx = was_transmitting_for_callback.load(std::sync::atomic::Ordering::Relaxed);
-        let is_tx_now = !pipeline_result.suppress;
-
-        // Update input level and transmitting state in state (for UI metering)
-        // is_transmitting reflects whether audio is actually being transmitted
-        // (not suppressed by VAD or other pipeline processors)
-        if let Ok(mut s) = state_for_callback.write() {
-            if let Some(level_db) = pipeline_result.level_db {
-                s.audio.input_level_db = Some(level_db);
+            // Notify UI if transmission state changed (VAD triggered on/off)
+            if was_tx != is_tx_now {
+                repaint_for_callback();
             }
-            // Update is_transmitting to reflect actual transmission state
-            s.audio.is_transmitting = is_tx_now;
-        }
 
-        // Notify UI if transmission state changed (VAD triggered on/off)
-        if was_tx != is_tx_now {
-            repaint_for_callback();
-        }
-
-        // Pipeline suppress flag gates actual transmission
-        // This allows VAD (or any other processor) to prevent encoding/sending
-        if pipeline_result.suppress {
-            // If we were transmitting and now we're suppressed, send end-of-stream
-            if was_tx {
-                was_transmitting_for_callback.store(false, std::sync::atomic::Ordering::Relaxed);
-                let _ = encoded_tx.send(CaptureMessage::EndOfStream);
+            // Pipeline suppress flag gates actual transmission
+            // This allows VAD (or any other processor) to prevent encoding/sending
+            if pipeline_result.suppress {
+                // If we were transmitting and now we're suppressed, send end-of-stream
+                if was_tx {
+                    was_transmitting_for_callback.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = encoded_tx.send(CaptureMessage::EndOfStream);
+                }
+                return;
             }
-            return;
-        }
 
-        // We're transmitting now
-        was_transmitting_for_callback.store(true, std::sync::atomic::Ordering::Relaxed);
+            // We're transmitting now
+            was_transmitting_for_callback.store(true, std::sync::atomic::Ordering::Relaxed);
 
-        // Encode the processed audio frame using the connection-scoped encoder
-        if let Ok(mut guard) = encoder_for_callback.lock() {
-            if let Some(enc) = guard.as_mut() {
-                match enc.encode(&processed_samples) {
-                    Ok(encoded) => {
-                        // Dump TX opus packet (after encoding)
-                        dumper_for_callback.write_tx_opus(&encoded);
+            // Encode the processed audio frame using the connection-scoped encoder
+            if let Ok(mut guard) = encoder_for_callback.lock() {
+                if let Some(enc) = guard.as_mut() {
+                    let mut opus_buf = [0u8; OPUS_MAX_PACKET_SIZE];
+                    match enc.encode(&processed_samples, &mut opus_buf) {
+                        Ok(len) => {
+                            let encoded = &opus_buf[..len];
+                            // Dump TX opus packet (after encoding)
+                            dumper_for_callback.write_tx_opus(encoded);
 
-                        let size_bytes = encoded.len();
-                        let _ = encoded_tx.send(CaptureMessage::EncodedFrame {
-                            data: Bytes::from(encoded),
-                            size_bytes,
-                        });
-                    }
-                    Err(e) => {
-                        trace!("Encode error: {}", e);
+                            let _ = encoded_tx.send(CaptureMessage::EncodedFrame {
+                                data: Bytes::copy_from_slice(encoded),
+                                size_bytes: len,
+                            });
+                        }
+                        Err(e) => {
+                            trace!("Encode error: {}", e);
+                        }
                     }
                 }
             }
-        }
-    });
+        }),
+    );
 
     match input {
-        Ok(input) => {
-            *audio_input = Some(input);
+        Ok(stream) => {
+            // Start inactive — sync_transmission! will activate if needed.
+            // This prevents the callback from firing before the state machine
+            // has decided whether capture should be active.
+            stream.set_active(false);
+            *audio_input = Some(stream);
             info!(
                 "Started connection-scoped audio input stream with pipeline ({} processors)",
                 tx_pipeline_config.processors.len()
@@ -1539,11 +1561,11 @@ fn start_transmission(
 
 /// Stop and destroy the audio input stream.
 ///
-/// This destroys the underlying cpal stream. It should only be called on
+/// This destroys the underlying platform stream. It should only be called on
 /// disconnection, device change, settings change, or mute - NOT on PTT release.
-/// The `capture_active` flag (managed by `sync_transmission!`) handles PTT gating.
-fn stop_transmission(
-    audio_input: &mut Option<AudioInput>,
+/// The `set_active()` method on the capture stream handles PTT gating.
+fn stop_transmission<P: Platform>(
+    audio_input: &mut Option<CapStream<P>>,
     _state: &Arc<RwLock<State>>,
     _repaint: &Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -1555,30 +1577,27 @@ fn stop_transmission(
     info!("Destroyed audio input stream");
 }
 
-/// Start audio output for playback.
-fn start_audio_output(audio_system: &AudioSystem, selected_output: &Option<String>) -> Option<AudioOutput> {
-    let device = match selected_output {
-        Some(id) => audio_system.get_output_device_by_id(id),
-        None => audio_system.default_output_device(),
-    };
-
-    let device = match device {
-        Some(d) => d,
-        None => {
-            error!("No output device available");
-            return None;
-        }
-    };
-
-    // NOTE: Opus decoders in user_audio persist for the entire session.
-    // They are only cleared when users leave the room, connection closes, etc.
-    // This avoids crackle at speech start.
-
-    // Create and return the audio output
-    match AudioOutput::new(&device, &AudioConfig::default()) {
-        Ok(output) => {
+/// Start audio output for playback using the AudioBackend trait.
+///
+/// Creates a playback stream that reads from the shared `playback_buffer`.
+fn start_audio_output<P: Platform>(
+    audio_backend: &P::AudioBackend,
+    selected_output: &Option<String>,
+    playback_buffer: Arc<Mutex<VecDeque<f32>>>,
+) -> Option<PlayStream<P>> {
+    let buffer = playback_buffer;
+    match audio_backend.open_output(
+        selected_output.as_deref(),
+        Box::new(move |output: &mut [f32]| {
+            let mut buf = buffer.lock().unwrap_or_else(|e| e.into_inner());
+            for sample in output.iter_mut() {
+                *sample = buf.pop_front().unwrap_or(0.0);
+            }
+        }),
+    ) {
+        Ok(stream) => {
             info!("Audio output started");
-            Some(output)
+            Some(stream)
         }
         Err(e) => {
             error!("Failed to create audio output: {}", e);
@@ -1588,12 +1607,12 @@ fn start_audio_output(audio_system: &AudioSystem, selected_output: &Option<Strin
 }
 
 /// Handle received voice datagram - insert into jitter buffer or handle end-of-stream.
-fn handle_voice_datagram(
+fn handle_voice_datagram<C: VoiceCodec>(
     sender_id: u64,
     sequence: u32,
     opus_data: Vec<u8>,
     end_of_stream: bool,
-    user_audio: &mut HashMap<u64, UserAudioState>,
+    user_audio: &mut HashMap<u64, UserAudioState<C::Decoder>>,
     audio_settings: &AudioSettings,
     rx_pipeline_defaults: &pipeline::PipelineConfig,
     per_user_rx: &HashMap<u64, pipeline::UserRxConfig>,
@@ -1621,7 +1640,7 @@ fn handle_voice_datagram(
 
     // Get or create per-user audio state
     let jitter_delay = audio_settings.jitter_buffer_delay_packets;
-    let user_state = user_audio.entry(sender_id).or_insert_with(|| {
+    if !user_audio.contains_key(&sender_id) {
         // Determine pipeline config and volume for this user
         let (pipeline_config, volume_db) = match per_user_rx.get(&sender_id) {
             Some(user_rx) => {
@@ -1640,11 +1659,19 @@ fn handle_voice_datagram(
             }
         };
 
-        let mut user_state = UserAudioState::new(jitter_delay).expect("create user audio state");
-        user_state.rx_pipeline = rx_pipeline;
-        user_state.volume_db = volume_db;
-        user_state
-    });
+        let decoder = match C::create_decoder() {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Failed to create decoder for user {}: {}", sender_id, e);
+                return;
+            }
+        };
+        let mut new_state = UserAudioState::new(decoder, jitter_delay);
+        new_state.rx_pipeline = rx_pipeline;
+        new_state.volume_db = volume_db;
+        user_audio.insert(sender_id, new_state);
+    }
+    let user_state = user_audio.get_mut(&sender_id).unwrap();
 
     // Insert packet into jitter buffer
     user_state.insert_packet(sequence, opus_data);
@@ -1665,19 +1692,14 @@ fn handle_voice_datagram(
 }
 
 /// Mix audio from all users' jitter buffers and queue for playback.
-fn mix_and_play_audio(
-    user_audio: &mut HashMap<u64, UserAudioState>,
+fn mix_and_play_audio<D: VoiceDecoderTrait>(
+    user_audio: &mut HashMap<u64, UserAudioState<D>>,
     sfx_queue: &mut VecDeque<f32>,
-    audio_output: &Option<AudioOutput>,
+    playback_buffer: &Arc<Mutex<VecDeque<f32>>>,
     audio_dumper: &AudioDumper,
 ) {
-    let output = match audio_output {
-        Some(o) => o,
-        None => return,
-    };
-
     // Collect decoded frames from all users who are ready
-    let mut mixed_buffer = [0.0f32; FRAME_SIZE];
+    let mut mixed_buffer = [0.0f32; OPUS_FRAME_SIZE];
     let mut has_audio = false;
 
     for user_state in user_audio.values_mut() {
@@ -1706,7 +1728,7 @@ fn mix_and_play_audio(
             has_audio = true;
             // Mix by summing with clamping to [-1.0, 1.0]
             for (i, &sample) in pcm.iter().enumerate() {
-                if i < FRAME_SIZE {
+                if i < OPUS_FRAME_SIZE {
                     mixed_buffer[i] = (mixed_buffer[i] + sample).clamp(-1.0, 1.0);
                 }
             }
@@ -1716,7 +1738,7 @@ fn mix_and_play_audio(
     // Mix in sound effects from the sfx queue
     if !sfx_queue.is_empty() {
         has_audio = true;
-        for sample in mixed_buffer.iter_mut().take(FRAME_SIZE) {
+        for sample in mixed_buffer.iter_mut().take(OPUS_FRAME_SIZE) {
             if let Some(sfx_sample) = sfx_queue.pop_front() {
                 *sample = (*sample + sfx_sample).clamp(-1.0, 1.0);
             }
@@ -1727,7 +1749,15 @@ fn mix_and_play_audio(
     if has_audio {
         // Dump the final mixed audio that goes to playback
         audio_dumper.write_playback(&mixed_buffer);
-        output.queue_samples(&mixed_buffer);
+
+        // Write to the shared playback buffer
+        let mut buf = playback_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buf.extend(mixed_buffer.iter());
+        // Cap buffer size to avoid unbounded growth
+        if buf.len() > MAX_PLAYBACK_BUFFER_SAMPLES {
+            let excess = buf.len() - MAX_PLAYBACK_BUFFER_SAMPLES;
+            buf.drain(..excess);
+        }
     }
 }
 
@@ -1739,8 +1769,8 @@ fn mix_and_play_audio(
 /// - User leaves the room (UserLeftRoom / PeerLeft commands)
 /// - We change rooms (RoomChanged command)
 /// - Connection is closed (ConnectionClosed command)
-fn cleanup_stale_users(
-    user_audio: &HashMap<u64, UserAudioState>,
+fn cleanup_stale_users<D: VoiceDecoderTrait>(
+    user_audio: &HashMap<u64, UserAudioState<D>>,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -1776,8 +1806,8 @@ fn cleanup_stale_users(
 }
 
 /// Update audio statistics in shared state.
-fn update_stats(
-    user_audio: &HashMap<u64, UserAudioState>,
+fn update_stats<D: VoiceDecoderTrait>(
+    user_audio: &HashMap<u64, UserAudioState<D>>,
     packets_sent: u64,
     bytes_sent: u64,
     state: &Arc<RwLock<State>>,
@@ -1835,6 +1865,31 @@ fn update_stats(
 mod tests {
     use super::*;
 
+    /// Minimal mock decoder for testing jitter buffer logic.
+    /// Returns silence for all decode operations.
+    struct MockDecoder;
+
+    impl VoiceDecoderTrait for MockDecoder {
+        fn decode(&mut self, _data: &[u8], output: &mut [f32]) -> anyhow::Result<usize> {
+            output.fill(0.0);
+            Ok(output.len())
+        }
+
+        fn decode_plc(&mut self, output: &mut [f32]) -> anyhow::Result<usize> {
+            output.fill(0.0);
+            Ok(output.len())
+        }
+
+        fn decode_fec(&mut self, _data: &[u8], output: &mut [f32]) -> anyhow::Result<usize> {
+            output.fill(0.0);
+            Ok(output.len())
+        }
+    }
+
+    fn make_state(jitter_delay: u32) -> UserAudioState<MockDecoder> {
+        UserAudioState::new(MockDecoder, jitter_delay)
+    }
+
     #[test]
     fn test_audio_command_send() {
         // Just verify the types work
@@ -1852,13 +1907,12 @@ mod tests {
 
     #[test]
     fn test_user_audio_state_creation() {
-        let state = UserAudioState::new(3);
-        assert!(state.is_ok());
+        let _state = make_state(3);
     }
 
     #[test]
     fn test_user_audio_state_sequence_restart_detection() {
-        let mut state = UserAudioState::new(3).unwrap();
+        let mut state = make_state(3);
 
         // Simulate initial stream: packets 0, 1, 2, 3, 4
         for seq in 0..5 {
@@ -1887,7 +1941,7 @@ mod tests {
 
     #[test]
     fn test_user_audio_state_no_reset_for_normal_packets() {
-        let mut state = UserAudioState::new(3).unwrap();
+        let mut state = make_state(3);
 
         // Simulate initial stream
         for seq in 0..5 {

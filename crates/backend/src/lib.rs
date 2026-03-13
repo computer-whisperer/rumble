@@ -50,19 +50,13 @@
 use libp2p::Multiaddr;
 use std::path::PathBuf;
 
-// Audio subsystem
+// Audio constants and types (concrete I/O moved to rumble-native)
 pub mod audio;
-pub use audio::{
-    AudioConfig, AudioDeviceInfo, AudioInput, AudioOutput, AudioSystem, CHANNELS, FRAME_SIZE,
-    MAX_PLAYBACK_BUFFER_SAMPLES, SAMPLE_RATE, bytes_to_samples, samples_to_bytes,
-};
+pub use audio::{AudioDeviceInfo, CHANNELS, SAMPLE_RATE};
 
-// Opus codec for voice encoding/decoding
+// Opus codec constants and utilities (concrete encoder/decoder moved to rumble-native)
 pub mod codec;
-pub use codec::{
-    CodecError, DecoderStats, EncoderSettings, EncoderStats, OPUS_FRAME_SIZE, OPUS_MAX_PACKET_SIZE, OPUS_SAMPLE_RATE,
-    VoiceDecoder, VoiceEncoder, opus_version,
-};
+pub use codec::{EncoderSettings, OPUS_FRAME_SIZE, OPUS_MAX_PACKET_SIZE, OPUS_SAMPLE_RATE, is_dtx_frame};
 
 // Bounded voice channel for handling slow connections
 pub mod bounded_voice;
@@ -91,9 +85,11 @@ pub mod events;
 // build breaks when items in `events` are renamed/moved.
 pub use events::*;
 
-// Backend handle
+// Backend handle (generic over Platform)
 pub mod handle;
-pub use handle::BackendHandle;
+
+/// The default backend handle, using the native platform implementations.
+pub type BackendHandle = handle::BackendHandle<rumble_native::NativePlatform>;
 
 // RPC server for external process control
 pub mod rpc;

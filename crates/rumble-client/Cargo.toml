@@ -9,5 +9,6 @@ api = { path = "../api" }
 pipeline = { path = "../pipeline" }
 anyhow = "1"
 async-trait = "0.1"
+sha2 = "0.10"
 uuid = { version = "1.19.0", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }

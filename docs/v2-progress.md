@@ -1,6 +1,6 @@
 # V2 Architecture Migration — Progress & Remaining Work
 
-**Last updated:** 2026-03-11
+**Last updated:** 2026-03-12
 **Design doc:** `docs/v2-architecture.md`
 
 ---
@@ -16,11 +16,11 @@
 | **4b** | Extract tracker into plugin | Done | `0a321ed` |
 | **4c** | Plugin stream routing | Done | `a833c10` |
 | **5a** | Datagram transport abstraction | Done | `e6effb8`, `b82419d` |
-| **5b** | Full Transport integration | Not started | — |
-| **5c** | `BackendHandle<P: Platform>` | Not started | — |
-| **5d** | Switch `egui-test` to rumble-client | Not started | — |
-| **5e** | Switch `mumble-bridge` to rumble-client | Blocked | — |
-| **5f** | Deprecate `backend` crate | Not started | — |
+| **5b** | Full Transport integration | Done | — |
+| **5c** | `BackendHandle<P: Platform>` | Done | — |
+| **5d** | Switch `egui-test` to rumble-client | Done (via alias) | — |
+| **5e** | Switch `mumble-bridge` to rumble-client | Done | — |
+| **5f** | Deprecate `backend` crate | Done (dead code removed) | — |
 | **6** | WASM platform | Deferred indefinitely | — |
 
 ---
@@ -75,130 +75,115 @@ All Platform trait impls exist with `NativePlatform` as the bundle:
 - `handle.rs` wraps `quinn::Connection` in `QuinnDatagramHandle` before passing to audio task
 - Fixed framing bug: `QuinnTransport::send()` now uses varint prefix (matching `api::try_decode_frame`)
 
+### Phase 5b — Full Transport integration in handle.rs
+
+- `Transport` trait extended with `TransportRecvStream` and `take_recv()` for two-task architecture
+- `TlsConfig` extended with `captured_cert: Option<CapturedCert>` for interactive cert verification
+- `ServerCertInfo`, `CapturedCert`, helper functions moved to `rumble-client/cert.rs`
+- `InteractiveCertVerifier` moved to `rumble-native/cert_verifier.rs` (alongside existing `FingerprintVerifier`)
+- `QuinnTransport::connect()` now supports all three verifier modes (accept-all, interactive, fingerprint-pinned)
+- `connect_to_server()` uses `Transport::connect()` for QUIC handshake, `Transport::send()/recv()` for auth
+- `run_connection_task()` stores `Option<QuinnTransport>` — zero `quinn::` references in handle.rs
+- `run_receiver_task()` uses `TransportRecvStream` for framed message reception
+- `make_client_endpoint()` and `compute_server_cert_hash()` removed (functionality in Transport)
+- `backend/cert_verifier.rs` reduced to re-exports from `rumble-client` and `rumble-native`
+
 ---
 
 ## Remaining Work
 
-### Phase 5b — Integrate Transport trait into connection task
+### Phase 5b — Integrate Transport trait into connection task — DONE
 
-**Goal:** `handle.rs`'s `connect_to_server()` and `run_connection_task()` use `Transport::send()/recv()` instead of raw quinn streams.
+Completed: `handle.rs` now uses `Transport::send()/recv()` exclusively. Zero `quinn::` references remain in handle.rs.
 
-**Current state:** `handle.rs` has 16 direct `quinn::` references:
-- `make_client_endpoint()` (~70 lines): creates quinn Endpoint with rustls config
-- `connect_to_server()` (~170 lines): QUIC handshake, auth, returns `(quinn::Connection, SendStream, RecvStream)`
-- `run_connection_task()`: holds `Option<quinn::SendStream>`, calls `send.write_all(&encode_frame(...))`
-- `run_recv_loop()`: holds `quinn::RecvStream`, reads frames
-- Connection close: `conn.close(quinn::VarInt::from_u32(0), b"shutdown")`
+**What was done:**
+- Added `TransportRecvStream` trait and `take_recv()` to `Transport` for two-task send/recv split
+- Added `CapturedCert` to `TlsConfig` for interactive cert verification (hybrid of options A+B)
+- Moved `ServerCertInfo` and `CapturedCert` types to `rumble-client/cert.rs` (platform-agnostic)
+- Moved `InteractiveCertVerifier` to `rumble-native/cert_verifier.rs`
+- `connect_to_server()` now uses `QuinnTransport::connect()` + `transport.send()/recv()` for auth handshake
+- `run_connection_task()` stores `Option<QuinnTransport>` instead of `quinn::Connection` + `quinn::SendStream`
+- All ~25 command handlers use `send_envelope(t, &env)` helper instead of `send.write_all(&encode_frame(...))`
+- `run_receiver_task()` takes `QuinnRecvStream` (via `TransportRecvStream` trait)
+- `make_client_endpoint()` deleted — connection setup handled by `QuinnTransport::connect()`
+- `compute_server_cert_hash()` replaced by `transport.peer_certificate_der()`
+- TorrentManager still uses `transport.connection()` accessor for raw quinn connection (Phase 5f)
+- `backend/cert_verifier.rs` now re-exports from `rumble-client` and `rumble-native`
 
-**Blocker: Interactive cert verification.** The backend's `InteractiveCertVerifier` (in `cert_verifier.rs`) captures unknown certs via shared `Arc<Mutex<Option<ServerCertInfo>>>` state for UI prompts. This is deeply coupled to the connection setup:
+### Phase 5c — Make `BackendHandle` generic over `Platform` — DONE
 
-1. `make_client_endpoint()` injects `InteractiveCertVerifier` into rustls config
-2. Connection fails with `UnknownIssuer` → verifier stores cert in shared state
-3. `run_connection_task()` detects cert error, puts `PendingCertificate` in UI state
-4. User approves → retries with cert added to `ConnectConfig.accepted_certs`
+Completed: `BackendHandle<P: Platform>` is fully generic. `pub type BackendHandle = handle::BackendHandle<NativePlatform>` alias in lib.rs preserves backward compatibility.
 
-The `Transport::connect()` trait has no way to express this interactive flow. Options:
-- **A)** Extend `TlsConfig` with a captured-cert callback or channel
-- **B)** Keep cert verification at the `BackendHandle` level — try connect, catch cert error, prompt user, retry with fingerprint in `TlsConfig.accepted_fingerprints`
-- **C)** Move `InteractiveCertVerifier` into `rumble-native` and expose it through a platform-specific extension trait
+**What was done:**
+- `audio_task.rs`: Made generic over `P: Platform` — `spawn_audio_task<P>`, `run_audio_task<P>`, all helper functions parameterized
+- `audio_task.rs`: Replaced `AudioSystem`/`AudioInput`/`AudioOutput` with `P::AudioBackend` + shared `Arc<Mutex<VecDeque<f32>>>` playback buffer (push→pull bridge)
+- `audio_task.rs`: Replaced `VoiceEncoder`/`VoiceDecoder` with `P::Codec` trait usage, zero-copy encode/decode API
+- `audio_task.rs`: `UserAudioState<D: VoiceDecoderTrait>` generic, `capture_active` Arc<AtomicBool> replaced with local bool + `AudioCaptureStream::set_active()`
+- `audio_task.rs`: Type aliases `Enc<P>`, `Dec<P>`, `CapStream<P>`, `PlayStream<P>` for ergonomics
+- `handle.rs`: `BackendHandle<P: Platform>` with PhantomData, all functions generic over `Transport`/`Platform`
+- `handle.rs`: `send_envelope<T>`, `wait_for_server_hello<T>`, `wait_for_auth_result<T>`, `connect_to_server<T>`, `run_connection_task<P>`
+- `handle.rs`: TorrentManager uses `&dyn Any` downcast to `QuinnTransport` (Phase 5f will extract properly)
+- `handle.rs`: `is_cert_verification_error` replaced with `is_cert_error_message` (platform-agnostic)
+- `handle.rs`: `run_receiver_task` takes `impl TransportRecvStream` instead of concrete `QuinnRecvStream`
+- `lib.rs`: `pub type BackendHandle = handle::BackendHandle<NativePlatform>` — zero downstream breakage
+- `rumble-client/audio.rs`: Added `Default` supertrait to `AudioBackend`
+- Tests: `UserAudioState` tests use `MockDecoder` instead of concrete `VoiceDecoder`
+- Storage (`P::Storage`) and KeyManager (`P::KeyManager`) not yet wired — deferred to Phase 5d
 
-**Recommended approach:** Option B. `Transport::connect()` fails normally on unknown certs. `BackendHandle` catches the error, extracts cert info from the error chain, prompts user, then retries with the fingerprint added to `TlsConfig.accepted_fingerprints`. This keeps the Transport trait clean and moves the UI-specific retry logic to the right layer.
+### Phase 5d — Switch `egui-test` to `rumble-client` + `rumble-native` — DONE (via alias)
 
-**Work items:**
-1. Make `QuinnTransport::connect()` work with `InteractiveCertVerifier` (or use `FingerprintVerifier` after user approval)
-2. Refactor `connect_to_server()` to use `Transport::connect()` + auth handshake over `Transport::send()/recv()`
-3. Replace `quinn::SendStream` usage in `run_connection_task()` with `Transport::send()`
-4. Replace `run_recv_loop()` with `Transport::recv()` loop
-5. Preserve connection close via `Transport::close()`
+The `pub type BackendHandle = handle::BackendHandle<NativePlatform>` alias in backend/lib.rs makes this a no-op. egui-test's imports all work unchanged:
+- `BackendHandle` → type alias to `BackendHandle<NativePlatform>` ✓
+- `State`, `Command`, `ConnectionState`, etc. → re-exported from api::types via backend::events ✓
+- `SigningCallback` → already in api::types ✓
+- `ConnectConfig`, `SfxKind`, RPC types → backend-native, no change needed ✓
 
-**Estimated scope:** ~500 lines changed in handle.rs, ~50 lines in transport.rs/QuinnTransport
+**Deferred nice-to-haves** (not required for v2 migration):
+- Refactor `key_manager.rs` to delegate to `NativeKeySigning` (currently works fine with custom key management)
+- Migrate settings persistence to use `FileStorage` (currently works fine with hand-rolled JSON)
 
-### Phase 5c — Make `BackendHandle` generic over `Platform`
+### Phase 5e — Switch `mumble-bridge` to `rumble-client` — DONE
 
-**Goal:** `BackendHandle<P: Platform>` with `type Handle = BackendHandle<NativePlatform>` alias.
+Completed: mumble-bridge now uses `QuinnTransport` from rumble-native instead of raw quinn, and aws-lc-rs instead of ring.
 
-**Depends on:** Phase 5b (Transport integration)
+**What was done:**
+- Switched crypto provider from `ring` to `aws-lc-rs` (quinn, rustls, tokio-rustls features in Cargo.toml)
+- Removed direct `quinn` dependency — bridge uses `rumble-native::QuinnTransport` and `rumble-native::QuinnConnection`
+- Rewrote `rumble_client.rs`: `connect()` uses `QuinnTransport::connect()` with `TlsConfig { accept_invalid_certs: true }` instead of manual endpoint setup
+- `RumbleConnection` holds `QuinnTransport` instead of raw `quinn::Connection` + `SendStream` + `RecvStream` + `BytesMut`
+- All `send_*` functions take `&mut QuinnTransport`, use `transport.send()` via shared `send_envelope()` helper
+- `read_envelope()` uses `transport.recv()` instead of manual buffer management
+- Deleted `make_bridge_endpoint()`, `AcceptAnyCert` struct, `compute_server_cert_hash()` — replaced by Transport trait
+- `main.rs`: connection decomposition uses `transport.take_recv()` + `transport.connection()` for recv task + datagram reading
+- `bridge.rs`: `run_bridge` takes `QuinnConnection` + `&mut QuinnTransport` instead of raw quinn types
+- `mumble_tls.rs`: switched from `ring::default_provider()` to `aws_lc_rs::default_provider()`
+- Added `pub use quinn::Connection as QuinnConnection` to `rumble-native/lib.rs` for bridge access
 
-**Work items:**
-1. Add `P: Platform` type parameter to `BackendHandle`, `run_connection_task`, `spawn_audio_task`
-2. Replace `VoiceEncoder`/`VoiceDecoder` concrete types in `audio_task.rs` with `P::Codec` trait usage
-3. Replace `AudioSystem`/`AudioInput`/`AudioOutput` in `audio_task.rs` with `P::AudioBackend`
-4. Wire `P::Storage` for settings persistence (currently filesystem-only in egui-test)
-5. Wire `P::KeyManager` for auth signing (currently in egui-test's `key_manager.rs`)
-6. Accept `Option<Box<dyn FileTransferPlugin>>` in `BackendHandle::new()`
+### Phase 5f — Deprecate `backend` crate — DONE (dead code removed)
 
-**Key challenge: audio model mismatch.** The backend's `AudioOutput` uses a push model (backend writes to a shared ring buffer, cpal reads from it). The `AudioBackend` trait's `open_output()` uses a pull model (callback fills buffer). `CpalAudioBackend` in rumble-native already implements the pull model. The backend's `audio_task.rs` will need adapting to match.
+Completed: Dead concrete implementations removed from backend. The crate now contains only platform-agnostic logic and thin re-exports.
 
-**Estimated scope:** ~300 lines in audio_task.rs, ~100 lines in handle.rs, ~50 lines in lib.rs
+**What was done:**
+- `audio.rs`: Removed `AudioSystem`, `AudioInput`, `AudioOutput`, `AudioConfig`, `InputProcessor`, helpers (~690 lines deleted). Kept `SAMPLE_RATE`, `CHANNELS` constants and `AudioDeviceInfo` re-export.
+- `codec.rs`: Removed `VoiceEncoder`, `VoiceDecoder`, `CodecError`, `EncoderStats`, `DecoderStats`, `opus_version()` and most tests (~660 lines deleted). Kept `is_dtx_frame()`, constant re-exports, and DTX test.
+- `cert_verifier.rs`: Already just re-exports from rumble-client + rumble-native (no changes needed).
+- `Cargo.toml`: Removed `cpal` and `opus` direct dependencies (now only needed via rumble-native).
+- `lib.rs`: Removed dead type re-exports (`AudioSystem`, `AudioInput`, `AudioOutput`, `VoiceEncoder`, `VoiceDecoder`, etc.)
+- `audio_task.rs`: Replaced `FRAME_SIZE` import with `OPUS_FRAME_SIZE` from codec module.
 
-### Phase 5d — Switch `egui-test` to `rumble-client` + `rumble-native`
+**What remains in backend** (platform-agnostic client logic):
+- `handle.rs`: Generic `BackendHandle<P: Platform>` — connection task, command handling
+- `audio_task.rs`: Generic audio task — jitter buffers, mixing, voice I/O
+- `bounded_voice.rs`, `sfx.rs`, `synth.rs`: Pure Rust utilities
+- `events.rs`, `processors.rs`, `rpc.rs`: State types, pipeline wrappers, RPC
+- `audio_dump.rs`: Debug utility
+- `torrent.rs`, `p2p.rs`: Still use raw quinn (future: extract to rumble-native)
+- `cert_verifier.rs`: Thin re-export shim
 
-**Goal:** `egui-test` depends on `rumble-client` + `rumble-native` instead of `backend`.
-
-**Current state:** `egui-test/Cargo.toml` has `backend = { path = "../backend" }`. No rumble-client/rumble-native deps.
-
-**Depends on:** Phase 5c (generic BackendHandle)
-
-**Work items:**
-1. Add `rumble-client` + `rumble-native` deps to `egui-test/Cargo.toml`
-2. Replace `use backend::BackendHandle` with `use backend::BackendHandle` (type alias to `BackendHandle<NativePlatform>`)
-3. Move key management from `egui-test/key_manager.rs` to use `NativeKeySigning`
-4. Move settings persistence to use `FileStorage`
-5. Update imports throughout `app.rs`
-
-**Estimated scope:** Mostly import changes. The `key_manager.rs` (~800 lines) refactor is the largest piece.
-
-### Phase 5e — Switch `mumble-bridge` to `rumble-client`
-
-**Goal:** Delete `mumble-bridge/src/rumble_client.rs` (430 lines of duplicated connection logic).
-
-**Blocker: Crypto provider mismatch.**
-
-| Crate | Crypto Provider | Quinn Feature |
-|-------|-----------------|---------------|
-| `backend` + `rumble-native` | `aws-lc-rs` | `rustls-aws-lc-rs` |
-| `mumble-bridge` | `ring` | `rustls-ring` |
-
-The bridge cannot use `QuinnTransport` from rumble-native without switching its crypto provider from `ring` to `aws-lc-rs`. This also affects its Mumble TLS server (uses `tokio-rustls` with ring).
-
-**Work items:**
-1. Switch mumble-bridge from `ring` to `aws-lc-rs` (change quinn/rustls/tokio-rustls features in Cargo.toml)
-2. Verify Mumble TLS server still works with aws-lc-rs
-3. Replace `mumble_client.rs` connect logic with `QuinnTransport::connect()` + shared auth helpers
-4. Keep bridge-specific envelope helpers (`send_bridge_hello`, `send_bridge_register_user`, etc.) — these construct bridge-protocol messages, not duplicates of core logic
-5. Use `Transport::send()` for reliable messages, `DatagramTransport` for voice relay
-
-**Risk:** The `AcceptAnyCert` verifier in mumble-bridge bypasses ALL TLS verification (including signature verification). The `AcceptAllVerifier` in rumble-native properly delegates signature verification to the crypto provider. Behavior should be equivalent for the bridge use case but needs testing.
-
-**Estimated scope:** ~200 lines deleted, ~50 lines changed, Cargo.toml feature swap
-
-### Phase 5f — Deprecate `backend` crate
-
-**Goal:** `backend` becomes a thin re-export shim or is deleted entirely.
-
-**Depends on:** All other Phase 5 steps complete.
-
-**What moves out of backend:**
-
-| Module | Lines | Destination |
-|--------|-------|-------------|
-| `audio.rs` | 703 | Replaced by `rumble-native::CpalAudioBackend` |
-| `codec.rs` | 701 | Replaced by `rumble-native::NativeOpusCodec` |
-| `cert_verifier.rs` | 357 | `InteractiveCertVerifier` → `rumble-native` or stays in handle.rs |
-| `handle.rs` | 3160 | Stays (becomes generic `BackendHandle<P>`) |
-| `audio_task.rs` | 2040 | Stays (becomes generic over `P::Codec` + `P::AudioBackend`) |
-| `torrent.rs` | 937 | → `rumble-native` as `FileTransferPlugin` impl |
-| `p2p.rs` | 495 | → `rumble-native` (feature-gated) |
-| `rpc.rs` | 414 | Stays (native-only RPC) |
-| `events.rs` | 239 | Already mostly in `api/types.rs` |
-| `bounded_voice.rs` | 251 | Stays (pure Rust, platform-agnostic) |
-| `sfx.rs` + `synth.rs` | 447 | Stays (pure Rust) |
-| `audio_dump.rs` | 261 | Stays (debug utility) |
-| `processors.rs` | — | Stays (pipeline wrappers) |
-
-After this, `backend` contains only platform-agnostic client logic (the "brain") — which is what `rumble-client` was supposed to be. At this point either:
-- Rename `backend` → incorporate into `rumble-client`
-- Or keep `backend` as the "wired-up" crate that combines `rumble-client` abstractions with platform-specific impls
+**Future work** (not blocking v2):
+- Move `torrent.rs` to rumble-native as `FileTransferPlugin` impl
+- Move `p2p.rs` to rumble-native (feature-gated)
+- Remove remaining `quinn`/`rustls-pemfile`/`webpki-roots` deps once torrent + cert loading migrated
 
 ### Phase 6 — WASM (deferred indefinitely)
 

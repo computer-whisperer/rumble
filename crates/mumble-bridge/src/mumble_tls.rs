@@ -21,7 +21,7 @@ pub fn make_tls_acceptor() -> Result<TlsAcceptor> {
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
-    let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
         .with_protocol_versions(rustls::ALL_VERSIONS)?
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)?;
