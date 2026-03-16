@@ -2259,6 +2259,11 @@ fn handle_server_message(
                                         if ih.len() == 20 {
                                             let mut arr = [0u8; 20];
                                             arr.copy_from_slice(ih);
+                                            // Skip dedup for all-zero infohashes (relay transfers
+                                            // don't have real infohashes, so they'd all collide)
+                                            if arr == [0u8; 20] {
+                                                return false;
+                                            }
                                             s.file_transfers.iter().any(|t| t.infohash == arr)
                                         } else {
                                             false

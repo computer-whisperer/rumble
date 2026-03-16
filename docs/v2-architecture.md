@@ -9,7 +9,7 @@
 
 1. **Traits over `#[cfg]`** — Platform differences are expressed as trait implementations in separate crates, not `#[cfg(target_arch)]` branches inside shared code. This means a WASM build and a native build use the *same* backend logic with *different* injected implementations.
 
-2. **No kitchen-sink crates** — A terminal client or mobile FFI wrapper shouldn't pull in cpal, rqbit, or libp2p just to get the `State` type and connection logic.
+2. **No kitchen-sink crates** — A terminal client or mobile FFI wrapper shouldn't pull in cpal or platform-specific deps just to get the `State` type and connection logic.
 
 3. **One place for protocol knowledge** — The auth handshake, message framing, envelope construction, and state types live in shared crates. New clients and bridges import them, not copy them.
 
@@ -44,7 +44,7 @@ rumble-client    ← connection logic, protocol state machine, message handling
                    This is the "brain" that any client uses.
 
 rumble-native    ← Platform impl for desktop: cpal audio, opus-rs, quinn,
-                   tokio runtime, rqbit, libp2p, SSH agent
+                   tokio runtime, SSH agent, file relay client
 rumble-wasm      ← Platform impl for browser: Web Audio, WebTransport,
                    opus.wasm, wasm-bindgen-futures
 
@@ -343,7 +343,7 @@ The platform-agnostic client logic, generic over `P: Platform`:
 | Audio dump (debugging) | `backend/audio_dump.rs` | ~100 |
 | Cert verification logic | `backend/cert_verifier.rs` | ~200 |
 
-`rumble-client` depends on: `api`, `pipeline`, and standard library. **No** cpal, quinn, opus, tokio, rqbit, libp2p.
+`rumble-client` depends on: `api`, `pipeline`, and standard library. **No** cpal, quinn, opus, tokio.
 
 ### Into `rumble-native` (desktop platform impl)
 
@@ -355,10 +355,9 @@ The platform-agnostic client logic, generic over `P: Platform`:
 | `TokioRuntime` | `backend/handle.rs` (embedded) | Thin wrapper |
 | `FileStorage` | `egui-test/settings.rs` (partially) | XDG dirs + JSON files |
 | `NativeKeySigning` | `egui-test/key_manager.rs` | SSH agent + local files |
-| `TorrentManager` | `backend/torrent.rs` | rqbit wrapper |
-| `P2PManager` | `backend/p2p.rs` | libp2p wrapper |
+| `FileTransferRelayPlugin` | `rumble-native/file_transfer_relay.rs` | QUIC relay client |
 
-Dependencies: `cpal`, `opus`, `quinn`, `rustls`, `tokio`, `librqbit`, `libp2p`, `ssh-agent-lib`, etc.
+Dependencies: `cpal`, `opus`, `quinn`, `rustls`, `tokio`, `ssh-agent-lib`, `parking_lot`, `mime_guess`.
 
 ### Into `rumble-wasm` (browser platform impl)
 
@@ -386,9 +385,9 @@ Not everything needs to move:
 
 ---
 
-## File Transfer: Plugin Architecture
+## File Transfer: Server-Cached Relay
 
-File transfer is **not part of the `Platform` trait**. It's an optional plugin that `BackendHandle` accepts separately. Different platforms and deployments can use different strategies — or none at all.
+File transfer is **not part of the `Platform` trait**. It's an optional plugin that `BackendHandle` accepts separately, injected via a factory callback after the transport connects.
 
 ### Client-Side Plugin
 
@@ -397,35 +396,58 @@ File transfer is **not part of the `Platform` trait**. It's an optional plugin t
 /// Not part of Platform — different deployments can use different
 /// strategies, or disable file transfer entirely.
 pub trait FileTransferPlugin: Send + Sync + 'static {
-    /// Offer a file for transfer. Returns metadata to share in chat.
+    /// Upload a file to the server cache. Returns metadata to share in chat.
     fn share(&self, path: PathBuf) -> Result<FileOffer>;
 
-    /// Accept a file offer and begin downloading.
-    fn download(&self, offer: &FileOffer) -> Result<TransferHandle>;
+    /// Fetch a file from the server cache by transfer ID.
+    fn download(&self, transfer_id: &TransferId) -> Result<TransferHandle>;
 
-    /// Query active transfer status.
+    /// Query active transfer status (uploads and downloads).
     fn transfers(&self) -> Vec<TransferStatus>;
 
-    /// Cancel an active transfer.
+    /// Cancel an active upload or download.
     fn cancel(&self, id: &TransferId) -> Result<()>;
 }
 ```
 
-`BackendHandle<P>` takes `Option<Box<dyn FileTransferPlugin>>`. If `None`, file commands return "not available" to the UI.
+`BackendHandle<P>` takes `Option<Box<dyn FileTransferPlugin>>`. If `None`, file commands return "not available" to the UI. The plugin is constructed by the caller (e.g. egui-test) via a factory callback that receives the transport post-connect, keeping the backend free of concrete transport types.
 
-### Planned Implementations
+### Store-and-Serve Model
 
-1. **`rqbit-plugin`** (existing, to be refactored) — BitTorrent-based. Decentralized, good for large files to many recipients. Uses server tracker + relay for peer discovery and NAT traversal. Heavyweight dependency (rqbit + libp2p).
+File transfer uses a server-cached relay. The sender uploads a file to the server immediately on share. The server holds it in a room-scoped cache. Any room member can fetch the file by transfer ID at any time while the cache entry is alive — no coordination with the sender needed.
 
-2. **`relay-plugin`** (new, simple) — Server-mediated relay over QUIC streams. Sender opens a stream to server, server opens a stream to recipient, pipes bytes through. Zero new dependencies on the client. Works for any platform. Good enough for screenshots, documents, short clips.
+**Upload flow:**
+1. User picks a file, hits send
+2. Client opens a `"file-relay"` stream to the server
+3. Sends `RelayUpload { transfer_id, room_id, file_name, file_size, mime }` + raw file bytes
+4. Server stores in cache, keyed by transfer ID, scoped to room
+5. Client sends a chat message with file metadata (transfer ID, name, size, mime)
 
-The relay plugin is the priority — it's simpler, lighter, and validates the plugin architecture. The rqbit plugin can be refactored into the same interface later.
+**Download flow:**
+1. Client receives chat message with file metadata (online member or late joiner via chat history)
+2. Auto-download logic decides: accept automatically or show download button
+3. Client opens a `"file-relay"` stream, sends `RelayFetch { transfer_id }`
+4. Server responds with `RelayFetchResponse { status, file_name, file_size }` + raw file bytes
+5. If cache entry has been evicted, server responds with error status; UI shows "unavailable"
+
+**Cache eviction (configurable):**
+- TTL per entry (default 30 min)
+- Room-clear: evict when room empties (default on)
+- Server-clear: evict on shutdown (always — cache is ephemeral)
+- Max cache size per room / global cap
+
+This model means:
+- Sender can disconnect immediately after upload — file lives in server cache
+- Late joiners get file metadata via chat history, fetch from cache
+- No sender/recipient pairing or coordination
+- All data flows over QUIC streams on the existing connection — works through any NAT
+- When the room empties or TTL expires, files are cleaned up automatically
 
 ---
 
 ## Server Plugin System
 
-The server has the same problem as the client — tracker, relay service, and bridge protocol handlers are bolted directly into `handlers.rs` and `server.rs`. A plugin system lets us namespace experiments without touching the core message loop.
+A plugin system lets us namespace experiments without touching the core message loop.
 
 ### Design
 
@@ -436,7 +458,6 @@ Plugins are **compile-time** — they're Rust crates compiled into the server bi
 // 1-49:    Core protocol (auth, state, chat, rooms)
 // 50-69:   ACL system
 // 70-79:   Bridge protocol (virtual users — core, not a plugin)
-// 80-89:   Tracker plugin (file-transfer-bittorrent)
 // 90-99:   File relay plugin (file-transfer-relay)
 // 100-109: (next plugin)
 ```
@@ -486,7 +507,7 @@ QUIC's multi-stream architecture provides natural namespacing. Beyond the initia
 ```rust
 /// First frame on a plugin-owned stream.
 pub struct StreamHeader {
-    /// Plugin name (e.g. "file-relay", "tracker")
+    /// Plugin name (e.g. "file-relay")
     pub plugin: String,
     /// Plugin-specific metadata (e.g. transfer ID, target user)
     pub metadata: Vec<u8>,
@@ -494,6 +515,23 @@ pub struct StreamHeader {
 ```
 
 The server reads the header, dispatches to the matching plugin, and the plugin owns that stream's lifetime. File transfer data flows on its own streams, never competing with control messages on stream 0.
+
+### Client-Side Stream Dispatch
+
+The client mirrors the server's stream routing pattern. The backend centralizes incoming bi-stream acceptance and reads the `StreamHeader` to dispatch to the correct plugin. This prevents plugins from competing for streams via independent `accept_bi()` loops.
+
+```rust
+// Backend accepts all server-initiated bi-streams, reads header, dispatches
+loop {
+    let (send, recv) = transport.accept_bi().await?;
+    let header = StreamHeader::read_from(&mut recv).await?;
+    if let Some(plugin) = plugins.get(&header.plugin) {
+        plugin.on_incoming_stream(header, send, recv).await;
+    }
+}
+```
+
+This requires the `Transport` trait to expose stream acceptance (currently only `send`/`recv` on the control stream and datagrams are exposed).
 
 ### Server Context
 
@@ -531,9 +569,7 @@ pub struct ServerCtx {
 
 | Current code | Becomes | Notes |
 |-------------|---------|-------|
-| `server/src/tracker.rs` | `file-transfer-bittorrent` plugin | Bundles tracker + relay service |
-| `server/src/relay.rs` | `file-transfer-bittorrent` plugin | Same plugin as tracker |
-| (new) | `file-transfer-relay` plugin | Simple QUIC stream pipe between clients |
+| (reworked) | `file-transfer-relay` plugin | Store-and-serve cache with QUIC stream upload/fetch |
 | Bridge protocol (fields 70-79) | **Stays built-in** | Core protocol for virtual users, not an experiment |
 | ACL system | **Stays built-in** | Core permission model |
 | Auth, chat, rooms, state sync | **Stays built-in** | Core protocol |
@@ -584,11 +620,11 @@ The migration is incremental. Each phase produces a working build.
 
 1. Define `ServerPlugin` trait and `ServerCtx` in `crates/server/`
 2. Implement plugin dispatch in the server's message loop and stream accept loop
-3. Extract tracker + relay into `file-transfer-bittorrent` plugin
-4. Implement `file-transfer-relay` plugin (simple QUIC stream pipe)
-5. Refactor file transfer client-side code into `FileTransferPlugin` implementations
+3. Implement `file-transfer-relay` plugin (store-and-serve cache with QUIC stream upload/fetch)
+4. Add client-side stream dispatch to the backend (mirror server's `on_stream()` routing)
+5. Extend `Transport` trait with stream acceptance for server-initiated bi-streams
 
-**Risk:** Medium. Server-side is mostly reshuffling existing code behind the trait. The new relay plugin is small.
+**Risk:** Medium. Server-side is mostly reshuffling existing code behind the trait.
 
 ### Phase 5: Switch `egui-test` and `mumble-bridge` to `rumble-client` *(the flip)*
 
@@ -652,7 +688,7 @@ The consumer defines the contract. `rumble-native` depends on `rumble-client` to
 
 ### 4. File transfer: optional plugin, not part of Platform
 
-`BackendHandle<P>` accepts `Option<Box<dyn FileTransferPlugin>>`. Two planned implementations: rqbit (refactored) and simple QUIC relay (new). See "File Transfer: Plugin Architecture" section above.
+`BackendHandle<P>` accepts `Option<Arc<dyn FileTransferPlugin>>` via a factory callback post-connect. The implementation is a server-cached relay — sender uploads to server, recipients fetch by transfer ID. See "File Transfer: Server-Cached Relay" section above.
 
 ### 5. Server plugins: compile-time, proto-extending
 
@@ -662,9 +698,9 @@ Server plugins are Rust crates compiled into the server binary. Each brings its 
 
 The mumble-bridge is a separate binary connecting as a client. The server-side bridge protocol (virtual users, voice dedup) is core protocol, not a plugin. Other bridge types (Discord, etc.) would be separate binaries using the same bridge protocol.
 
-### 7. Tracker + relay become one server plugin
+### 7. Client-side stream dispatch
 
-`file-transfer-bittorrent` plugin bundles the tracker and relay service. The new simple file relay is a separate `file-transfer-relay` plugin. Both are compiled into the server.
+The client mirrors the server's stream routing. The backend centralizes incoming bi-stream acceptance, reads `StreamHeader`, and dispatches to the matching plugin. The `Transport` trait exposes stream acceptance for this purpose.
 
 ### Deferred (WASM)
 
@@ -694,17 +730,16 @@ These questions are parked until WASM threading stabilizes:
         │(pure Rust│ │  client  │     │  ┌────────────┐  │
         │ portable)│ │  traits  │     │  │  core +    │  │
         └────┬─────┘ │  + logic │     │  │  plugins   │  │
-             │       │  + tokio │     │  │  (tracker,  │  │
-             │       └────┬─────┘     │  │   relay,   │  │
-             │            │           │  │   file-xfr) │  │
-             │     ┌──────┴─────┐     │  └────────────┘  │
-             │     │            │     └──────────────────┘
-             ▼     ▼            │
-        ┌──────────────┐        │  (future)
-        │ rumble-native│        │  ┌─────────────┐
-        │ cpal, quinn, │        └──│ rumble-wasm  │
-        │ opus-rs,     │           └─────────────┘
-        │ rqbit, libp2p│
+             │       │  + tokio │     │  │  (file     │  │
+             │       └────┬─────┘     │  │   relay)   │  │
+             │            │           │  └────────────┘  │
+             │     ┌──────┴─────┐     └──────────────────┘
+             │     │            │
+             ▼     ▼            │  (future)
+        ┌──────────────┐        │  ┌─────────────┐
+        │ rumble-native│        └──│ rumble-wasm  │
+        │ cpal, quinn, │           └─────────────┘
+        │ opus-rs      │
         └──────┬───────┘
                │
         ┌──────┴──────┐
@@ -783,9 +818,6 @@ Every non-WASM-compatible dependency and where it's used:
 | `handle.rs:3071` | `quinn::Endpoint::client` | Bind local UDP socket | `Transport` |
 | `handle.rs:3090` | `std::fs::read` | Load PEM/DER certificate files | `PersistentStorage` |
 | `handle.rs:2036` | `std::net::ToSocketAddrs` | DNS resolution | `Transport` |
-| `torrent.rs` (entire) | `librqbit` | BitTorrent download/upload/relay | Feature-gate |
-| `torrent.rs:75` | `tokio::net::TcpListener` | TCP relay proxy | Feature-gate |
-| `p2p.rs` (entire) | `libp2p` | NAT traversal, file exchange | Feature-gate |
 | `rpc.rs` (entire) | `tokio::net::UnixListener` | Unix domain socket RPC | Native-only |
 | `audio_dump.rs:87` | `std::fs::create_dir_all` | Debug audio dump files | Native-only (debug) |
 | `cert_verifier.rs` | `rustls` | TLS cert verification | `Transport` (internal) |

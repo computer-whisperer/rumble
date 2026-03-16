@@ -456,7 +456,12 @@ async fn handle_incoming_relay(
     let offer = proto::RelayOffer::decode(&offer_buf[..])?;
 
     let transfer_id = offer.transfer_id.clone();
-    let file_name = offer.file_name.clone();
+    // Sanitize: the sender controls this value, strip path components to
+    // prevent traversal (e.g. "../../../.ssh/authorized_keys")
+    let file_name = std::path::Path::new(&offer.file_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_owned());
     let file_size = offer.file_size;
 
     info!(
