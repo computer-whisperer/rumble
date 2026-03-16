@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-/// Unique identifier for a file transfer (hex-encoded infohash for BitTorrent).
+/// Unique identifier for a file transfer (typically a UUID string).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransferId(pub String);
 
@@ -13,7 +13,7 @@ pub struct FileOffer {
     pub name: String,
     pub size: u64,
     pub mime: String,
-    /// Opaque data to share with recipients (e.g., magnet link).
+    /// Opaque data to share with recipients (e.g., relay metadata).
     pub share_data: String,
 }
 
@@ -59,8 +59,6 @@ pub struct PluginPeerInfo {
 #[derive(Debug, Clone)]
 pub struct TransferStatus {
     pub id: TransferId,
-    /// Raw infohash bytes (20 bytes for BitTorrent).
-    pub infohash: [u8; 20],
     pub name: String,
     pub size: u64,
     /// Progress as a fraction in [0.0, 1.0].
@@ -77,8 +75,6 @@ pub struct TransferStatus {
     pub is_finished: bool,
     /// Error message if in error state.
     pub error: Option<String>,
-    /// Magnet link for this transfer.
-    pub magnet: Option<String>,
     /// Local file path if available.
     pub local_path: Option<PathBuf>,
     /// Per-peer details.
@@ -88,7 +84,7 @@ pub struct TransferStatus {
 /// Optional file transfer capability, injected into BackendHandle.
 ///
 /// Not part of `Platform` — different deployments can use different
-/// strategies (BitTorrent, direct transfer, etc.) or disable file
+/// strategies (relay, direct transfer, etc.) or disable file
 /// transfer entirely.
 ///
 /// Methods are synchronous. Implementations running inside a tokio runtime
@@ -98,8 +94,8 @@ pub trait FileTransferPlugin: Send + Sync + 'static {
     /// Share a local file and return metadata for recipients.
     fn share(&self, path: PathBuf) -> anyhow::Result<FileOffer>;
 
-    /// Begin downloading a file from a magnet link (or other opaque share data).
-    fn download(&self, magnet: &str) -> anyhow::Result<TransferId>;
+    /// Begin downloading a file from opaque share data (e.g., relay metadata).
+    fn download(&self, share_data: &str) -> anyhow::Result<TransferId>;
 
     /// List all active transfers and their status.
     fn transfers(&self) -> Vec<TransferStatus>;
@@ -115,6 +111,6 @@ pub trait FileTransferPlugin: Send + Sync + 'static {
     /// If `delete_files` is true, also remove downloaded files from disk.
     fn cancel(&self, id: &TransferId, delete_files: bool) -> anyhow::Result<()>;
 
-    /// Get the local file path for a transfer (by hex infohash).
+    /// Get the local file path for a completed transfer.
     fn get_file_path(&self, id: &TransferId) -> anyhow::Result<PathBuf>;
 }

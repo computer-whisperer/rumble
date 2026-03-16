@@ -32,8 +32,6 @@ use uuid::Uuid;
 
 use std::{sync::atomic::AtomicBool, time::Instant};
 
-use crate::relay::RelayTokenManager;
-
 /// Per-user voice datagram rate limiter using a fixed time window.
 ///
 /// Tracks bytes sent within a 1-second window. If the byte count exceeds
@@ -261,23 +259,6 @@ pub struct SessionEntry {
     pub device: Option<String>,
 }
 
-/// P2P capabilities reported by a client.
-#[derive(Clone, Debug, Default)]
-pub struct PeerCapabilitiesEntry {
-    /// Whether the client supports libp2p file transfer.
-    pub supports_file_transfer: bool,
-    /// Whether the client supports P2P voice.
-    pub supports_p2p_voice: bool,
-    /// Whether the client wants to use relay mode (hides IP from peers).
-    pub prefer_relay: bool,
-    /// Client's libp2p PeerId as bytes.
-    pub libp2p_peer_id: Vec<u8>,
-    /// Client's publicly reachable multiaddrs.
-    pub multiaddrs: Vec<String>,
-    /// Self-reported bandwidth tier.
-    pub bandwidth_tier: u32,
-}
-
 /// The server's shared state.
 ///
 /// This contains all mutable server state including:
@@ -306,14 +287,8 @@ pub struct ServerState {
     sessions: DashMap<u64, SessionEntry>,
     /// Reverse index: session_id → user_id for peer mapping.
     sessions_by_id: DashMap<[u8; 32], u64>,
-    /// P2P capabilities reported by clients: user_id → capabilities.
-    peer_capabilities: DashMap<u64, PeerCapabilitiesEntry>,
     /// Server's TLS certificate DER bytes (for computing cert hash).
     server_cert_der: Vec<u8>,
-    /// Relay token manager for NAT traversal.
-    pub relay_tokens: Arc<RelayTokenManager>,
-    /// Relay service port (set after relay service starts).
-    relay_port: std::sync::atomic::AtomicU16,
     /// Virtual users managed by bridge connections: virtual_user_id → VirtualUser.
     virtual_users: DashMap<u64, VirtualUser>,
     /// Per-user voice datagram rate limiters: user_id → VoiceRateLimit.
@@ -332,10 +307,7 @@ impl ServerState {
             pending_auth: DashMap::new(),
             sessions: DashMap::new(),
             sessions_by_id: DashMap::new(),
-            peer_capabilities: DashMap::new(),
             server_cert_der: Vec::new(),
-            relay_tokens: Arc::new(RelayTokenManager::new()),
-            relay_port: std::sync::atomic::AtomicU16::new(0),
             virtual_users: DashMap::new(),
             voice_rate_limits: DashMap::new(),
             welcome_message: None,
@@ -351,10 +323,7 @@ impl ServerState {
             pending_auth: DashMap::new(),
             sessions: DashMap::new(),
             sessions_by_id: DashMap::new(),
-            peer_capabilities: DashMap::new(),
             server_cert_der: cert_der,
-            relay_tokens: Arc::new(RelayTokenManager::new()),
-            relay_port: std::sync::atomic::AtomicU16::new(0),
             virtual_users: DashMap::new(),
             voice_rate_limits: DashMap::new(),
             welcome_message: None,
@@ -371,16 +340,6 @@ impl ServerState {
     /// Get the welcome message.
     pub fn welcome_message(&self) -> Option<&str> {
         self.welcome_message.as_deref()
-    }
-
-    /// Set the relay port (called after relay service starts).
-    pub fn set_relay_port(&self, port: u16) {
-        self.relay_port.store(port, Ordering::SeqCst);
-    }
-
-    /// Get the relay port.
-    pub fn relay_port(&self) -> u16 {
-        self.relay_port.load(Ordering::SeqCst)
     }
 
     /// Get the server's certificate hash.
@@ -409,8 +368,6 @@ impl ServerState {
         if let Some((_, session)) = self.sessions.remove(&user_id) {
             self.sessions_by_id.remove(&session.session_id);
         }
-        // Also remove peer capabilities when session ends.
-        self.peer_capabilities.remove(&user_id);
     }
 
     /// Get the session entry for a user.
@@ -430,29 +387,6 @@ impl ServerState {
                 .get(uid.value())
                 .map(|s| (*uid.value(), s.value().clone()))
         })
-    }
-
-    /// Store P2P capabilities for a user.
-    pub fn set_peer_capabilities(&self, user_id: u64, capabilities: PeerCapabilitiesEntry) {
-        self.peer_capabilities.insert(user_id, capabilities);
-    }
-
-    /// Get P2P capabilities for a user.
-    pub fn get_peer_capabilities(&self, user_id: u64) -> Option<PeerCapabilitiesEntry> {
-        self.peer_capabilities.get(&user_id).map(|r| r.value().clone())
-    }
-
-    /// Get all peers with their capabilities (for broadcasting PeerAnnounce).
-    pub fn get_all_peer_capabilities(&self) -> Vec<(u64, SessionEntry, PeerCapabilitiesEntry)> {
-        let mut result = Vec::new();
-        for session_ref in self.sessions.iter() {
-            let user_id = *session_ref.key();
-            let session = session_ref.value().clone();
-            if let Some(caps_ref) = self.peer_capabilities.get(&user_id) {
-                result.push((user_id, session, caps_ref.value().clone()));
-            }
-        }
-        result
     }
 
     /// Allocate the next user ID (lock-free).

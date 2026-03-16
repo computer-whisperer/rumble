@@ -225,8 +225,8 @@ pub struct FileInfo {
     pub size: u64,
     /// MIME type (e.g., "image/jpeg").
     pub mime: String,
-    /// 40-character hex-encoded SHA-1 infohash.
-    pub infohash: String,
+    /// Unique transfer identifier (UUID string).
+    pub transfer_id: String,
 }
 
 /// A file message that can be sent in chat.
@@ -244,7 +244,7 @@ pub struct FileMessage {
 
 impl FileMessage {
     /// Create a new file message.
-    pub fn new(name: String, size: u64, mime: String, infohash: String) -> Self {
+    pub fn new(name: String, size: u64, mime: String, transfer_id: String) -> Self {
         Self {
             schema: FILE_MESSAGE_SCHEMA.to_string(),
             message_type: "file".to_string(),
@@ -252,7 +252,7 @@ impl FileMessage {
                 name,
                 size,
                 mime,
-                infohash,
+                transfer_id,
             },
         }
     }
@@ -260,11 +260,6 @@ impl FileMessage {
     /// Serialize to JSON.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
-    }
-
-    /// Derive a magnet link from the infohash.
-    pub fn magnet_link(&self) -> String {
-        format!("magnet:?xt=urn:btih:{}", self.file.infohash)
     }
 }
 
@@ -329,7 +324,7 @@ pub fn parse_file_message(text: &str) -> FileMessageParseResult {
     };
 
     // Check for extraneous file fields
-    let allowed_file_fields = ["name", "size", "mime", "infohash"];
+    let allowed_file_fields = ["name", "size", "mime", "transfer_id"];
     for key in file_obj.keys() {
         if !allowed_file_fields.contains(&key.as_str()) {
             return FileMessageParseResult::InvalidFileMessage(format!("Extraneous file field: {}", key));
@@ -358,18 +353,16 @@ pub fn parse_file_message(text: &str) -> FileMessageParseResult {
         }
     };
 
-    let infohash = match file_obj.get("infohash").and_then(|v| v.as_str()) {
-        Some(h) => h.to_string(),
+    let transfer_id = match file_obj.get("transfer_id").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
         None => {
-            return FileMessageParseResult::InvalidFileMessage("Missing 'file.infohash'".to_string());
+            return FileMessageParseResult::InvalidFileMessage("Missing 'file.transfer_id'".to_string());
         }
     };
 
-    // Validate infohash format (40 hex chars)
-    if infohash.len() != 40 || !infohash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return FileMessageParseResult::InvalidFileMessage(
-            "Invalid infohash format (expected 40 hex characters)".to_string(),
-        );
+    // Validate transfer_id is non-empty
+    if transfer_id.is_empty() {
+        return FileMessageParseResult::InvalidFileMessage("Empty 'file.transfer_id'".to_string());
     }
 
     FileMessageParseResult::FileMessage(FileMessage {
@@ -379,7 +372,7 @@ pub fn parse_file_message(text: &str) -> FileMessageParseResult {
             name,
             size,
             mime,
-            infohash,
+            transfer_id,
         },
     })
 }
@@ -397,7 +390,7 @@ mod file_message_tests {
                 "name": "photo.jpg",
                 "size": 1048576,
                 "mime": "image/jpeg",
-                "infohash": "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+                "transfer_id": "550e8400-e29b-41d4-a716-446655440000"
             }
         }"#;
 
@@ -406,7 +399,7 @@ mod file_message_tests {
                 assert_eq!(fm.file.name, "photo.jpg");
                 assert_eq!(fm.file.size, 1048576);
                 assert_eq!(fm.file.mime, "image/jpeg");
-                assert_eq!(fm.file.infohash, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
+                assert_eq!(fm.file.transfer_id, "550e8400-e29b-41d4-a716-446655440000");
             }
             other => panic!("Expected FileMessage, got {:?}", other),
         }
@@ -433,7 +426,7 @@ mod file_message_tests {
                 "name": "test.txt",
                 "size": 100,
                 "mime": "text/plain",
-                "infohash": "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+                "transfer_id": "550e8400-e29b-41d4-a716-446655440000"
             },
             "extra": "field"
         }"#;
@@ -447,20 +440,20 @@ mod file_message_tests {
     }
 
     #[test]
-    fn test_parse_invalid_infohash() {
+    fn test_parse_empty_transfer_id() {
         let json = r#"{
             "type": "file",
             "file": {
                 "name": "test.txt",
                 "size": 100,
                 "mime": "text/plain",
-                "infohash": "tooshort"
+                "transfer_id": ""
             }
         }"#;
 
         match parse_file_message(json) {
             FileMessageParseResult::InvalidFileMessage(msg) => {
-                assert!(msg.contains("infohash"));
+                assert!(msg.contains("transfer_id"));
             }
             other => panic!("Expected InvalidFileMessage, got {:?}", other),
         }
@@ -472,25 +465,11 @@ mod file_message_tests {
             "test.txt".to_string(),
             1024,
             "text/plain".to_string(),
-            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string(),
+            "550e8400-e29b-41d4-a716-446655440000".to_string(),
         );
         let json = fm.to_json().unwrap();
         assert!(json.contains("test.txt"));
         assert!(json.contains("1024"));
-    }
-
-    #[test]
-    fn test_magnet_link() {
-        let fm = FileMessage::new(
-            "test.txt".to_string(),
-            1024,
-            "text/plain".to_string(),
-            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string(),
-        );
-        assert_eq!(
-            fm.magnet_link(),
-            "magnet:?xt=urn:btih:aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
-        );
     }
 }
 

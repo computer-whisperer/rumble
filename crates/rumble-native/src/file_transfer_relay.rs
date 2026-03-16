@@ -69,7 +69,6 @@ impl TransferEntry {
         };
         TransferStatus {
             id: self.id.clone(),
-            infohash: [0u8; 20], // relay transfers don't have infohashes
             name: self.name.clone(),
             size: self.size,
             progress: self.progress,
@@ -79,7 +78,6 @@ impl TransferEntry {
             state,
             is_finished: self.is_complete,
             error: self.error.clone(),
-            magnet: None,
             local_path: self.path.clone(),
             peer_details: Vec::new(),
         }

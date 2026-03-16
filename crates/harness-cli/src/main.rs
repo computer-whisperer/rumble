@@ -932,10 +932,9 @@ fn print_response(response: &Response) {
                     println!("  {} (max {} bytes)", rule.mime_pattern, rule.max_size_bytes);
                 }
             }
-            ResponseData::FileShared { infohash, magnet_link } => {
+            ResponseData::FileShared { transfer_id } => {
                 println!("File shared!");
-                println!("Infohash: {}", infohash);
-                println!("Magnet: {}", magnet_link);
+                println!("Transfer ID: {}", transfer_id);
             }
             ResponseData::FileTransfers { transfers } => {
                 if transfers.is_empty() {
@@ -945,7 +944,7 @@ fn print_response(response: &Response) {
                     for t in transfers {
                         println!(
                             "  [{}] {} ({:.1}% - {})",
-                            &t.infohash[..8],
+                            &t.transfer_id[..8.min(t.transfer_id.len())],
                             t.name,
                             t.progress * 100.0,
                             t.state

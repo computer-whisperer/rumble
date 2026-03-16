@@ -86,10 +86,7 @@ mod tests {
             ],
             audio: AudioState::default(),
             chat_messages: vec![],
-            file_transfers: vec![],
-            file_transfer_settings: FileTransferSettings::default(),
             room_tree: RoomTree::default(),
-            p2p_peers: HashMap::new(),
             effective_permissions: 0,
             per_room_permissions: HashMap::new(),
             permission_denied: None,
@@ -212,28 +209,5 @@ mod tests {
         assert!(tree.is_ancestor(root_uuid, grandchild_uuid));
         assert!(tree.is_ancestor(child1_uuid, grandchild_uuid));
         assert!(!tree.is_ancestor(child2_uuid, grandchild_uuid));
-
-        #[test]
-        fn p2p_file_message_roundtrip() {
-            let msg = P2pFileMessage::new(
-                "clip.wav".to_string(),
-                1234,
-                "abcd".to_string(),
-                "12D3KooWTestPeer".to_string(),
-                vec!["/ip4/1.2.3.4/tcp/1234/p2p/12D3KooWTestPeer".to_string()],
-            );
-
-            let json = msg.to_json();
-            let parsed = P2pFileMessage::parse(&json).expect("parse");
-            assert_eq!(parsed.file.name, "clip.wav");
-            assert_eq!(parsed.file.size, 1234);
-            assert_eq!(parsed.file.file_id, "abcd");
-            assert_eq!(parsed.file.peer_id, "12D3KooWTestPeer");
-            assert_eq!(parsed.file.addrs.len(), 1);
-
-            let magnet = parsed.magnet_link();
-            assert!(magnet.starts_with("rumblep2p://12D3KooWTestPeer/abcd"));
-            assert!(magnet.contains("ma=%2Fip4%2F1.2.3.4%2Ftcp%2F1234%2Fp2p%2F12D3KooWTestPeer"));
-        }
     }
 }

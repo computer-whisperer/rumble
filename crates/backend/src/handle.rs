@@ -38,8 +38,6 @@
 //! let state = handle.state();
 //! ```
 
-#[cfg(feature = "p2p")]
-use crate::p2p::{P2PManager, build_p2p_magnet, parse_p2p_magnet};
 use crate::{
     ConnectConfig,
     audio_dump::AudioDumper,
@@ -52,11 +50,9 @@ use api::{
     room_id_from_uuid,
 };
 use ed25519_dalek::SigningKey;
-#[cfg(feature = "p2p")]
-use libp2p::{Multiaddr, identity};
 use prost::Message;
 use rumble_client::{
-    AudioBackend, FileTransferPlugin, Platform, TransferId,
+    AudioBackend, Platform,
     auth::{send_envelope, wait_for_auth_result, wait_for_server_hello},
     cert::{CapturedCert, is_cert_error_message, new_captured_cert, take_captured_cert},
     transport::{TlsConfig, Transport, TransportRecvStream},
@@ -69,77 +65,6 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-
-/// Detect MIME type from a filename's extension.
-fn mime_from_extension(filename: &str) -> Option<String> {
-    let guess = mime_guess::from_path(filename).first()?;
-    Some(guess.to_string())
-}
-
-/// Map a raw error message to a user-friendly description.
-fn friendly_download_error(raw: &str) -> String {
-    let lower = raw.to_lowercase();
-    if lower.contains("connection refused") {
-        "Could not reach any peers sharing this file".to_string()
-    } else if lower.contains("timed out") || lower.contains("timeout") {
-        "Download timed out \u{2014} peers may be offline".to_string()
-    } else if lower.contains("no such file") || lower.contains("not found") {
-        "File not found \u{2014} the magnet link may be invalid or expired".to_string()
-    } else if lower.contains("no peers") || lower.contains("no seeds") {
-        "No peers available \u{2014} nobody is currently sharing this file".to_string()
-    } else if lower.contains("invalid magnet") || lower.contains("invalid info hash") {
-        "Invalid magnet link \u{2014} please check the link and try again".to_string()
-    } else if lower.contains("disk") || lower.contains("no space") || lower.contains("permission denied") {
-        "Disk error \u{2014} check available space and file permissions".to_string()
-    } else if lower.contains("dns") || lower.contains("resolve") {
-        "Network error \u{2014} could not resolve tracker address".to_string()
-    } else {
-        format!("Download failed: {}", raw)
-    }
-}
-
-/// Map plugin transfer state to events TransferState.
-fn map_plugin_transfer_state(
-    state: rumble_client::PluginTransferState,
-    is_finished: bool,
-) -> crate::events::TransferState {
-    use rumble_client::PluginTransferState;
-    match state {
-        PluginTransferState::Initializing => crate::events::TransferState::Checking,
-        PluginTransferState::Paused => crate::events::TransferState::Paused,
-        PluginTransferState::Error => crate::events::TransferState::Error,
-        PluginTransferState::Downloading => crate::events::TransferState::Downloading,
-        PluginTransferState::Seeding => {
-            if is_finished {
-                crate::events::TransferState::Seeding
-            } else {
-                crate::events::TransferState::Downloading
-            }
-        }
-    }
-}
-
-/// Map plugin peer connection type to events PeerConnectionType.
-fn map_plugin_peer_connection_type(ct: rumble_client::PluginPeerConnectionType) -> crate::events::PeerConnectionType {
-    use rumble_client::PluginPeerConnectionType;
-    match ct {
-        PluginPeerConnectionType::Direct => crate::events::PeerConnectionType::Direct,
-        PluginPeerConnectionType::Relay => crate::events::PeerConnectionType::Relay,
-        PluginPeerConnectionType::Utp => crate::events::PeerConnectionType::Utp,
-        PluginPeerConnectionType::Socks => crate::events::PeerConnectionType::Socks,
-    }
-}
-
-/// Map plugin peer state to events PeerState.
-fn map_plugin_peer_state(ps: rumble_client::PluginPeerState) -> crate::events::PeerState {
-    use rumble_client::PluginPeerState;
-    match ps {
-        PluginPeerState::Connecting => crate::events::PeerState::Connecting,
-        PluginPeerState::Live => crate::events::PeerState::Live,
-        PluginPeerState::Queued => crate::events::PeerState::Queued,
-        PluginPeerState::Dead => crate::events::PeerState::Dead,
-    }
-}
 
 /// A handle to the backend that can be used from UI code.
 ///
@@ -227,7 +152,6 @@ impl<P: Platform> BackendHandle<P> {
             my_room_id: None,
             my_session_public_key: None,
             my_session_id: None,
-            p2p_peers: HashMap::new(),
             audio: AudioState {
                 input_devices,
                 output_devices,
@@ -248,8 +172,6 @@ impl<P: Platform> BackendHandle<P> {
             },
             chat_messages: Vec::new(),
             room_tree: Default::default(),
-            file_transfers: Vec::new(),
-            file_transfer_settings: Default::default(),
             effective_permissions: 0,
             per_room_permissions: HashMap::new(),
             permission_denied: None,
@@ -491,67 +413,16 @@ async fn run_connection_task<P: Platform>(
     // Connection state
     let mut transport: Option<P::Transport> = None;
     let mut client_name = String::new();
-    let mut file_transfer: Option<Arc<dyn FileTransferPlugin>> = None;
-    let mut shared_infohashes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut _session_identity: Option<SessionIdentity> = None;
-    #[cfg(feature = "p2p")]
-    let mut p2p_manager: Option<Arc<P2PManager>> = None;
-    let mut transfer_update_interval = tokio::time::interval(std::time::Duration::from_millis(500));
 
     loop {
         tokio::select! {
-            _ = transfer_update_interval.tick() => {
-                if let Some(ft) = &file_transfer {
-                    let plugin_transfers = ft.transfers();
-                    let transfers = plugin_transfers.into_iter().map(|t| {
-                        let state = map_plugin_transfer_state(t.state, t.is_finished);
-                        let error = t.error.as_deref().map(friendly_download_error);
-                        let mime = mime_from_extension(&t.name);
-                        let peer_details = t.peer_details.into_iter().map(|p| {
-                            crate::events::TransferPeerInfo {
-                                address: p.address,
-                                connection_type: map_plugin_peer_connection_type(p.connection_type),
-                                state: map_plugin_peer_state(p.state),
-                                downloaded_bytes: p.downloaded_bytes,
-                                uploaded_bytes: p.uploaded_bytes,
-                            }
-                        }).collect();
-
-                        crate::events::FileTransferState {
-                            infohash: t.infohash,
-                            name: t.name,
-                            size: t.size,
-                            mime,
-                            progress: t.progress,
-                            download_speed: t.download_speed,
-                            upload_speed: t.upload_speed,
-                            peers: t.peers,
-                            seeders: Vec::new(),
-                            state,
-                            error,
-                            magnet: t.magnet,
-                            local_path: t.local_path,
-                            peer_details,
-                        }
-                    }).collect();
-
-                    {
-                        let mut s = write_state(&state);
-                        s.file_transfers = transfers;
-                    }
-                    repaint();
-                }
-            }
             cmd = command_rx.recv() => {
                 let Some(cmd) = cmd else {
                     // Channel closed, handle is dropped, exit task
                     debug!("Command channel closed, shutting down connection task");
                     if let Some(t) = transport.take() {
                         t.close().await;
-                    }
-                    #[cfg(feature = "p2p")]
-                    if let Some(p2p) = p2p_manager.take() {
-                        p2p.shutdown().await;
                     }
                     return;
                 };
@@ -604,41 +475,6 @@ async fn run_connection_task<P: Platform>(
 
                                 _session_identity = Some(session_info);
 
-                                #[cfg(feature = "p2p")]
-                                {
-                                    p2p_manager = start_p2p_manager_from_session(
-                                        &_session_identity.as_ref().unwrap().signing_key,
-                                        &config,
-                                    )
-                                    .await;
-
-                                    // Send PeerCapabilities to server
-                                    if let Some(ref p2p) = p2p_manager {
-                                        send_peer_capabilities(
-                                            &mut new_transport,
-                                            p2p.clone(),
-                                        )
-                                        .await;
-                                    }
-                                }
-
-                                // Initialize file transfer plugin (needs raw quinn connection)
-                                let temp_dir = config.download_dir.clone()
-                                    .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
-                                if let Some(qt) = (&new_transport as &dyn std::any::Any).downcast_ref::<rumble_native::QuinnTransport>() {
-                                    match rumble_native::BitTorrentFileTransfer::new(qt.connection().clone(), temp_dir).await {
-                                        Ok(ft) => {
-                                            ft.set_needs_relay(config.prefer_relay);
-                                            file_transfer = Some(Arc::new(ft));
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to initialize file transfer plugin: {}", e);
-                                        }
-                                    }
-                                } else {
-                                    warn!("BitTorrentFileTransfer requires QuinnTransport — skipping file transfer support");
-                                }
-
                                 // Split off the receive stream for the receiver task
                                 let recv_stream = new_transport.take_recv();
                                 transport = Some(new_transport);
@@ -647,11 +483,9 @@ async fn run_connection_task<P: Platform>(
                                 let state_clone = state.clone();
                                 let repaint_clone = repaint.clone();
                                 let audio_task_clone = audio_task.clone();
-                                let file_transfer_clone = file_transfer.clone();
                                 let command_tx_clone = command_tx.clone();
-                                let shared_infohashes_clone = shared_infohashes.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, file_transfer_clone, command_tx_clone, shared_infohashes_clone).await;
+                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone).await;
                                 });
                             }
                             Err(e) => {
@@ -767,41 +601,6 @@ async fn run_connection_task<P: Platform>(
                                     client_name = pending.username;
                                     _session_identity = Some(session_info);
 
-                                    #[cfg(feature = "p2p")]
-                                    {
-                                        p2p_manager = start_p2p_manager_from_session(
-                                            &_session_identity.as_ref().unwrap().signing_key,
-                                            &new_config,
-                                        )
-                                        .await;
-
-                                        // Send PeerCapabilities to server
-                                        if let Some(ref p2p) = p2p_manager {
-                                            send_peer_capabilities(
-                                                &mut new_transport,
-                                                p2p.clone(),
-                                            )
-                                            .await;
-                                        }
-                                    }
-
-                                    // Initialize file transfer plugin (needs raw quinn connection)
-                                    let temp_dir = new_config.download_dir.clone()
-                                        .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
-                                    if let Some(qt) = (&new_transport as &dyn std::any::Any).downcast_ref::<rumble_native::QuinnTransport>() {
-                                        match rumble_native::BitTorrentFileTransfer::new(qt.connection().clone(), temp_dir).await {
-                                            Ok(ft) => {
-                                                ft.set_needs_relay(new_config.prefer_relay);
-                                                file_transfer = Some(Arc::new(ft));
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to initialize file transfer plugin: {}", e);
-                                            }
-                                        }
-                                    } else {
-                                        warn!("BitTorrentFileTransfer requires QuinnTransport — skipping file transfer support");
-                                    }
-
                                     // Split off the receive stream for the receiver task
                                     let recv_stream = new_transport.take_recv();
                                     transport = Some(new_transport);
@@ -810,11 +609,9 @@ async fn run_connection_task<P: Platform>(
                                     let state_clone = state.clone();
                                     let repaint_clone = repaint.clone();
                                     let audio_task_clone = audio_task.clone();
-                                    let file_transfer_clone = file_transfer.clone();
                                     let command_tx_clone = command_tx.clone();
-                                    let shared_infohashes_clone = shared_infohashes.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, file_transfer_clone, command_tx_clone, shared_infohashes_clone).await;
+                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone).await;
                                     });
                                 }
                                 Err(e) => {
@@ -852,11 +649,6 @@ async fn run_connection_task<P: Platform>(
 
                         if let Some(t) = transport.take() {
                             t.close().await;
-                        }
-                        file_transfer = None;
-                        #[cfg(feature = "p2p")]
-                        if let Some(p2p) = p2p_manager.take() {
-                            p2p.shutdown().await;
                         }
                         {
                             let mut s = write_state(&state);
@@ -1154,396 +946,9 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::ShareFile { path } => {
-                        #[cfg(feature = "p2p")]
-                        if let Some(p2p) = &p2p_manager {
-                            let state = state.clone();
-                            let repaint = repaint.clone();
-                            let client = client_name.clone();
-                            let path = path.clone();
-                            match p2p.share_file(path.clone()).await {
-                                Ok(shared) => {
-                                    shared_infohashes.insert(hex::encode(shared.id));
-                                    let addrs = p2p.listen_addrs().await;
-                                    let magnet = build_p2p_magnet(p2p.peer_id(), &shared, &addrs);
-                                    let addr_strings: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
-
-                                    let msg = crate::events::P2pFileMessage::new(
-                                        shared.name.clone(),
-                                        shared.size,
-                                        hex::encode(shared.id),
-                                        p2p.peer_id().to_string(),
-                                        addr_strings,
-                                    );
-
-                                    if let Some(t) = &mut transport {
-                                        let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
-                                        let timestamp_ms = SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis() as i64;
-
-                                        let env = proto::Envelope {
-                                            state_hash: Vec::new(),
-                                            payload: Some(Payload::ChatMessage(proto::ChatMessage {
-                                                id: message_id,
-                                                timestamp_ms,
-                                                sender: client.clone(),
-                                                text: msg.to_json(),
-                                            })),
-                                        };
-                                        if let Err(e) = send_envelope(t, &env).await {
-                                            error!("Failed to send p2p file share message: {}", e);
-                                        }
-                                    }
-
-                                    let mut s = write_state(&state);
-                                    s.chat_messages.push(crate::events::ChatMessage {
-                                        id: uuid::Uuid::new_v4().into_bytes(),
-                                        sender: "System".to_string(),
-                                        text: format!("Sharing {} via P2P (magnet: {})", shared.name, magnet),
-                                        timestamp: SystemTime::now(),
-                                        is_local: true,
-                                        kind: Default::default(),
-                                    });
-                                    repaint();
-                                    continue;
-                                }
-                                Err(e) => {
-                                    error!("Failed to share file via P2P: {}", e);
-                                    let mut s = write_state(&state);
-                                    s.chat_messages.push(crate::events::ChatMessage {
-                                        id: uuid::Uuid::new_v4().into_bytes(),
-                                        sender: "System".to_string(),
-                                        text: format!("Failed to share file via P2P: {}", e),
-                                        timestamp: SystemTime::now(),
-                                        is_local: true,
-                                        kind: Default::default(),
-                                    });
-                                    repaint();
-                                    // fall through to torrent path as a fallback
-                                }
-                            }
-                        }
-
-                        if let (Some(ft), Some(t)) = (&file_transfer, &mut transport) {
-                            let ft = ft.clone();
-                            let path = path.clone();
-                            let state = state.clone();
-                            let repaint = repaint.clone();
-                            let client = client_name.clone();
-
-                            // Share file and get info via plugin
-                            match ft.share(path) {
-                                Ok(offer) => {
-                                    info!("Shared file: {} ({})", offer.name, offer.share_data);
-                                    shared_infohashes.insert(offer.id.0.clone());
-
-                                    // Create file message JSON
-                                    let file_message = crate::events::FileMessage::new(
-                                        offer.name.clone(),
-                                        offer.size,
-                                        offer.mime.clone(),
-                                        offer.id.0.clone(),
-                                    );
-                                    let text = file_message.to_json();
-                                    let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
-                                    let timestamp_ms = SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis() as i64;
-
-                                    // Send to server as chat message
-                                    let env = proto::Envelope {
-                                        state_hash: Vec::new(),
-                                        payload: Some(Payload::ChatMessage(proto::ChatMessage {
-                                            id: message_id.clone(),
-                                            timestamp_ms,
-                                            sender: client.clone(),
-                                            text: text.clone(),
-                                            tree: None,
-                                        })),
-                                    };
-                                    if let Err(e) = send_envelope(t, &env).await {
-                                        error!("Failed to send file share message: {}", e);
-                                    }
-
-                                    // Add local confirmation with magnet link
-                                    let mut s = write_state(&state);
-                                    s.chat_messages.push(crate::events::ChatMessage {
-                                        id: uuid::Uuid::new_v4().into_bytes(),
-                                        sender: "System".to_string(),
-                                        text: format!("Sharing {} ({} bytes)\nMagnet: {}", offer.name, offer.size, offer.share_data),
-                                        timestamp: SystemTime::now(),
-                                        is_local: true,
-                                        kind: Default::default(),
-                                    });
-                                    repaint();
-                                }
-                                Err(e) => {
-                                    error!("Failed to share file: {}", e);
-                                    let mut s = write_state(&state);
-                                    s.chat_messages.push(crate::events::ChatMessage {
-                                        id: uuid::Uuid::new_v4().into_bytes(),
-                                        sender: "System".to_string(),
-                                        text: format!("Failed to share file: {}", e),
-                                        timestamp: SystemTime::now(),
-                                        is_local: true,
-                                        kind: Default::default(),
-                                    });
-                                    repaint();
-                                }
-                            }
-                        }
-                    }
-
-                    Command::DownloadFile { magnet } => {
-                        #[cfg(feature = "p2p")]
-                        if let Some(p2p) = &p2p_manager {
-                            if let Ok((peer_id, file_id, addrs)) = parse_p2p_magnet(&magnet) {
-                                let p2p = p2p.clone();
-                                let state = state.clone();
-                                let repaint = repaint.clone();
-                                let download_dir = config
-                                    .download_dir
-                                    .clone()
-                                    .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
-
-                                tokio::spawn(async move {
-                                    for addr in &addrs {
-                                        p2p.dial(addr.clone()).await;
-                                    }
-
-                                    match p2p.fetch_file(peer_id, file_id).await {
-                                        Ok((name, data)) => {
-                                            // Check if this is a chat history file
-                                            if name == "chat-history.json" {
-                                                // Parse and merge chat history
-                                                if let Ok(json_str) = std::str::from_utf8(&data) {
-                                                    if let Some(history) = crate::events::ChatHistoryContent::parse(json_str) {
-                                                        let received_messages = history.to_messages();
-                                                        let msg_count = received_messages.len();
-
-                                                        let mut s = write_state(&state);
-                                                        // Merge: add messages with new UUIDs
-                                                        let existing_ids: std::collections::HashSet<[u8; 16]> =
-                                                            s.chat_messages.iter().map(|m| m.id).collect();
-
-                                                        let mut added = 0;
-                                                        for msg in received_messages {
-                                                            if !existing_ids.contains(&msg.id) {
-                                                                s.chat_messages.push(msg);
-                                                                added += 1;
-                                                            }
-                                                        }
-
-                                                        // Sort by timestamp
-                                                        s.chat_messages.sort_by_key(|m| m.timestamp);
-
-                                                        // Add system message about the sync
-                                                        s.chat_messages.push(crate::events::ChatMessage {
-                                                            id: uuid::Uuid::new_v4().into_bytes(),
-                                                            sender: "System".to_string(),
-                                                            text: format!(
-                                                                "Synced chat history: {} new messages (of {} received)",
-                                                                added, msg_count
-                                                            ),
-                                                            timestamp: SystemTime::now(),
-                                                            is_local: true,
-                                                        });
-                                                        repaint();
-                                                        return; // Done with chat history
-                                                    }
-                                                }
-                                                error!("Failed to parse chat history JSON");
-                                                return; // Don't process as regular file
-                                            }
-
-                                            // Regular file download
-                                            if let Err(e) = tokio::fs::create_dir_all(&download_dir).await {
-                                                error!("Failed to create download dir: {}", e);
-                                            }
-
-                                            let dest = download_dir.join(&name);
-                                            match tokio::fs::write(&dest, &data).await {
-                                                Ok(_) => {
-                                                    let mut s = write_state(&state);
-                                                    s.chat_messages.push(crate::events::ChatMessage {
-                                                        id: uuid::Uuid::new_v4().into_bytes(),
-                                                        sender: "System".to_string(),
-                                                        text: format!(
-                                                            "Downloaded {} via P2P to {}",
-                                                            name,
-                                                            dest.display()
-                                                        ),
-                                                        timestamp: SystemTime::now(),
-                                                        is_local: true,
-                                                    });
-                                                    repaint();
-                                                }
-                                                Err(e) => {
-                                                    error!("Failed to save P2P download: {}", e);
-                                                    let mut s = write_state(&state);
-                                                    s.chat_messages.push(crate::events::ChatMessage {
-                                                        id: uuid::Uuid::new_v4().into_bytes(),
-                                                        sender: "System".to_string(),
-                                                        text: format!("Failed to save P2P download: {}", e),
-                                                        timestamp: SystemTime::now(),
-                                                        is_local: true,
-                                                    });
-                                                    repaint();
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to download via P2P: {}", e);
-                                            let msg = friendly_download_error(&e.to_string());
-                                            let mut s = write_state(&state);
-                                            s.chat_messages.push(crate::events::ChatMessage {
-                                                id: uuid::Uuid::new_v4().into_bytes(),
-                                                sender: "System".to_string(),
-                                                text: msg,
-                                                timestamp: SystemTime::now(),
-                                                is_local: true,
-                                            });
-                                            repaint();
-                                        }
-                                    }
-                                });
-
-                                continue;
-                            }
-                        }
-
-                        if let Some(ft) = &file_transfer {
-                            let ft = ft.clone();
-                            let magnet = magnet.clone();
-                            let state = state.clone();
-                            let repaint = repaint.clone();
-                            tokio::spawn(async move {
-                                match ft.download(&magnet) {
-                                    Ok(_) => {
-                                        info!("Started download");
-                                        let mut s = write_state(&state);
-                                        s.chat_messages.push(crate::events::ChatMessage {
-                                            id: uuid::Uuid::new_v4().into_bytes(),
-                                            sender: "System".to_string(),
-                                            text: "Started download".to_string(),
-                                            timestamp: SystemTime::now(),
-                                            is_local: true,
-                                            kind: Default::default(),
-                                        });
-                                        repaint();
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to download file: {}", e);
-                                        let msg = friendly_download_error(&e.to_string());
-                                        let mut s = write_state(&state);
-                                        s.chat_messages.push(crate::events::ChatMessage {
-                                            id: uuid::Uuid::new_v4().into_bytes(),
-                                            sender: "System".to_string(),
-                                            text: msg,
-                                            timestamp: SystemTime::now(),
-                                            is_local: true,
-                                            kind: Default::default(),
-                                        });
-                                        repaint();
-                                    }
-                                }
-                            });
-                        }
-                    }
-
-                    Command::PauseTransfer { infohash } => {
-                        if let Some(ft) = &file_transfer {
-                            let ft = ft.clone();
-                            let infohash = infohash.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = ft.pause(&TransferId(infohash)) {
-                                    error!("Failed to pause transfer: {}", e);
-                                }
-                            });
-                        }
-                    }
-
-                    Command::ResumeTransfer { infohash } => {
-                        if let Some(ft) = &file_transfer {
-                            let ft = ft.clone();
-                            let infohash = infohash.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = ft.resume(&TransferId(infohash)) {
-                                    error!("Failed to resume transfer: {}", e);
-                                }
-                            });
-                        }
-                    }
-
-                    Command::CancelTransfer { infohash } => {
-                        if let Some(ft) = &file_transfer {
-                            let ft = ft.clone();
-                            let infohash = infohash.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = ft.cancel(&TransferId(infohash), false) {
-                                    error!("Failed to cancel transfer: {}", e);
-                                }
-                            });
-                        }
-                    }
-
-                    Command::RemoveTransfer { infohash, delete_file } => {
-                        if let Some(ft) = &file_transfer {
-                            let ft = ft.clone();
-                            let infohash = infohash.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = ft.cancel(&TransferId(infohash), delete_file) {
-                                    error!("Failed to remove transfer: {}", e);
-                                }
-                            });
-                        }
-                    }
-
-                    Command::SaveFileAs { infohash, destination } => {
-                        if let Some(ft) = &file_transfer {
-                            match ft.get_file_path(&TransferId(infohash.clone())) {
-                                Ok(source) => {
-                                    let dest = destination.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = tokio::fs::copy(&source, &dest).await {
-                                            error!("Failed to save file: {}", e);
-                                        } else {
-                                            info!("Saved file to: {:?}", dest);
-                                        }
-                                    });
-                                }
-                                Err(e) => {
-                                    error!("Failed to get file path for save: {}", e);
-                                }
-                            }
-                        }
-                    }
-
-                    Command::OpenFile { infohash } => {
-                        if let Some(ft) = &file_transfer {
-                            match ft.get_file_path(&TransferId(infohash.clone())) {
-                                Ok(path) => {
-                                    if let Err(e) = open::that(&path) {
-                                        error!("Failed to open file: {}", e);
-                                    } else {
-                                        info!("Opened file: {:?}", path);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to get file path for open: {}", e);
-                                }
-                            }
-                        }
-                    }
-
-                    Command::UpdateFileTransferSettings { settings } => {
-                        debug!("Updating file transfer settings: auto_download_enabled={}", settings.auto_download_enabled);
-                        let mut s = write_state(&state);
-                        s.file_transfer_settings = settings;
-                        drop(s);
-                        repaint();
+                        // TODO: Wire up relay-based file sharing via FileTransferPlugin.
+                        warn!("ShareFile not yet wired up to relay plugin: {:?}", path);
+                        add_local_message(&state, "File sharing is not currently available".to_string(), &repaint);
                     }
 
                     Command::RequestChatHistory => {
@@ -1585,96 +990,8 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::ShareChatHistory => {
-                        // Share our chat history via P2P in response to a request
-                        #[cfg(feature = "p2p")]
-                        if let Some(p2p) = &p2p_manager {
-                            // Serialize chat history (excluding local messages)
-                            let history = {
-                                let s = read_state(&state);
-                                crate::events::ChatHistoryContent::from_messages(&s.chat_messages)
-                            };
-
-                            if history.messages.is_empty() {
-                                debug!("No chat history to share");
-                                continue;
-                            }
-
-                            let json = history.to_json();
-                            let json_bytes = json.as_bytes();
-
-                            // Write to temp file
-                            let temp_path = std::env::temp_dir().join(format!(
-                                "rumble-chat-history-{}.json",
-                                uuid::Uuid::new_v4()
-                            ));
-
-                            if let Err(e) = std::fs::write(&temp_path, json_bytes) {
-                                error!("Failed to write chat history temp file: {}", e);
-                                continue;
-                            }
-
-                            // Share via P2P
-                            match p2p.share_file(temp_path.clone()).await {
-                                Ok(shared) => {
-                                    let addrs = p2p.listen_addrs().await;
-                                    let addr_strings: Vec<String> =
-                                        addrs.iter().map(|a| a.to_string()).collect();
-
-                                    // Create file message with chat history MIME type
-                                    let msg = crate::events::P2pFileMessage::new(
-                                        "chat-history.json".to_string(),
-                                        shared.size,
-                                        hex::encode(shared.id),
-                                        p2p.peer_id().to_string(),
-                                        addr_strings,
-                                    );
-
-                                    // Send as chat message
-                                    if let Some(t) = &mut transport {
-                                        let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
-                                        let timestamp_ms = SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis() as i64;
-
-                                        let env = proto::Envelope {
-                                            state_hash: Vec::new(),
-                                            payload: Some(Payload::ChatMessage(proto::ChatMessage {
-                                                id: message_id,
-                                                timestamp_ms,
-                                                sender: client_name.clone(),
-                                                text: msg.to_json(),
-                                            })),
-                                        };
-                                        if let Err(e) = send_envelope(t, &env).await {
-                                            error!("Failed to send chat history share message: {}", e);
-                                        } else {
-                                            info!(
-                                                "Shared chat history ({} messages, {} bytes)",
-                                                history.messages.len(),
-                                                shared.size
-                                            );
-                                        }
-                                    }
-
-                                    // Clean up temp file after a delay (let P2P transfer complete)
-                                    let temp_path_clone = temp_path.clone();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                                        let _ = std::fs::remove_file(temp_path_clone);
-                                    });
-                                }
-                                Err(e) => {
-                                    error!("Failed to share chat history via P2P: {}", e);
-                                    let _ = std::fs::remove_file(&temp_path);
-                                }
-                            }
-                        }
-
-                        #[cfg(not(feature = "p2p"))]
-                        {
-                            debug!("Chat history sharing requires P2P feature");
-                        }
+                        // Chat history sharing via P2P has been removed.
+                        debug!("Chat history sharing not available (P2P removed)");
                     }
 
                     // ACL Commands
@@ -1804,67 +1121,14 @@ async fn run_connection_task<P: Platform>(
     }
 }
 
-/// Ephemeral session identity used for libp2p PeerId binding.
+/// Ephemeral session identity for this connection.
 struct SessionIdentity {
-    #[allow(dead_code)] // used behind #[cfg(feature = "p2p")]
+    #[allow(dead_code)]
     signing_key: SigningKey,
     session_public_key: [u8; 32],
     session_id: [u8; 32],
     _issued_ms: i64,
     _expires_ms: i64,
-}
-
-#[cfg(feature = "p2p")]
-async fn start_p2p_manager_from_session(
-    session_signing: &SigningKey,
-    config: &ConnectConfig,
-) -> Option<Arc<P2PManager>> {
-    let secret = identity::ed25519::SecretKey::try_from_bytes(session_signing.to_bytes()).ok()?;
-    let kp = identity::Keypair::from(identity::ed25519::Keypair::from(secret));
-
-    let listen_addrs: Vec<Multiaddr> = if config.p2p_listen_addrs.is_empty() {
-        vec!["/ip4/0.0.0.0/tcp/0".parse().expect("p2p default listen addr")]
-    } else {
-        config.p2p_listen_addrs.clone()
-    };
-
-    match P2PManager::spawn(kp, listen_addrs, config.p2p_relay.clone()).await {
-        Ok(manager) => Some(Arc::new(manager)),
-        Err(err) => {
-            error!(%err, "failed to start p2p manager");
-            None
-        }
-    }
-}
-
-/// Send PeerCapabilities message to the server after P2P manager is initialized.
-#[cfg(feature = "p2p")]
-async fn send_peer_capabilities<T: Transport>(transport: &mut T, p2p: Arc<P2PManager>) {
-    // Wait a moment for listen addresses to be discovered
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let addrs = p2p.listen_addrs().await;
-    let peer_id_bytes = p2p.peer_id().to_bytes();
-
-    let capabilities = proto::PeerCapabilities {
-        supports_file_transfer: true,
-        supports_p2p_voice: false, // Not yet implemented
-        prefer_relay: false,
-        libp2p_peer_id: peer_id_bytes,
-        multiaddrs: addrs.into_iter().map(|a| a.to_string()).collect(),
-        bandwidth_tier: 0, // Auto
-    };
-
-    let envelope = proto::Envelope {
-        state_hash: Vec::new(),
-        payload: Some(Payload::PeerCapabilities(capabilities)),
-    };
-
-    if let Err(e) = send_envelope(transport, &envelope).await {
-        warn!("Failed to send PeerCapabilities: {}", e);
-    } else {
-        info!("Sent PeerCapabilities to server");
-    }
 }
 
 /// Connect to a server and perform handshake with Ed25519 authentication.
@@ -2016,23 +1280,13 @@ async fn run_receiver_task(
     state: Arc<RwLock<State>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
     audio_task: AudioTaskHandle,
-    file_transfer: Option<Arc<dyn FileTransferPlugin>>,
     command_tx: mpsc::UnboundedSender<Command>,
-    shared_infohashes: std::collections::HashSet<String>,
 ) {
     loop {
         match recv.recv().await {
             Ok(Some(frame)) => {
                 if let Ok(env) = proto::Envelope::decode(&*frame) {
-                    handle_server_message(
-                        env,
-                        &state,
-                        &repaint,
-                        &audio_task,
-                        &file_transfer,
-                        &command_tx,
-                        &shared_infohashes,
-                    );
+                    handle_server_message(env, &state, &repaint, &audio_task, &command_tx);
                 }
             }
             Ok(None) => {
@@ -2093,15 +1347,9 @@ fn handle_server_message(
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_task: &AudioTaskHandle,
-    file_transfer: &Option<Arc<dyn FileTransferPlugin>>,
     command_tx: &mpsc::UnboundedSender<Command>,
-    shared_infohashes: &std::collections::HashSet<String>,
 ) {
     match env.payload {
-        Some(Payload::TrackerAnnounceResponse(_)) => {
-            // TrackerAnnounceResponse is handled inline in the announce loop
-            // This branch handles any stray responses (shouldn't happen)
-        }
         Some(Payload::CommandResult(cr)) => {
             // Display command results as local chat messages
             let prefix = if cr.success { "✔" } else { "✖" };
@@ -2182,61 +1430,6 @@ fn handle_server_message(
                             return;
                         }
 
-                        // Check if this is a P2P chat history file
-                        if let Some(p2p_msg) = crate::events::P2pFileMessage::parse(&cb.text) {
-                            if p2p_msg.file.name == "chat-history.json" {
-                                debug!("Received chat history file from {}", cb.sender);
-                                // Send command to download and merge history
-                                let _ = command_tx.send(Command::DownloadFile {
-                                    magnet: p2p_msg.magnet_link(),
-                                });
-                                // Don't add this message to chat - it's a protocol message
-                                return;
-                            }
-                        }
-
-                        // Check if this is a file message that should be auto-downloaded
-                        // Skip auto-download if we're already seeding this file
-                        let mut should_auto_download = None;
-                        if let Some(file_msg) = crate::events::FileMessage::parse(&cb.text) {
-                            let already_shared = shared_infohashes.contains(&file_msg.file.infohash);
-
-                            let s = read_state(&state);
-                            if !already_shared
-                                && s.file_transfer_settings
-                                    .should_auto_download(&file_msg.file.mime, file_msg.file.size)
-                            {
-                                // Check we're not already downloading this file
-                                let infohash_bytes = hex::decode(&file_msg.file.infohash).ok();
-                                let already_downloading = infohash_bytes
-                                    .as_ref()
-                                    .map(|ih| {
-                                        if ih.len() == 20 {
-                                            let mut arr = [0u8; 20];
-                                            arr.copy_from_slice(ih);
-                                            // Skip dedup for all-zero infohashes (relay transfers
-                                            // don't have real infohashes, so they'd all collide)
-                                            if arr == [0u8; 20] {
-                                                return false;
-                                            }
-                                            s.file_transfers.iter().any(|t| t.infohash == arr)
-                                        } else {
-                                            false
-                                        }
-                                    })
-                                    .unwrap_or(false);
-
-                                if !already_downloading {
-                                    should_auto_download = Some(file_msg.magnet_link());
-                                    debug!(
-                                        "Auto-downloading file: {} ({} bytes, {})",
-                                        file_msg.file.name, file_msg.file.size, file_msg.file.mime
-                                    );
-                                }
-                            }
-                            drop(s);
-                        }
-
                         let kind = if cb.tree.unwrap_or(false) {
                             crate::events::ChatMessageKind::Tree
                         } else {
@@ -2258,43 +1451,6 @@ fn handle_server_message(
                         }
                         drop(s);
                         repaint();
-
-                        // Trigger auto-download if conditions were met
-                        if let (Some(magnet), Some(ft)) = (should_auto_download, file_transfer) {
-                            let ft = ft.clone();
-                            let state = state.clone();
-                            let repaint = repaint.clone();
-                            tokio::spawn(async move {
-                                match ft.download(&magnet) {
-                                    Ok(_) => {
-                                        info!("Auto-download started");
-                                        let mut s = write_state(&state);
-                                        s.chat_messages.push(crate::events::ChatMessage {
-                                            id: uuid::Uuid::new_v4().into_bytes(),
-                                            sender: "System".to_string(),
-                                            text: "Auto-download started".to_string(),
-                                            timestamp: std::time::SystemTime::now(),
-                                            is_local: true,
-                                            kind: Default::default(),
-                                        });
-                                        repaint();
-                                    }
-                                    Err(e) => {
-                                        error!("Auto-download failed: {}", e);
-                                        let mut s = write_state(&state);
-                                        s.chat_messages.push(crate::events::ChatMessage {
-                                            id: uuid::Uuid::new_v4().into_bytes(),
-                                            sender: "System".to_string(),
-                                            text: format!("Auto-download failed: {}", e),
-                                            timestamp: std::time::SystemTime::now(),
-                                            is_local: true,
-                                            kind: Default::default(),
-                                        });
-                                        repaint();
-                                    }
-                                }
-                            });
-                        }
                     }
                     proto::server_event::Kind::DirectMessageReceived(dm) => {
                         // Incoming DM from another user (server no longer echoes to sender)
@@ -2344,12 +1500,6 @@ fn handle_server_message(
                     }
                 }
             }
-        }
-        Some(Payload::PeerAnnounce(pa)) => {
-            handle_peer_announce(pa, state, repaint);
-        }
-        Some(Payload::RelayAllocation(ra)) => {
-            handle_relay_allocation(ra, state, repaint);
         }
         Some(Payload::PermissionDenied(pd)) => {
             warn!("Permission denied: {}", pd.message);
@@ -2792,69 +1942,3 @@ fn build_client_room_chain(
         })
         .collect()
 }
-
-/// Handle a PeerAnnounce message from the server.
-/// This updates our knowledge of P2P peers.
-fn handle_peer_announce(
-    announce: proto::PeerAnnounce,
-    state: &Arc<RwLock<State>>,
-    repaint: &Arc<dyn Fn() + Send + Sync>,
-) {
-    let user_id = announce.user_id.as_ref().map(|u| u.value).unwrap_or(0);
-
-    if announce.is_removal {
-        // Peer left - remove from our list
-        let mut s = write_state(&state);
-        s.p2p_peers.remove(&user_id);
-        info!(user_id, "P2P peer removed");
-        drop(s);
-        repaint();
-        return;
-    }
-
-    // Convert session_id to fixed array
-    let session_id: [u8; 32] = announce.session_id.try_into().unwrap_or_else(|_| [0u8; 32]);
-
-    let peer_info = crate::events::PeerInfo {
-        user_id,
-        session_id,
-        libp2p_peer_id: announce.libp2p_peer_id,
-        multiaddrs: announce.multiaddrs,
-        supports_relay: announce.supports_relay,
-        supports_p2p_voice: announce.supports_p2p_voice,
-    };
-
-    let mut s = write_state(&state);
-    s.p2p_peers.insert(user_id, peer_info);
-    info!(
-        user_id,
-        multiaddrs_count = s.p2p_peers.get(&user_id).map(|p| p.multiaddrs.len()).unwrap_or(0),
-        "P2P peer announced"
-    );
-    drop(s);
-    repaint();
-}
-
-/// Handle a RelayAllocation message from the server.
-/// This provides us with relay details for NAT traversal.
-fn handle_relay_allocation(
-    allocation: proto::RelayAllocation,
-    state: &Arc<RwLock<State>>,
-    repaint: &Arc<dyn Fn() + Send + Sync>,
-) {
-    info!(
-        relay_multiaddr = %allocation.relay_multiaddr,
-        expires_ms = allocation.expires_ms,
-        rate_limit = allocation.rate_limit_bytes_per_sec,
-        "Received relay allocation"
-    );
-
-    // TODO: Store relay allocation for use with P2P connections
-    // For now, just log it. When P2P voice is implemented, we'll use this
-    // to configure the libp2p swarm with the relay address.
-
-    let _ = (state, repaint); // Suppress unused warnings for now
-}
-
-// make_client_endpoint removed — connection setup is now handled by
-// QuinnTransport::connect() in rumble-native (v2 Phase 5b).

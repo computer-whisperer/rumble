@@ -4,10 +4,6 @@ description = "Rumble client backend library"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = []
-p2p = []
-
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "bloom", "log", "platform-verifier", "runtime-tokio"] }
@@ -36,7 +32,6 @@ rand = { workspace = true }
 rand_core = { workspace = true }
 open = "5"
 mime_guess = "2"
-libp2p = { version = "0.52", features = ["tcp", "tokio", "dns", "noise", "yamux", "ping", "identify", "relay", "request-response", "dcutr", "macros"] }
 async-trait = "0.1"
 blake3 = "1"
 futures = "0.3"

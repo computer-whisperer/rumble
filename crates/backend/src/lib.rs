@@ -46,8 +46,6 @@
 //!   They should be cleared only when the peer leaves (or as a long-TTL fallback), otherwise
 //!   you will hear a crackle at speech start and see repeated `decoder initialized` logs.
 
-#[cfg(feature = "p2p")]
-use libp2p::Multiaddr;
 use std::path::PathBuf;
 
 // Audio constants and types (concrete I/O moved to rumble-native)
@@ -94,9 +92,6 @@ pub type BackendHandle = handle::BackendHandle<rumble_native::NativePlatform>;
 // RPC server for external process control
 pub mod rpc;
 
-#[cfg(feature = "p2p")]
-pub mod p2p;
-
 // Waveform synthesizer for sound effects
 pub mod synth;
 
@@ -140,14 +135,6 @@ pub struct ConnectConfig {
     /// If true, always use relay mode for file transfers.
     /// This is useful when behind NAT or when you want to hide your IP.
     pub prefer_relay: bool,
-
-    /// Optional libp2p listen multiaddrs (defaults to 0.0.0.0:0 if empty).
-    #[cfg(feature = "p2p")]
-    pub p2p_listen_addrs: Vec<Multiaddr>,
-
-    /// Optional relay base address (e.g. /dns4/relay.example.com/tcp/4001/p2p/<relay-peer> ).
-    #[cfg(feature = "p2p")]
-    pub p2p_relay: Option<Multiaddr>,
 }
 
 impl ConnectConfig {
@@ -171,20 +158,6 @@ impl ConnectConfig {
     /// Enable relay mode for file transfers (useful behind NAT).
     pub fn with_prefer_relay(mut self, prefer: bool) -> Self {
         self.prefer_relay = prefer;
-        self
-    }
-
-    /// Add an additional libp2p listen address (p2p feature only).
-    #[cfg(feature = "p2p")]
-    pub fn with_p2p_listen_addr(mut self, addr: Multiaddr) -> Self {
-        self.p2p_listen_addrs.push(addr);
-        self
-    }
-
-    /// Configure a libp2p relay base address (p2p feature only).
-    #[cfg(feature = "p2p")]
-    pub fn with_p2p_relay(mut self, relay: Multiaddr) -> Self {
-        self.p2p_relay = Some(relay);
         self
     }
 }

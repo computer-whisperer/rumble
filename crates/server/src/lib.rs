@@ -44,7 +44,7 @@
 //!     let server_config = ServerConfig::load()?;
 //!     let (certs, key) = server_config.load_certificates()?;
 //!     let data_dir = server_config.data_dir().ok().map(|p| p.to_string_lossy().to_string());
-//!     let config = Config { bind: server_config.bind, certs, key, data_dir, relay: None, welcome_message: None, plugins: vec![] };
+//!     let config = Config { bind: server_config.bind, certs, key, data_dir, welcome_message: None, plugins: vec![] };
 //!     let server = Server::new(config)?;
 //!     server.run().await
 //! }
@@ -55,19 +55,14 @@ pub mod config;
 pub mod handlers;
 pub mod persistence;
 pub mod plugin;
-pub mod relay;
 pub mod relay_plugin;
 pub mod server;
 pub mod state;
-pub mod tracker;
-pub mod tracker_plugin;
 
 // Re-export main types for convenience
 pub use config::{ServerConfig, generate_self_signed_cert, load_pem_certificates};
 pub use persistence::{PersistedGroup, PersistedRoom, PersistedRoomAcl, Persistence, RegisteredUser};
 pub use plugin::{ServerCtx, ServerPlugin, StreamHeader};
-pub use relay::{RelayConfig, RelayService, RelayTokenManager};
 pub use relay_plugin::FileTransferRelayPlugin;
 pub use server::{Config, Server};
-pub use state::{ClientHandle, PeerCapabilitiesEntry, ServerState, StateData};
-pub use tracker_plugin::FileTransferBittorrentPlugin;
+pub use state::{ClientHandle, ServerState, StateData};

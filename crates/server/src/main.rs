@@ -17,9 +17,7 @@
 //! Run with `--help` for available options.
 
 use anyhow::Result;
-use server::{
-    Config, FileTransferBittorrentPlugin, FileTransferRelayPlugin, Persistence, RelayConfig, Server, ServerConfig,
-};
+use server::{Config, FileTransferRelayPlugin, Persistence, Server, ServerConfig};
 use tracing::info;
 
 /// Handle admin CLI subcommands that run against the database and then exit.
@@ -115,10 +113,6 @@ async fn main() -> Result<()> {
     // Build server config
     let data_dir = server_config.data_dir().ok().map(|p| p.to_string_lossy().to_string());
 
-    // Enable relay service with default configuration
-    // Port 0 means OS will assign an available port
-    let relay = Some(RelayConfig::default());
-
     if let Some(ref msg) = server_config.welcome_message {
         info!("Welcome message: {}", msg);
     }
@@ -128,12 +122,8 @@ async fn main() -> Result<()> {
         certs,
         key,
         data_dir,
-        relay,
         welcome_message: server_config.welcome_message,
-        plugins: vec![
-            Box::new(FileTransferBittorrentPlugin::new()),
-            Box::new(FileTransferRelayPlugin::new()),
-        ],
+        plugins: vec![Box::new(FileTransferRelayPlugin::new())],
     };
 
     let server = Server::new(config)?;

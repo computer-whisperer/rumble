@@ -2,7 +2,7 @@
 //!
 //! These types were originally defined in `backend::events` and other backend
 //! modules. They are pure-data types with no platform-specific dependencies
-//! (no cpal, opus, libp2p, etc.), so they live here in the `api` crate for
+//! (no cpal, opus, etc.), so they live here in the `api` crate for
 //! broader reuse.
 
 use crate::proto::{RoomInfo, User};
@@ -12,7 +12,6 @@ use std::{
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use urlencoding::encode;
 use uuid::Uuid;
 
 // =============================================================================
@@ -46,10 +45,6 @@ pub(crate) fn serialize_id_hex<S: serde::Serializer>(id: &[u8; 16], s: S) -> Res
     s.serialize_str(&hex::encode(id))
 }
 
-pub(crate) fn serialize_infohash_hex<S: serde::Serializer>(id: &[u8; 20], s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&hex::encode(id))
-}
-
 pub(crate) fn serialize_opt_instant<S: serde::Serializer>(_: &Option<Instant>, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_none()
 }
@@ -59,10 +54,6 @@ pub(crate) fn serialize_session_key<S: serde::Serializer>(key: &Option<[u8; 32]>
         Some(k) => s.serialize_some(&hex::encode(k)),
         None => s.serialize_none(),
     }
-}
-
-pub(crate) fn serialize_session_id_bytes<S: serde::Serializer>(id: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&hex::encode(id))
 }
 
 // =============================================================================
@@ -693,212 +684,6 @@ pub struct ChatMessage {
 }
 
 // =============================================================================
-// File Message (for file sharing in chat)
-// =============================================================================
-
-/// A file share message embedded in chat.
-///
-/// File messages are sent as JSON-encoded text in chat messages.
-/// The client detects file messages by parsing the text as JSON
-/// and validating against the file message schema.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FileMessage {
-    /// Message type marker (always "file").
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    /// File information.
-    pub file: FileInfo,
-}
-
-/// File information for a shared file.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FileInfo {
-    /// Original filename.
-    pub name: String,
-    /// File size in bytes.
-    pub size: u64,
-    /// MIME type (e.g., "image/jpeg").
-    pub mime: String,
-    /// 40-character hex-encoded SHA-1 infohash.
-    pub infohash: String,
-}
-
-impl FileMessage {
-    /// Schema URL for file messages.
-    pub const SCHEMA: &'static str = "https://rumble.example/schemas/file-message-v1.json";
-
-    /// Create a new file message.
-    pub fn new(name: String, size: u64, mime: String, infohash: String) -> Self {
-        Self {
-            msg_type: "file".to_string(),
-            file: FileInfo {
-                name,
-                size,
-                mime,
-                infohash,
-            },
-        }
-    }
-
-    /// Try to parse a chat message text as a file message.
-    ///
-    /// Returns Some(FileMessage) if the text is valid JSON that matches
-    /// the file message schema with no extraneous fields.
-    pub fn parse(text: &str) -> Option<Self> {
-        // Attempt JSON parse
-        let value: serde_json::Value = serde_json::from_str(text).ok()?;
-
-        // Check it's an object
-        let obj = value.as_object()?;
-
-        // Validate against the schema:
-        // - Must have "type": "file"
-        // - Must have "file" object with exactly: name, size, mime, infohash
-        // - May optionally have "$schema" field
-        // - No other fields allowed (prevents false positives on user-pasted JSON)
-
-        // Check type field
-        if obj.get("type")?.as_str()? != "file" {
-            return None;
-        }
-
-        // Check file object exists
-        let file_obj = obj.get("file")?.as_object()?;
-
-        // Validate file object has exactly the required fields
-        let required_fields = ["name", "size", "mime", "infohash"];
-        for field in &required_fields {
-            if !file_obj.contains_key(*field) {
-                return None;
-            }
-        }
-
-        // Check for extraneous fields in file object
-        for key in file_obj.keys() {
-            if !required_fields.contains(&key.as_str()) {
-                return None;
-            }
-        }
-
-        // Check for extraneous fields in root object
-        for key in obj.keys() {
-            if !["type", "file", "$schema"].contains(&key.as_str()) {
-                return None;
-            }
-        }
-
-        // Now we can safely deserialize
-        serde_json::from_value(value).ok()
-    }
-
-    /// Generate the magnet link for this file.
-    pub fn magnet_link(&self) -> String {
-        format!("magnet:?xt=urn:btih:{}", self.file.infohash)
-    }
-
-    /// Serialize to JSON for sending as a chat message.
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-}
-
-// =============================================================================
-// P2P File Message (libp2p transfer)
-// =============================================================================
-
-/// A P2P file share message embedded in chat.
-/// Carries peer id and multiaddrs so clients can dial directly.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct P2pFileMessage {
-    /// Message type marker (always "p2p_file").
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    /// File information.
-    pub file: P2pFileInfo,
-}
-
-/// File info + peer routing hints for libp2p transfers.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct P2pFileInfo {
-    pub name: String,
-    pub size: u64,
-    /// Hex-encoded 32-byte file id (BLAKE3 in current implementation).
-    pub file_id: String,
-    /// Base58 libp2p PeerId of the seeding peer.
-    pub peer_id: String,
-    /// Multiaddr strings (already include /p2p/<peer> component when applicable).
-    pub addrs: Vec<String>,
-}
-
-impl P2pFileMessage {
-    pub const SCHEMA: &'static str = "https://rumble.example/schemas/p2p-file-message-v1.json";
-
-    pub fn new(name: String, size: u64, file_id: String, peer_id: String, addrs: Vec<String>) -> Self {
-        Self {
-            msg_type: "p2p_file".to_string(),
-            file: P2pFileInfo {
-                name,
-                size,
-                file_id,
-                peer_id,
-                addrs,
-            },
-        }
-    }
-
-    pub fn parse(text: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(text).ok()?;
-        let obj = value.as_object()?;
-
-        if obj.get("type")?.as_str()? != "p2p_file" {
-            return None;
-        }
-
-        let file_obj = obj.get("file")?.as_object()?;
-        let required_fields = ["name", "size", "file_id", "peer_id", "addrs"];
-        for field in &required_fields {
-            if !file_obj.contains_key(*field) {
-                return None;
-            }
-        }
-
-        for key in file_obj.keys() {
-            if !required_fields.contains(&key.as_str()) {
-                return None;
-            }
-        }
-
-        for key in obj.keys() {
-            if !["type", "file", "$schema"].contains(&key.as_str()) {
-                return None;
-            }
-        }
-
-        serde_json::from_value(value).ok()
-    }
-
-    pub fn magnet_link(&self) -> String {
-        let mut uri = format!("rumblep2p://{}/{}", self.file.peer_id, self.file.file_id);
-        if !self.file.addrs.is_empty() {
-            let query = self
-                .file
-                .addrs
-                .iter()
-                .map(|addr| format!("ma={}", encode(addr)))
-                .collect::<Vec<_>>()
-                .join("&");
-            uri.push('?');
-            uri.push_str(&query);
-        }
-        uri
-    }
-
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-}
-
-// =============================================================================
 // Chat History Sync Messages
 // =============================================================================
 
@@ -1042,222 +827,6 @@ impl ChatHistoryContent {
 }
 
 // =============================================================================
-// Auto-Download Settings
-// =============================================================================
-
-/// A single auto-download rule with a MIME pattern and max file size.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AutoDownloadRule {
-    /// MIME type pattern (e.g., "image/*", "audio/*", "application/pdf").
-    pub mime_pattern: String,
-    /// Maximum file size in bytes. 0 = disabled for this pattern.
-    pub max_size_bytes: u64,
-}
-
-impl AutoDownloadRule {
-    /// Check if a given MIME type matches this rule's pattern.
-    ///
-    /// Supports wildcard patterns like "image/*" and exact matches like "application/pdf".
-    pub fn matches_mime(&self, mime: &str) -> bool {
-        if self.mime_pattern.ends_with("/*") {
-            // Wildcard pattern: "image/*" matches "image/jpeg", "image/png", etc.
-            let prefix = &self.mime_pattern[..self.mime_pattern.len() - 1]; // "image/"
-            mime.starts_with(prefix)
-        } else {
-            // Exact match
-            self.mime_pattern == mime
-        }
-    }
-
-    /// Check if a file matches this rule (MIME and size).
-    pub fn matches(&self, mime: &str, size: u64) -> bool {
-        self.max_size_bytes > 0 && size <= self.max_size_bytes && self.matches_mime(mime)
-    }
-}
-
-/// File transfer settings including auto-download configuration.
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct FileTransferSettings {
-    /// Auto-download files matching the rules below.
-    pub auto_download_enabled: bool,
-    /// Auto-download rules, each with a MIME pattern and size limit.
-    pub auto_download_rules: Vec<AutoDownloadRule>,
-}
-
-impl FileTransferSettings {
-    /// Check if a file should be auto-downloaded based on the current settings.
-    pub fn should_auto_download(&self, mime: &str, size: u64) -> bool {
-        if !self.auto_download_enabled {
-            return false;
-        }
-        self.auto_download_rules.iter().any(|rule| rule.matches(mime, size))
-    }
-}
-
-// =============================================================================
-// File Transfer State
-// =============================================================================
-
-/// State of a file transfer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransferState {
-    /// In queue, not started.
-    #[default]
-    Pending,
-    /// Verifying existing data.
-    Checking,
-    /// Actively downloading.
-    Downloading,
-    /// Actively seeding (upload only).
-    Seeding,
-    /// Paused by user.
-    Paused,
-    /// Download completed, not seeding.
-    Completed,
-    /// Transfer failed with error.
-    Error,
-}
-
-impl TransferState {
-    /// Check if this state represents an active transfer.
-    pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            TransferState::Checking | TransferState::Downloading | TransferState::Seeding
-        )
-    }
-
-    /// Check if the transfer is complete (downloaded or seeding).
-    pub fn is_finished(&self) -> bool {
-        matches!(self, TransferState::Seeding | TransferState::Completed)
-    }
-}
-
-/// Connection type for a transfer peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PeerConnectionType {
-    /// Direct TCP connection to peer.
-    #[default]
-    Direct,
-    /// Connection through server relay (for NAT'd peers).
-    Relay,
-    /// uTP (micro Transport Protocol) connection.
-    Utp,
-    /// Connection through SOCKS proxy.
-    Socks,
-}
-
-impl std::fmt::Display for PeerConnectionType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PeerConnectionType::Direct => write!(f, "Direct"),
-            PeerConnectionType::Relay => write!(f, "Relay"),
-            PeerConnectionType::Utp => write!(f, "uTP"),
-            PeerConnectionType::Socks => write!(f, "SOCKS"),
-        }
-    }
-}
-
-/// State of a peer connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PeerState {
-    /// Connecting to peer.
-    #[default]
-    Connecting,
-    /// Connected and transferring.
-    Live,
-    /// Queued for connection.
-    Queued,
-    /// Connection failed or closed.
-    Dead,
-}
-
-impl std::fmt::Display for PeerState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PeerState::Connecting => write!(f, "Connecting"),
-            PeerState::Live => write!(f, "Live"),
-            PeerState::Queued => write!(f, "Queued"),
-            PeerState::Dead => write!(f, "Dead"),
-        }
-    }
-}
-
-/// Information about a connected peer in a file transfer.
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct TransferPeerInfo {
-    /// Socket address of the peer (IP:port).
-    pub address: String,
-    /// Connection type (direct, relay, uTP, etc.).
-    pub connection_type: PeerConnectionType,
-    /// Current peer state.
-    pub state: PeerState,
-    /// Bytes downloaded from this peer.
-    pub downloaded_bytes: u64,
-    /// Bytes uploaded to this peer.
-    pub uploaded_bytes: u64,
-}
-
-/// Information about a file transfer.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FileTransferState {
-    /// Infohash (20 bytes).
-    #[serde(serialize_with = "serialize_infohash_hex")]
-    pub infohash: [u8; 20],
-    /// Original filename.
-    pub name: String,
-    /// File size in bytes.
-    pub size: u64,
-    /// MIME type (if known).
-    pub mime: Option<String>,
-    /// Progress (0.0 to 1.0).
-    pub progress: f32,
-    /// Download speed in bytes/sec.
-    pub download_speed: u64,
-    /// Upload speed in bytes/sec.
-    pub upload_speed: u64,
-    /// Number of connected peers.
-    pub peers: u32,
-    /// User IDs of known seeders (from tracker).
-    pub seeders: Vec<u64>,
-    /// Current state.
-    pub state: TransferState,
-    /// Error message (if state is Error).
-    pub error: Option<String>,
-    /// Magnet link for sharing.
-    pub magnet: Option<String>,
-    /// Local file path (if available).
-    pub local_path: Option<std::path::PathBuf>,
-    /// Detailed information about connected peers.
-    pub peer_details: Vec<TransferPeerInfo>,
-}
-
-// =============================================================================
-// P2P Peer Information
-// =============================================================================
-
-/// Information about a P2P peer announced by the server.
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct PeerInfo {
-    /// The user ID this peer corresponds to.
-    pub user_id: u64,
-    /// Session ID (32-byte hash of session public key).
-    #[serde(serialize_with = "serialize_session_id_bytes")]
-    pub session_id: [u8; 32],
-    /// libp2p PeerId as bytes.
-    pub libp2p_peer_id: Vec<u8>,
-    /// Multiaddrs where this peer can be reached.
-    pub multiaddrs: Vec<String>,
-    /// Whether the peer supports relay mode.
-    pub supports_relay: bool,
-    /// Whether the peer supports P2P voice.
-    pub supports_p2p_voice: bool,
-}
-
-// =============================================================================
 // Sound Effect Kind
 // =============================================================================
 
@@ -1396,16 +965,12 @@ pub struct State {
     pub my_user_id: Option<u64>,
     /// Our current room ID (if in a room).
     pub my_room_id: Option<Uuid>,
-    /// Ephemeral session public key for this connection (P2P identity).
+    /// Ephemeral session public key for this connection.
     #[serde(serialize_with = "serialize_session_key")]
     pub my_session_public_key: Option<[u8; 32]>,
     /// Stable session identifier derived from the session public key.
     #[serde(serialize_with = "serialize_session_key")]
     pub my_session_id: Option<[u8; 32]>,
-
-    // P2P state
-    /// Known P2P peers (keyed by user_id).
-    pub p2p_peers: HashMap<u64, PeerInfo>,
 
     // Audio
     /// Audio subsystem state.
@@ -1414,11 +979,6 @@ pub struct State {
     // Chat (recent messages, not persisted)
     /// Recent chat messages.
     pub chat_messages: Vec<ChatMessage>,
-
-    // File Transfers
-    pub file_transfers: Vec<FileTransferState>,
-    /// File transfer settings (auto-download rules, etc.).
-    pub file_transfer_settings: FileTransferSettings,
 
     // Room tree (derived from rooms)
     /// Hierarchical tree structure of rooms, rebuilt when rooms change.
@@ -1635,39 +1195,6 @@ pub enum Command {
     ShareFile {
         path: std::path::PathBuf,
     },
-    DownloadFile {
-        magnet: String,
-    },
-    /// Pause a file transfer by infohash (hex-encoded).
-    PauseTransfer {
-        infohash: String,
-    },
-    /// Resume a paused file transfer by infohash (hex-encoded).
-    ResumeTransfer {
-        infohash: String,
-    },
-    /// Cancel and remove a file transfer by infohash (hex-encoded).
-    CancelTransfer {
-        infohash: String,
-    },
-    /// Remove a completed/seeding transfer and optionally delete the local file.
-    RemoveTransfer {
-        infohash: String,
-        delete_file: bool,
-    },
-    /// Save a completed file to a new location.
-    SaveFileAs {
-        infohash: String,
-        destination: std::path::PathBuf,
-    },
-    /// Open a completed file with the system default application.
-    OpenFile {
-        infohash: String,
-    },
-    /// Update file transfer settings (auto-download rules, etc.).
-    UpdateFileTransferSettings {
-        settings: FileTransferSettings,
-    },
 
     // Sound Effects
     /// Play a sound effect.
@@ -1820,30 +1347,6 @@ impl std::fmt::Debug for Command {
             Command::RegisterUser { user_id } => f.debug_struct("RegisterUser").field("user_id", user_id).finish(),
             Command::UnregisterUser { user_id } => f.debug_struct("UnregisterUser").field("user_id", user_id).finish(),
             Command::ShareFile { path } => f.debug_struct("ShareFile").field("path", path).finish(),
-            Command::DownloadFile { magnet } => f.debug_struct("DownloadFile").field("magnet", magnet).finish(),
-            Command::PauseTransfer { infohash } => f.debug_struct("PauseTransfer").field("infohash", infohash).finish(),
-            Command::ResumeTransfer { infohash } => {
-                f.debug_struct("ResumeTransfer").field("infohash", infohash).finish()
-            }
-            Command::CancelTransfer { infohash } => {
-                f.debug_struct("CancelTransfer").field("infohash", infohash).finish()
-            }
-            Command::RemoveTransfer { infohash, delete_file } => f
-                .debug_struct("RemoveTransfer")
-                .field("infohash", infohash)
-                .field("delete_file", delete_file)
-                .finish(),
-            Command::SaveFileAs { infohash, destination } => f
-                .debug_struct("SaveFileAs")
-                .field("infohash", infohash)
-                .field("destination", destination)
-                .finish(),
-            Command::OpenFile { infohash } => f.debug_struct("OpenFile").field("infohash", infohash).finish(),
-            Command::UpdateFileTransferSettings { settings } => f
-                .debug_struct("UpdateFileTransferSettings")
-                .field("auto_download_enabled", &settings.auto_download_enabled)
-                .field("rules_count", &settings.auto_download_rules.len())
-                .finish(),
             Command::PlaySfx { kind, volume } => f
                 .debug_struct("PlaySfx")
                 .field("kind", kind)

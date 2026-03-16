@@ -89,7 +89,7 @@ Server sends incremental `StateUpdate` messages with BLAKE3 hash. Client verifie
 - **Serialization**: Protocol Buffers (prost) - see `crates/api/proto/api.proto`
 - **Audio Format**: Opus at 48kHz, 20ms frames (960 samples)
 - **Authentication**: Ed25519 signatures with optional SSH agent support
-- **File Sharing**: BitTorrent (via rqbit)
+- **File Sharing**: Server relay (with plugin architecture for alternative backends)
 
 ## Audio: Opus Decoder Lifetime (important)
 
@@ -105,8 +105,8 @@ Located in `vendor/`. Used primarily for reference; code links against GitHub ve
 
 - `egui_ltreeview` - Tree view widget for room hierarchy
 - `opus-rs` - Opus audio codec bindings
-- `rqbit` - BitTorrent client (for file sharing feature)
-- `torrust-tracker` - BitTorrent tracker
+- `rqbit` - BitTorrent client (legacy, no longer used for file sharing)
+- `torrust-tracker` - BitTorrent tracker (legacy, no longer used)
 
 ## GUI Test Harness
 

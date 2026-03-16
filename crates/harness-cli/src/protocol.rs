@@ -212,7 +212,7 @@ pub enum ResponseData {
     },
 
     /// File shared result.
-    FileShared { infohash: String, magnet_link: String },
+    FileShared { transfer_id: String },
 
     /// List of file transfers.
     FileTransfers { transfers: Vec<FileTransferInfo> },
@@ -221,7 +221,7 @@ pub enum ResponseData {
 /// Information about a file transfer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileTransferInfo {
-    pub infohash: String,
+    pub transfer_id: String,
     pub name: String,
     pub size: u64,
     pub progress: f32,

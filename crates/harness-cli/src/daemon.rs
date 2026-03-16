@@ -379,60 +379,8 @@ impl ClientInstance {
         }
     }
 
-    /// Enable or disable auto-download.
-    fn set_auto_download(&mut self, enabled: bool) {
-        use backend::Command;
-        let backend = self.app.backend();
-
-        // Get current settings and update
-        let state = backend.state();
-        let mut settings = state.file_transfer_settings.clone();
-        settings.auto_download_enabled = enabled;
-
-        // Send the updated settings to the backend
-        backend.send(Command::UpdateFileTransferSettings { settings });
-    }
-
-    /// Set auto-download rules.
-    fn set_auto_download_rules(&mut self, rules: Vec<crate::protocol::AutoDownloadRuleConfig>) {
-        use backend::{AutoDownloadRule, Command};
-        let backend = self.app.backend();
-
-        // Get current settings and update
-        let state = backend.state();
-        let mut settings = state.file_transfer_settings.clone();
-        settings.auto_download_rules = rules
-            .into_iter()
-            .map(|r| AutoDownloadRule {
-                mime_pattern: r.mime_pattern,
-                max_size_bytes: r.max_size_bytes,
-            })
-            .collect();
-
-        // Send the updated settings to the backend
-        backend.send(Command::UpdateFileTransferSettings { settings });
-    }
-
-    /// Get file transfer settings.
-    fn get_file_transfer_settings(&self) -> (bool, Vec<crate::protocol::AutoDownloadRuleConfig>) {
-        let backend = self.app.backend();
-        let state = backend.state();
-        let settings = &state.file_transfer_settings;
-
-        let rules = settings
-            .auto_download_rules
-            .iter()
-            .map(|r| crate::protocol::AutoDownloadRuleConfig {
-                mime_pattern: r.mime_pattern.clone(),
-                max_size_bytes: r.max_size_bytes,
-            })
-            .collect();
-
-        (settings.auto_download_enabled, rules)
-    }
-
     /// Share a file via the backend.
-    fn share_file(&mut self, path: &str) -> anyhow::Result<(String, String)> {
+    fn share_file(&mut self, path: &str) -> anyhow::Result<String> {
         use backend::Command;
 
         // Send share command to backend
@@ -440,42 +388,13 @@ impl ClientInstance {
             path: std::path::PathBuf::from(path),
         });
 
-        // Run frames to let the share complete
-        for _ in 0..50 {
-            self.run_frame();
-            // Small sleep to allow async operations
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        // Check if we have a file transfer
-        let state = self.app.backend().state();
-        if let Some(transfer) = state.file_transfers.first() {
-            let infohash = hex::encode(transfer.infohash);
-            let magnet = transfer.magnet.clone().unwrap_or_default();
-            Ok((infohash, magnet))
-        } else {
-            Err(anyhow::anyhow!("File share did not produce a transfer"))
-        }
+        // Relay-based file sharing is not yet fully wired up in the harness.
+        Err(anyhow::anyhow!("File sharing not yet available in harness"))
     }
 
     /// Get list of file transfers.
     fn get_file_transfers(&self) -> Vec<crate::protocol::FileTransferInfo> {
-        use backend::TransferState;
-        let backend = self.app.backend();
-        let state = backend.state();
-
-        state
-            .file_transfers
-            .iter()
-            .map(|t| crate::protocol::FileTransferInfo {
-                infohash: hex::encode(t.infohash),
-                name: t.name.clone(),
-                size: t.size,
-                progress: t.progress,
-                state: format!("{:?}", t.state),
-                is_downloading: matches!(t.state, TransferState::Downloading),
-            })
-            .collect()
+        Vec::new()
     }
 }
 
@@ -992,22 +911,20 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
             }
         }
 
-        Command::SetAutoDownload { id, enabled } => {
-            let mut state = state.write().await;
-            if let Some(client) = state.clients.get_mut(&id) {
-                client.set_auto_download(enabled);
-                client.run_frame();
+        Command::SetAutoDownload { id, enabled: _ } => {
+            // Auto-download settings not yet implemented for relay transfers
+            let state = state.read().await;
+            if state.clients.contains_key(&id) {
                 Response::ack()
             } else {
                 Response::error(format!("Client {} not found", id))
             }
         }
 
-        Command::SetAutoDownloadRules { id, rules } => {
-            let mut state = state.write().await;
-            if let Some(client) = state.clients.get_mut(&id) {
-                client.set_auto_download_rules(rules);
-                client.run_frame();
+        Command::SetAutoDownloadRules { id, rules: _ } => {
+            // Auto-download rules not yet implemented for relay transfers
+            let state = state.read().await;
+            if state.clients.contains_key(&id) {
                 Response::ack()
             } else {
                 Response::error(format!("Client {} not found", id))
@@ -1016,11 +933,10 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
 
         Command::GetFileTransferSettings { id } => {
             let state = state.read().await;
-            if let Some(client) = state.clients.get(&id) {
-                let (enabled, rules) = client.get_file_transfer_settings();
+            if state.clients.contains_key(&id) {
                 Response::ok(ResponseData::FileTransferSettings {
-                    auto_download_enabled: enabled,
-                    auto_download_rules: rules,
+                    auto_download_enabled: false,
+                    auto_download_rules: vec![],
                 })
             } else {
                 Response::error(format!("Client {} not found", id))
@@ -1060,12 +976,12 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
             let mut state = state.write().await;
             if let Some(client) = state.clients.get_mut(&id) {
                 match client.share_file(&path) {
-                    Ok((infohash, magnet_link)) => {
+                    Ok(transfer_id) => {
                         // Run some frames to process the share
                         for _ in 0..10 {
                             client.run_frame();
                         }
-                        Response::ok(ResponseData::FileShared { infohash, magnet_link })
+                        Response::ok(ResponseData::FileShared { transfer_id })
                     }
                     Err(e) => Response::error(format!("Failed to share file: {}", e)),
                 }
@@ -1099,7 +1015,7 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
 
 /// Start the Rumble server.
 async fn start_server(port: u16) -> Result<ServerHandle> {
-    use server::{Config, FileTransferBittorrentPlugin, Server, generate_self_signed_cert};
+    use server::{Config, Server, generate_self_signed_cert};
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -1117,9 +1033,8 @@ async fn start_server(port: u16) -> Result<ServerHandle> {
         certs,
         key,
         data_dir: None,
-        relay: None,
         welcome_message: None,
-        plugins: vec![Box::new(FileTransferBittorrentPlugin::new())],
+        plugins: vec![],
     };
 
     let server = Server::new(config)?;

@@ -83,9 +83,8 @@ pub struct QuinnTransport {
 impl QuinnTransport {
     /// Access the underlying quinn connection.
     ///
-    /// This is needed for quinn-specific operations like TorrentManager
-    /// which opens its own bi-directional streams. This accessor will be
-    /// removed when TorrentManager is extracted (Phase 5f).
+    /// Used by plugins (e.g., relay file transfer) that need to open
+    /// their own bi-directional streams on the QUIC connection.
     pub fn connection(&self) -> &quinn::Connection {
         &self.connection
     }

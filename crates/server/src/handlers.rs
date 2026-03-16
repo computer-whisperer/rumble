@@ -14,10 +14,7 @@ use crate::{
     acl,
     persistence::Persistence,
     plugin::{ServerCtx, ServerPlugin},
-    state::{
-        ClientHandle, PeerCapabilitiesEntry, PendingAuth, ServerState, SessionEntry, UserStatus,
-        compute_server_state_hash,
-    },
+    state::{ClientHandle, PendingAuth, ServerState, SessionEntry, UserStatus, compute_server_state_hash},
 };
 use anyhow::Result;
 use api::{
@@ -160,19 +157,6 @@ pub async fn handle_envelope(
             }
             handle_unregister_user(uu, sender, state, persistence).await?;
         }
-        // TrackerAnnounce and TrackerScrape are handled by FileTransferBittorrentPlugin
-        Some(Payload::PeerCapabilities(pc)) => {
-            if !sender.authenticated.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            handle_peer_capabilities(pc, sender, state).await?;
-        }
-        Some(Payload::P2pVoiceStatus(vs)) => {
-            if !sender.authenticated.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            handle_p2p_voice_status(vs, sender, state).await?;
-        }
         // Bridge messages (70-79)
         Some(Payload::BridgeHello(bh)) => {
             if !sender.authenticated.load(Ordering::SeqCst) {
@@ -265,8 +249,6 @@ pub async fn handle_envelope(
             | Payload::ServerEvent(_)
             | Payload::AuthFailed(_)
             | Payload::CommandResult(_)
-            | Payload::PeerAnnounce(_)
-            | Payload::RelayAllocation(_)
             | Payload::BridgeUserRegistered(_)
             | Payload::PermissionDenied(_)
             | Payload::UserKicked(_),
@@ -1608,16 +1590,11 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
         }
     }
 
-    // Broadcast peer removal before removing session data
-    if client_handle.authenticated.load(Ordering::SeqCst) {
-        broadcast_peer_removal(user_id, state).await;
-    }
-
     // Remove client from DashMap (lock-free)
     state.remove_client_by_handle(client_handle);
     // Remove membership
     state.remove_user_membership(user_id).await;
-    // Remove session (also removes peer_capabilities)
+    // Remove session
     state.remove_session(user_id);
     // Remove voice rate limit state
     state.remove_voice_rate(user_id);
@@ -2632,176 +2609,6 @@ async fn handle_bridge_chat_message(
     }
 
     Ok(())
-}
-
-// =============================================================================
-// P2P Control Plane Handlers
-// =============================================================================
-
-/// Handle PeerCapabilities message from a client.
-/// This stores the client's P2P capabilities and broadcasts their info to other peers.
-async fn handle_peer_capabilities(
-    msg: proto::PeerCapabilities,
-    sender: Arc<ClientHandle>,
-    state: Arc<ServerState>,
-) -> Result<()> {
-    let user_id = sender.user_id;
-
-    info!(
-        user_id,
-        supports_file_transfer = msg.supports_file_transfer,
-        supports_p2p_voice = msg.supports_p2p_voice,
-        prefer_relay = msg.prefer_relay,
-        multiaddrs_count = msg.multiaddrs.len(),
-        "Received PeerCapabilities"
-    );
-
-    // Store the capabilities
-    let capabilities = PeerCapabilitiesEntry {
-        supports_file_transfer: msg.supports_file_transfer,
-        supports_p2p_voice: msg.supports_p2p_voice,
-        prefer_relay: msg.prefer_relay,
-        libp2p_peer_id: msg.libp2p_peer_id.clone(),
-        multiaddrs: msg.multiaddrs.clone(),
-        bandwidth_tier: msg.bandwidth_tier,
-    };
-    state.set_peer_capabilities(user_id, capabilities);
-
-    // Get the session entry to build the PeerAnnounce
-    let Some(session) = state.get_session(user_id) else {
-        warn!(user_id, "No session found for user when handling PeerCapabilities");
-        return Ok(());
-    };
-
-    // Broadcast PeerAnnounce to all other connected clients
-    let announce = proto::PeerAnnounce {
-        user_id: Some(proto::UserId { value: user_id }),
-        session_id: session.session_id.to_vec(),
-        libp2p_peer_id: msg.libp2p_peer_id,
-        multiaddrs: msg.multiaddrs,
-        supports_relay: msg.prefer_relay, // If they prefer relay, they support it
-        supports_p2p_voice: msg.supports_p2p_voice,
-        is_removal: false,
-    };
-
-    let envelope = proto::Envelope {
-        state_hash: Vec::new(),
-        payload: Some(Payload::PeerAnnounce(announce)),
-    };
-    let frame = encode_frame(&envelope);
-
-    // Broadcast to all other clients
-    broadcast_to_others(&state, user_id, &frame).await;
-
-    // Also send existing peers to the new client
-    send_existing_peers_to_client(&sender, &state).await;
-
-    Ok(())
-}
-
-/// Handle P2PVoiceStatus message from a client.
-/// This tracks which peers a client has active P2P voice connections to.
-async fn handle_p2p_voice_status(
-    msg: proto::P2pVoiceStatus,
-    sender: Arc<ClientHandle>,
-    _state: Arc<ServerState>,
-) -> Result<()> {
-    let user_id = sender.user_id;
-
-    debug!(
-        user_id,
-        p2p_mode_active = msg.p2p_mode_active,
-        connected_sessions_count = msg.connected_sessions.len(),
-        "Received P2PVoiceStatus"
-    );
-
-    // For now, just log this. In the future, we can use this to:
-    // - Track which clients are using P2P vs relay for voice
-    // - Adjust topology hints
-    // - Route relay traffic only when needed
-
-    // TODO: Store P2P voice status for topology decisions
-
-    Ok(())
-}
-
-/// Send PeerAnnounce for all existing peers to a newly connected client.
-async fn send_existing_peers_to_client(client: &Arc<ClientHandle>, state: &Arc<ServerState>) {
-    let peers = state.get_all_peer_capabilities();
-
-    for (peer_user_id, session, caps) in peers {
-        // Don't announce the client to themselves
-        if peer_user_id == client.user_id {
-            continue;
-        }
-
-        let announce = proto::PeerAnnounce {
-            user_id: Some(proto::UserId { value: peer_user_id }),
-            session_id: session.session_id.to_vec(),
-            libp2p_peer_id: caps.libp2p_peer_id,
-            multiaddrs: caps.multiaddrs,
-            supports_relay: caps.prefer_relay,
-            supports_p2p_voice: caps.supports_p2p_voice,
-            is_removal: false,
-        };
-
-        let envelope = proto::Envelope {
-            state_hash: Vec::new(),
-            payload: Some(Payload::PeerAnnounce(announce)),
-        };
-        let frame = encode_frame(&envelope);
-
-        if let Err(e) = client.send_frame(&frame).await {
-            debug!(
-                user_id = client.user_id,
-                peer_user_id,
-                error = ?e,
-                "Failed to send PeerAnnounce to client"
-            );
-        }
-    }
-}
-
-/// Broadcast a removal announcement when a peer disconnects.
-pub async fn broadcast_peer_removal(user_id: u64, state: &Arc<ServerState>) {
-    // Get session info before it's removed
-    let Some(session) = state.get_session(user_id) else {
-        return;
-    };
-
-    let announce = proto::PeerAnnounce {
-        user_id: Some(proto::UserId { value: user_id }),
-        session_id: session.session_id.to_vec(),
-        libp2p_peer_id: Vec::new(),
-        multiaddrs: Vec::new(),
-        supports_relay: false,
-        supports_p2p_voice: false,
-        is_removal: true,
-    };
-
-    let envelope = proto::Envelope {
-        state_hash: Vec::new(),
-        payload: Some(Payload::PeerAnnounce(announce)),
-    };
-    let frame = encode_frame(&envelope);
-
-    broadcast_to_others(state, user_id, &frame).await;
-}
-
-/// Broadcast a frame to all connected clients except the sender.
-async fn broadcast_to_others(state: &Arc<ServerState>, exclude_user_id: u64, frame: &[u8]) {
-    for client in state.snapshot_clients() {
-        if client.user_id == exclude_user_id {
-            continue;
-        }
-        if let Err(e) = client.send_frame(frame).await {
-            debug!(
-                user_id = client.user_id,
-                error = ?e,
-                "Failed to broadcast frame to client"
-            );
-        }
-    }
 }
 
 #[cfg(test)]

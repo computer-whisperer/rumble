@@ -59,9 +59,6 @@ pub enum RpcRequest {
 
     // Files
     ShareFile { path: String },
-    DownloadFile { magnet: String },
-    PauseTransfer { infohash: String },
-    ResumeTransfer { infohash: String },
 
     // Events
     Subscribe,
@@ -386,18 +383,6 @@ impl RpcServer {
                 let _ = command_tx.send(Command::ShareFile {
                     path: PathBuf::from(path),
                 });
-                RpcResponse::ok()
-            }
-            RpcRequest::DownloadFile { magnet } => {
-                let _ = command_tx.send(Command::DownloadFile { magnet });
-                RpcResponse::ok()
-            }
-            RpcRequest::PauseTransfer { infohash } => {
-                let _ = command_tx.send(Command::PauseTransfer { infohash });
-                RpcResponse::ok()
-            }
-            RpcRequest::ResumeTransfer { infohash } => {
-                let _ = command_tx.send(Command::ResumeTransfer { infohash });
                 RpcResponse::ok()
             }
             RpcRequest::Subscribe => RpcResponse::ok_with_data(serde_json::json!({"subscribed": true})),

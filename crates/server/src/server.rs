@@ -6,7 +6,6 @@ use crate::{
     handlers::{cleanup_client, handle_datagrams, handle_envelope},
     persistence::Persistence,
     plugin::{ServerCtx, ServerPlugin, StreamHeader},
-    relay::{RelayConfig, RelayService},
     state::{ClientHandle, ServerState},
 };
 use anyhow::Result;
@@ -34,8 +33,6 @@ pub struct Config {
     pub key: rustls::pki_types::PrivateKeyDer<'static>,
     /// Optional path for the persistence database.
     pub data_dir: Option<String>,
-    /// Relay service configuration. If None, relay service is disabled.
-    pub relay: Option<RelayConfig>,
     /// Welcome message (MOTD) sent to clients after authentication.
     pub welcome_message: Option<String>,
     /// Server plugins (compile-time extensions).
@@ -50,8 +47,6 @@ pub struct Server {
     endpoint: Endpoint,
     state: Arc<ServerState>,
     persistence: Option<Arc<Persistence>>,
-    relay_service: Option<Arc<RelayService>>,
-    relay_bind: Option<SocketAddr>,
     plugins: Vec<Arc<dyn ServerPlugin>>,
     plugin_ctx: Arc<ServerCtx>,
 }
@@ -86,16 +81,6 @@ impl Server {
             None
         };
 
-        // Initialize relay service if configured
-        let (relay_service, relay_bind) = if let Some(relay_config) = config.relay {
-            let relay_port = relay_config.port;
-            let relay = RelayService::new(relay_config, state.relay_tokens.clone());
-            let bind_addr = SocketAddr::new(config.bind.ip(), relay_port);
-            (Some(Arc::new(relay)), Some(bind_addr))
-        } else {
-            (None, None)
-        };
-
         // Create plugin context and wrap plugins in Arc
         let plugin_ctx = Arc::new(ServerCtx::new(state.clone(), persistence.clone()));
         let plugins: Vec<Arc<dyn ServerPlugin>> = config.plugins.into_iter().map(|p| Arc::from(p)).collect();
@@ -104,8 +89,6 @@ impl Server {
             endpoint,
             state,
             persistence,
-            relay_service,
-            relay_bind,
             plugins,
             plugin_ctx,
         })
@@ -164,22 +147,6 @@ impl Server {
         for plugin in &self.plugins {
             info!(plugin = plugin.name(), "starting plugin");
             plugin.start(&self.plugin_ctx).await?;
-        }
-
-        // Start relay service if configured
-        if let (Some(relay), Some(bind_addr)) = (&self.relay_service, &self.relay_bind) {
-            let relay = relay.clone();
-            let bind = *bind_addr;
-            tokio::spawn(async move {
-                if let Err(e) = relay.run(bind).await {
-                    error!("Relay service error: {e}");
-                }
-            });
-            // Give the relay service time to bind and store the port
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let port = self.relay_service.as_ref().unwrap().port().await;
-            self.state.set_relay_port(port);
-            info!("Relay service started on port {}", port);
         }
 
         info!("server_listen_addr = {}", self.endpoint.local_addr()?);

@@ -7,9 +7,8 @@
 
 use api::permissions::Permissions;
 use backend::{
-    AudioSettings, BackendHandle, Command, ConnectConfig, ConnectionState, FileMessage, P2pFileMessage, PipelineConfig,
-    ProcessorRegistry, SfxKind, TransferState, VoiceMode, build_default_tx_pipeline, merge_with_default_tx_pipeline,
-    register_builtin_processors,
+    AudioSettings, BackendHandle, Command, ConnectConfig, ConnectionState, PipelineConfig, ProcessorRegistry, SfxKind,
+    VoiceMode, build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
 };
 use ed25519_dalek::SigningKey;
 use eframe::egui;
@@ -26,7 +25,7 @@ use crate::{
     },
     settings::{
         AcceptedCertificate, Args, AutoDownloadRule, PersistentAudioSettings, PersistentSettings, PersistentVoiceMode,
-        TimestampFormat, format_size, get_file_icon,
+        TimestampFormat,
     },
     toasts::ToastManager,
 };
@@ -71,14 +70,6 @@ struct DescriptionModalState {
     room_uuid: Option<Uuid>,
     room_name: String,
     description: String,
-}
-
-/// State for the download file modal
-#[derive(Default)]
-struct DownloadModalState {
-    open: bool,
-    magnet_link: String,
-    validation_error: Option<String>,
 }
 
 /// State for the image view modal (click-to-enlarge with zoom/pan)
@@ -322,11 +313,6 @@ fn format_permission_details(perms: Permissions) -> String {
     }
 }
 
-/// Validate a magnet link format.
-fn is_valid_magnet(s: &str) -> bool {
-    s.starts_with("magnet:?") && s.contains("xt=urn:btih:")
-}
-
 /// Categories for the settings sidebar
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 enum SettingsCategory {
@@ -448,9 +434,6 @@ pub struct RumbleApp {
     // Pending file dialog (async to avoid blocking audio)
     pending_file_dialog: Option<tokio::task::JoinHandle<Option<std::path::PathBuf>>>,
 
-    // Pending save file dialog (returns infohash and destination path)
-    pending_save_dialog: Option<tokio::task::JoinHandle<Option<(String, std::path::PathBuf)>>>,
-
     // Tokio runtime handle for async operations (SSH agent, file dialogs)
     tokio_handle: tokio::runtime::Handle,
 
@@ -472,8 +455,6 @@ pub struct RumbleApp {
     move_room_modal: MoveRoomModalState,
 
     // Download file modal state
-    download_modal: DownloadModalState,
-
     // Delete room confirmation modal state
     delete_room_modal: DeleteRoomModalState,
 
@@ -689,25 +670,6 @@ impl RumbleApp {
             });
         }
 
-        // Apply file transfer settings to backend
-        {
-            let ui_settings = &persistent_settings.file_transfer;
-            let backend_settings = backend::FileTransferSettings {
-                auto_download_enabled: ui_settings.auto_download_enabled,
-                auto_download_rules: ui_settings
-                    .auto_download_rules
-                    .iter()
-                    .map(|r| backend::AutoDownloadRule {
-                        mime_pattern: r.mime_pattern.clone(),
-                        max_size_bytes: r.max_size_bytes,
-                    })
-                    .collect(),
-            };
-            backend.send(Command::UpdateFileTransferSettings {
-                settings: backend_settings,
-            });
-        }
-
         // Send initial status messages via backend
         backend.send(Command::LocalMessage {
             text: format!("Rumble Client v{}", env!("CARGO_PKG_VERSION")),
@@ -766,7 +728,6 @@ impl RumbleApp {
             signing_key,
             pending_agent_op: None,
             pending_file_dialog: None,
-            pending_save_dialog: None,
             tokio_handle: runtime_handle,
             persistent_settings,
             autoconnect_on_launch,
@@ -774,7 +735,6 @@ impl RumbleApp {
             processor_registry,
             rename_modal: RenameModalState::default(),
             move_room_modal: MoveRoomModalState::default(),
-            download_modal: DownloadModalState::default(),
             delete_room_modal: DeleteRoomModalState::default(),
             description_modal: DescriptionModalState::default(),
             image_view_modal: ImageViewModalState::default(),
@@ -1170,28 +1130,6 @@ impl RumbleApp {
         if let Some(format) = self.settings_modal.pending_timestamp_format {
             self.persistent_settings.chat_timestamp_format = format;
         }
-
-        // Apply file transfer settings to backend
-        self.sync_file_transfer_settings_to_backend();
-    }
-
-    /// Send the current file transfer settings to the backend.
-    fn sync_file_transfer_settings_to_backend(&self) {
-        let ui_settings = &self.persistent_settings.file_transfer;
-        let backend_settings = backend::FileTransferSettings {
-            auto_download_enabled: ui_settings.auto_download_enabled,
-            auto_download_rules: ui_settings
-                .auto_download_rules
-                .iter()
-                .map(|r| backend::AutoDownloadRule {
-                    mime_pattern: r.mime_pattern.clone(),
-                    max_size_bytes: r.max_size_bytes,
-                })
-                .collect(),
-        };
-        self.backend.send(Command::UpdateFileTransferSettings {
-            settings: backend_settings,
-        });
     }
 
     /// Join a room and optionally request chat history if auto-sync is enabled.
@@ -3412,25 +3350,6 @@ impl RumbleApp {
             }
         }
 
-        // Poll pending save dialog
-        if let Some(handle) = &self.pending_save_dialog {
-            if handle.is_finished() {
-                if let Some(handle) = self.pending_save_dialog.take() {
-                    match self.tokio_handle.block_on(handle) {
-                        Ok(Some((infohash, destination))) => {
-                            self.backend.send(Command::SaveFileAs { infohash, destination });
-                        }
-                        Ok(None) => {
-                            // User cancelled the dialog
-                        }
-                        Err(e) => {
-                            tracing::error!("Save dialog task panicked: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
         // Request periodic repaint when settings dialog is open (for level meters)
         // This ensures the UI updates even when no user interaction occurs
         if self.show_settings {
@@ -3589,308 +3508,6 @@ impl RumbleApp {
                 });
         }
 
-        // Download Modal
-        if self.download_modal.open {
-            egui::Modal::new(egui::Id::new("download_modal")).show(ctx, |ui| {
-                ui.heading("Download File");
-                ui.add_space(8.0);
-                ui.label("Enter Magnet Link:");
-                let response = ui.text_edit_singleline(&mut self.download_modal.magnet_link);
-                if response.changed() {
-                    // Re-validate on every edit
-                    let link = self.download_modal.magnet_link.trim();
-                    if link.is_empty() {
-                        self.download_modal.validation_error = None;
-                    } else if !is_valid_magnet(link) {
-                        self.download_modal.validation_error = Some(
-                            "Invalid magnet link: must start with \"magnet:?\" and contain \"xt=urn:btih:\""
-                                .to_string(),
-                        );
-                    } else {
-                        self.download_modal.validation_error = None;
-                    }
-                }
-                if let Some(err) = &self.download_modal.validation_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                }
-                ui.add_space(8.0);
-                let link_valid = is_valid_magnet(self.download_modal.magnet_link.trim());
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        self.download_modal.open = false;
-                    }
-                    let download_btn = ui.add_enabled(link_valid, egui::Button::new("Download"));
-                    if download_btn.clicked() {
-                        self.backend.send(Command::DownloadFile {
-                            magnet: self.download_modal.magnet_link.clone(),
-                        });
-                        self.download_modal.open = false;
-                        self.show_transfers = true;
-                    }
-                });
-            });
-        }
-
-        // Transfers Window
-        if self.show_transfers {
-            egui::Window::new("File Transfers")
-                .open(&mut self.show_transfers)
-                .default_width(400.0)
-                .show(ctx, |ui| {
-                    if state.file_transfers.is_empty() {
-                        ui.label("No active transfers.");
-                    } else {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for transfer in &state.file_transfers {
-                                ui.group(|ui| {
-                                    // Status icon and name
-                                    let (icon, status_text, color) = match transfer.state {
-                                        TransferState::Pending => ("\u{231b}", "Pending", egui::Color32::GRAY),
-                                        TransferState::Checking => ("\u{1f50d}", "Verifying...", egui::Color32::YELLOW),
-                                        TransferState::Downloading => {
-                                            ("\u{2b07}", "Downloading", egui::Color32::from_rgb(80, 140, 255))
-                                        }
-                                        TransferState::Seeding => ("\u{2b06}", "Seeding", egui::Color32::GREEN),
-                                        TransferState::Paused => {
-                                            ("\u{23f8}", "Paused", egui::Color32::from_rgb(160, 160, 160))
-                                        }
-                                        TransferState::Completed => ("\u{2714}", "Done", egui::Color32::GREEN),
-                                        TransferState::Error => ("\u{2718}", "Error", egui::Color32::RED),
-                                    };
-
-                                    ui.horizontal(|ui| {
-                                        ui.colored_label(color, icon);
-                                        let name_text = egui::RichText::new(&transfer.name).color(color);
-                                        ui.strong(name_text);
-                                    });
-
-                                    // Size info
-                                    let size_str = format_size(transfer.size);
-                                    ui.horizontal(|ui| {
-                                        ui.colored_label(color, format!("{} \u{00b7} {}", size_str, status_text));
-                                        if transfer.peers > 0 {
-                                            ui.label(format!("\u{00b7} {} peers", transfer.peers));
-                                        }
-                                    });
-
-                                    // Progress bar for downloading
-                                    if matches!(transfer.state, TransferState::Downloading) {
-                                        ui.add(
-                                            egui::ProgressBar::new(transfer.progress)
-                                                .show_percentage()
-                                                .animate(true),
-                                        );
-
-                                        // Speed info
-                                        if transfer.download_speed > 0 || transfer.upload_speed > 0 {
-                                            ui.horizontal(|ui| {
-                                                if transfer.download_speed > 0 {
-                                                    ui.colored_label(
-                                                        egui::Color32::from_rgb(80, 140, 255),
-                                                        format!("\u{2b07} {}/s", format_size(transfer.download_speed)),
-                                                    );
-                                                }
-                                                if transfer.upload_speed > 0 {
-                                                    ui.colored_label(
-                                                        egui::Color32::GREEN,
-                                                        format!("\u{2b06} {}/s", format_size(transfer.upload_speed)),
-                                                    );
-                                                }
-                                            });
-                                        }
-                                    }
-
-                                    // Progress bar for checking/verifying
-                                    if matches!(transfer.state, TransferState::Checking) {
-                                        ui.add(
-                                            egui::ProgressBar::new(transfer.progress)
-                                                .show_percentage()
-                                                .animate(true),
-                                        );
-                                    }
-
-                                    // Seeding stats
-                                    if matches!(transfer.state, TransferState::Seeding) {
-                                        ui.horizontal(|ui| {
-                                            if transfer.upload_speed > 0 {
-                                                ui.colored_label(
-                                                    egui::Color32::GREEN,
-                                                    format!("\u{2b06} {}/s", format_size(transfer.upload_speed)),
-                                                );
-                                            } else {
-                                                ui.colored_label(egui::Color32::GREEN, "Seeding...");
-                                            }
-                                        });
-                                    }
-
-                                    // Error message
-                                    if let Some(err) = &transfer.error {
-                                        ui.colored_label(egui::Color32::RED, format!("\u{26a0} {}", err));
-                                    }
-
-                                    // Peer details (collapsible)
-                                    if !transfer.peer_details.is_empty() {
-                                        let infohash_hex = hex::encode(transfer.infohash);
-                                        egui::CollapsingHeader::new(format!("Peers ({})", transfer.peer_details.len()))
-                                            .id_salt(&infohash_hex)
-                                            .show(ui, |ui| {
-                                                use backend::events::{
-                                                    PeerConnectionType, PeerState as TransferPeerState,
-                                                };
-
-                                                egui::Grid::new(format!("peer_grid_{}", infohash_hex))
-                                                    .striped(true)
-                                                    .spacing([10.0, 4.0])
-                                                    .show(ui, |ui| {
-                                                        // Header row
-                                                        ui.strong("Address");
-                                                        ui.strong("Type");
-                                                        ui.strong("State");
-                                                        ui.strong("Down");
-                                                        ui.strong("Up");
-                                                        ui.end_row();
-
-                                                        for peer in &transfer.peer_details {
-                                                            // Address (truncate if too long)
-                                                            let addr_display = if peer.address.len() > 21 {
-                                                                format!("{}...", &peer.address[..18])
-                                                            } else {
-                                                                peer.address.clone()
-                                                            };
-                                                            ui.label(&addr_display);
-
-                                                            // Connection type with color
-                                                            let (type_text, type_color) = match peer.connection_type {
-                                                                PeerConnectionType::Direct => {
-                                                                    ("Direct", egui::Color32::GREEN)
-                                                                }
-                                                                PeerConnectionType::Relay => {
-                                                                    ("Relay", egui::Color32::YELLOW)
-                                                                }
-                                                                PeerConnectionType::Utp => {
-                                                                    ("uTP", egui::Color32::LIGHT_BLUE)
-                                                                }
-                                                                PeerConnectionType::Socks => {
-                                                                    ("SOCKS", egui::Color32::LIGHT_GRAY)
-                                                                }
-                                                            };
-                                                            ui.colored_label(type_color, type_text);
-
-                                                            // Peer state with color
-                                                            let (state_text, state_color) = match peer.state {
-                                                                TransferPeerState::Live => {
-                                                                    ("Live", egui::Color32::GREEN)
-                                                                }
-                                                                TransferPeerState::Connecting => {
-                                                                    ("Connecting", egui::Color32::YELLOW)
-                                                                }
-                                                                TransferPeerState::Queued => {
-                                                                    ("Queued", egui::Color32::GRAY)
-                                                                }
-                                                                TransferPeerState::Dead => ("Dead", egui::Color32::RED),
-                                                            };
-                                                            ui.colored_label(state_color, state_text);
-
-                                                            // Downloaded/uploaded bytes
-                                                            ui.label(format_size(peer.downloaded_bytes));
-                                                            ui.label(format_size(peer.uploaded_bytes));
-
-                                                            ui.end_row();
-                                                        }
-                                                    });
-                                            });
-                                    }
-
-                                    // Actions
-                                    ui.horizontal(|ui| {
-                                        let infohash = hex::encode(transfer.infohash);
-
-                                        // Pause/Resume buttons
-                                        match transfer.state {
-                                            TransferState::Downloading
-                                            | TransferState::Seeding
-                                            | TransferState::Checking => {
-                                                if ui.button("⏸ Pause").clicked() {
-                                                    self.backend.send(Command::PauseTransfer {
-                                                        infohash: infohash.clone(),
-                                                    });
-                                                }
-                                            }
-                                            TransferState::Paused => {
-                                                if ui.button("▶ Resume").clicked() {
-                                                    self.backend.send(Command::ResumeTransfer {
-                                                        infohash: infohash.clone(),
-                                                    });
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-
-                                        // Cancel button for active transfers
-                                        if matches!(
-                                            transfer.state,
-                                            TransferState::Downloading
-                                                | TransferState::Checking
-                                                | TransferState::Pending
-                                                | TransferState::Paused
-                                        ) {
-                                            if ui.button("✖ Cancel").clicked() {
-                                                self.backend.send(Command::CancelTransfer {
-                                                    infohash: infohash.clone(),
-                                                });
-                                            }
-                                        }
-
-                                        // Remove/Stop seeding button for completed transfers
-                                        if matches!(transfer.state, TransferState::Seeding | TransferState::Completed) {
-                                            if ui.button("🗑 Remove").clicked() {
-                                                self.backend.send(Command::RemoveTransfer {
-                                                    infohash: infohash.clone(),
-                                                    delete_file: false,
-                                                });
-                                            }
-                                        }
-
-                                        // Save As button for completed downloads
-                                        if matches!(transfer.state, TransferState::Seeding | TransferState::Completed) {
-                                            if transfer.local_path.is_some() {
-                                                // Store infohash for the save dialog
-                                                let dialog_pending = self.pending_save_dialog.is_some();
-                                                if ui
-                                                    .add_enabled(!dialog_pending, egui::Button::new("💾 Save As..."))
-                                                    .clicked()
-                                                {
-                                                    let infohash_for_dialog = infohash.clone();
-                                                    let default_name = transfer.name.clone();
-                                                    let handle = self.tokio_handle.spawn(async move {
-                                                        rfd::AsyncFileDialog::new()
-                                                            .set_file_name(&default_name)
-                                                            .save_file()
-                                                            .await
-                                                            .map(|f| (infohash_for_dialog, f.path().to_path_buf()))
-                                                    });
-                                                    self.pending_save_dialog = Some(handle);
-                                                }
-                                            }
-                                        }
-
-                                        // Show magnet link copy for seeding transfers
-                                        if matches!(transfer.state, TransferState::Seeding | TransferState::Completed) {
-                                            if let Some(magnet) = &transfer.magnet {
-                                                if ui.button("📋 Copy Magnet").clicked() {
-                                                    ui.ctx().copy_text(magnet.clone());
-                                                }
-                                            }
-                                        }
-                                    });
-                                });
-                                ui.add_space(4.0);
-                            }
-                        });
-                    }
-                });
-        }
-
         // Top menu
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -3955,12 +3572,6 @@ impl RumbleApp {
                                 .map(|f| f.path().to_path_buf())
                         });
                         self.pending_file_dialog = Some(handle);
-                        ui.close();
-                    }
-                    if ui.button("Download File...").clicked() {
-                        self.download_modal.open = true;
-                        self.download_modal.magnet_link.clear();
-                        self.download_modal.validation_error = None;
                         ui.close();
                     }
                     if ui.button("Show Transfers").clicked() {
@@ -4159,15 +3770,6 @@ impl RumbleApp {
                         strip.cell(|ui| {
                             ui.heading("Text Chat");
                             ui.separator();
-                            // Collect file actions to trigger (can't trigger inside loop due to borrow)
-                            let mut download_magnet: Option<String> = None;
-                            let mut open_file_infohash: Option<String> = None;
-                            let mut save_file_info: Option<(String, String)> = None; // (infohash, default_name)
-                            let mut repost_text: Option<String> = None;
-                            let mut pause_infohash: Option<String> = None;
-                            let mut resume_infohash: Option<String> = None;
-                            let mut cancel_infohash: Option<String> = None;
-
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false; 2])
                                 .stick_to_bottom(true)
@@ -4198,252 +3800,6 @@ impl RumbleApp {
                                             // Local status messages in gray italics
                                             let text = format!("{}{}", timestamp_prefix, msg.text);
                                             ui.label(egui::RichText::new(text).italics().color(egui::Color32::GRAY));
-                                        } else if let Some(p2p_msg) = P2pFileMessage::parse(&msg.text) {
-                                            ui.group(|ui| {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(egui::RichText::new("P2P File").strong());
-                                                    ui.label(format!(
-                                                        "{} ({} bytes)",
-                                                        p2p_msg.file.name, p2p_msg.file.size
-                                                    ));
-                                                });
-
-                                                ui.label(format!("Peer: {}", p2p_msg.file.peer_id));
-                                                ui.label("Addresses:");
-                                                for addr in &p2p_msg.file.addrs {
-                                                    ui.label(egui::RichText::new(addr));
-                                                }
-
-                                                if ui.button("Download (P2P)").clicked() {
-                                                    download_magnet = Some(p2p_msg.magnet_link());
-                                                }
-                                            });
-                                        } else if let Some(file_msg) = FileMessage::parse(&msg.text) {
-                                            // Look up transfer state for this file
-                                            let infohash_hex = &file_msg.file.infohash;
-                                            let infohash_bytes: Option<[u8; 20]> =
-                                                hex::decode(infohash_hex).ok().and_then(|v| v.try_into().ok());
-
-                                            let transfer = infohash_bytes.and_then(|hash| {
-                                                state.file_transfers.iter().find(|t| t.infohash == hash)
-                                            });
-
-                                            let is_downloaded = transfer
-                                                .map(|t| {
-                                                    matches!(t.state, TransferState::Completed | TransferState::Seeding)
-                                                })
-                                                .unwrap_or(false);
-
-                                            let is_downloading = transfer
-                                                .map(|t| {
-                                                    matches!(
-                                                        t.state,
-                                                        TransferState::Downloading | TransferState::Checking
-                                                    )
-                                                })
-                                                .unwrap_or(false);
-
-                                            let is_paused = transfer
-                                                .map(|t| matches!(t.state, TransferState::Paused))
-                                                .unwrap_or(false);
-
-                                            let is_image = file_msg.file.mime.starts_with("image/");
-
-                                            // File message - render as file widget
-                                            ui.group(|ui| {
-                                                // For downloaded images, show inline preview
-                                                let mut image_shown = false;
-                                                if is_downloaded && is_image {
-                                                    if let Some(t) = transfer {
-                                                        if let Some(ref path) = t.local_path {
-                                                            // Create a unique URI for caching
-                                                            let uri = format!("bytes://file_preview/{}", infohash_hex);
-
-                                                            // Try to load the image bytes if not already cached
-                                                            let bytes_available = match ui.ctx().try_load_bytes(&uri) {
-                                                                Ok(_) => true,
-                                                                Err(_) => {
-                                                                    // Try to read and cache the file
-                                                                    if let Ok(bytes) = std::fs::read(path) {
-                                                                        ui.ctx().include_bytes(uri.clone(), bytes);
-                                                                        true
-                                                                    } else {
-                                                                        false
-                                                                    }
-                                                                }
-                                                            };
-
-                                                            if bytes_available {
-                                                                let response = ui.add(
-                                                                    egui::Image::new(&uri)
-                                                                        .max_width(300.0)
-                                                                        .max_height(200.0)
-                                                                        .corner_radius(4.0)
-                                                                        .sense(egui::Sense::click()),
-                                                                );
-                                                                if response.hovered() {
-                                                                    ui.ctx().set_cursor_icon(
-                                                                        egui::CursorIcon::PointingHand,
-                                                                    );
-                                                                    // Draw hover border
-                                                                    let rect = response.rect;
-                                                                    let stroke = egui::Stroke::new(
-                                                                        2.0,
-                                                                        ui.visuals().selection.stroke.color,
-                                                                    );
-                                                                    ui.painter().rect_stroke(
-                                                                        rect,
-                                                                        4.0,
-                                                                        stroke,
-                                                                        egui::StrokeKind::Outside,
-                                                                    );
-                                                                }
-                                                                if response.clicked() {
-                                                                    self.image_view_modal = ImageViewModalState {
-                                                                        open: true,
-                                                                        image_uri: format!(
-                                                                            "bytes://file_fullsize/{}",
-                                                                            infohash_hex
-                                                                        ),
-                                                                        image_name: file_msg.file.name.clone(),
-                                                                        file_path: Some(path.clone()),
-                                                                        zoom: 1.0,
-                                                                        fullsize_loaded: false,
-                                                                    };
-                                                                }
-                                                                image_shown = true;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-
-                                                ui.horizontal(|ui| {
-                                                    // File icon based on mime type (skip if image preview was shown)
-                                                    if !image_shown {
-                                                        let icon = get_file_icon(&file_msg.file.mime);
-                                                        ui.label(egui::RichText::new(icon).size(24.0));
-                                                    }
-
-                                                    ui.vertical(|ui| {
-                                                        // Sender and timestamp
-                                                        ui.horizontal(|ui| {
-                                                            ui.label(egui::RichText::new(&msg.sender).strong());
-                                                            if !timestamp_prefix.is_empty() {
-                                                                ui.label(
-                                                                    egui::RichText::new(&timestamp_prefix)
-                                                                        .small()
-                                                                        .color(egui::Color32::GRAY),
-                                                                );
-                                                            }
-                                                        });
-
-                                                        // File name
-                                                        ui.label(&file_msg.file.name);
-
-                                                        // Size, mime type, and status
-                                                        if is_downloading {
-                                                            if let Some(t) = transfer {
-                                                                let downloaded =
-                                                                    (file_msg.file.size as f32 * t.progress) as u64;
-                                                                ui.label(
-                                                                    egui::RichText::new(format!(
-                                                                        "{} / {} · {}/s",
-                                                                        format_size(downloaded),
-                                                                        format_size(file_msg.file.size),
-                                                                        format_size(t.download_speed)
-                                                                    ))
-                                                                    .small()
-                                                                    .color(egui::Color32::YELLOW),
-                                                                );
-                                                            }
-                                                        } else if is_paused {
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "{} · {} · Paused",
-                                                                    format_size(file_msg.file.size),
-                                                                    &file_msg.file.mime
-                                                                ))
-                                                                .small()
-                                                                .color(egui::Color32::GRAY),
-                                                            );
-                                                        } else if is_downloaded {
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "{} · {} · Downloaded ✔",
-                                                                    format_size(file_msg.file.size),
-                                                                    &file_msg.file.mime
-                                                                ))
-                                                                .small()
-                                                                .color(egui::Color32::GREEN),
-                                                            );
-                                                        } else {
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "{} · {}",
-                                                                    format_size(file_msg.file.size),
-                                                                    &file_msg.file.mime
-                                                                ))
-                                                                .small()
-                                                                .color(egui::Color32::GRAY),
-                                                            );
-                                                        }
-                                                    });
-                                                });
-
-                                                // Progress bar during download
-                                                if is_downloading {
-                                                    if let Some(t) = transfer {
-                                                        ui.add(
-                                                            egui::ProgressBar::new(t.progress)
-                                                                .show_percentage()
-                                                                .animate(true),
-                                                        );
-                                                    }
-                                                }
-
-                                                // Action buttons - different based on transfer state
-                                                ui.horizontal(|ui| {
-                                                    if is_downloaded {
-                                                        // Downloaded: show Open, Save As, Repost buttons
-                                                        if ui.button("📂 Open").clicked() {
-                                                            open_file_infohash = Some(infohash_hex.clone());
-                                                        }
-                                                        if ui.button("💾 Save As...").clicked() {
-                                                            save_file_info = Some((
-                                                                infohash_hex.clone(),
-                                                                file_msg.file.name.clone(),
-                                                            ));
-                                                        }
-                                                        if ui.button("🔄 Repost").clicked() {
-                                                            repost_text = Some(msg.text.clone());
-                                                        }
-                                                    } else if is_downloading {
-                                                        // Downloading: show Pause, Cancel buttons
-                                                        if ui.button("⏸ Pause").clicked() {
-                                                            pause_infohash = Some(infohash_hex.clone());
-                                                        }
-                                                        if ui.button("✖ Cancel").clicked() {
-                                                            cancel_infohash = Some(infohash_hex.clone());
-                                                        }
-                                                    } else if is_paused {
-                                                        // Paused: show Resume, Cancel buttons
-                                                        if ui.button("▶ Resume").clicked() {
-                                                            resume_infohash = Some(infohash_hex.clone());
-                                                        }
-                                                        if ui.button("✖ Cancel").clicked() {
-                                                            cancel_infohash = Some(infohash_hex.clone());
-                                                        }
-                                                    } else {
-                                                        // Not downloaded: show Download, Copy Magnet buttons
-                                                        if ui.button("⬇ Download").clicked() {
-                                                            download_magnet = Some(file_msg.magnet_link());
-                                                        }
-                                                        if ui.button("📋 Copy Magnet").clicked() {
-                                                            ui.ctx().copy_text(file_msg.magnet_link());
-                                                        }
-                                                    }
-                                                });
-                                            });
                                         } else {
                                             // Chat message with kind-based prefix
                                             match &msg.kind {
@@ -4477,38 +3833,6 @@ impl RumbleApp {
                                         }
                                     }
                                 });
-
-                            // Handle file actions
-                            if let Some(magnet) = download_magnet {
-                                self.backend.send(Command::DownloadFile { magnet });
-                                self.show_transfers = true;
-                            }
-                            if let Some(infohash) = open_file_infohash {
-                                self.backend.send(Command::OpenFile { infohash });
-                            }
-                            if let Some((infohash, default_name)) = save_file_info {
-                                // Spawn async save dialog
-                                let handle = self.tokio_handle.spawn(async move {
-                                    rfd::AsyncFileDialog::new()
-                                        .set_file_name(&default_name)
-                                        .save_file()
-                                        .await
-                                        .map(|f| (infohash, f.path().to_path_buf()))
-                                });
-                                self.pending_save_dialog = Some(handle);
-                            }
-                            if let Some(text) = repost_text {
-                                self.backend.send(Command::SendChat { text });
-                            }
-                            if let Some(infohash) = pause_infohash {
-                                self.backend.send(Command::PauseTransfer { infohash });
-                            }
-                            if let Some(infohash) = resume_infohash {
-                                self.backend.send(Command::ResumeTransfer { infohash });
-                            }
-                            if let Some(infohash) = cancel_infohash {
-                                self.backend.send(Command::CancelTransfer { infohash });
-                            }
                         });
                         strip.cell(|ui| {
                             ui.add_space(2.0);
