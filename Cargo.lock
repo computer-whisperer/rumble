@@ -1007,6 +1007,7 @@ dependencies = [
  "futures",
  "hex 0.4.3",
  "libp2p",
+ "mime_guess",
  "nnnoiseless",
  "open",
  "pipeline",

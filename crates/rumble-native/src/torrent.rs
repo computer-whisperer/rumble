@@ -210,59 +210,7 @@ pub struct SharedFileInfo {
 impl SharedFileInfo {
     /// Guess MIME type from filename extension.
     fn guess_mime(filename: &str) -> String {
-        let ext = std::path::Path::new(filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        match ext.as_str() {
-            // Images
-            "jpg" | "jpeg" => "image/jpeg",
-            "png" => "image/png",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "svg" => "image/svg+xml",
-            "ico" => "image/x-icon",
-            "bmp" => "image/bmp",
-            // Audio
-            "mp3" => "audio/mpeg",
-            "wav" => "audio/wav",
-            "ogg" => "audio/ogg",
-            "flac" => "audio/flac",
-            "m4a" => "audio/mp4",
-            // Video
-            "mp4" => "video/mp4",
-            "webm" => "video/webm",
-            "mkv" => "video/x-matroska",
-            "avi" => "video/x-msvideo",
-            "mov" => "video/quicktime",
-            // Documents
-            "pdf" => "application/pdf",
-            "doc" => "application/msword",
-            "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "xls" => "application/vnd.ms-excel",
-            "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "ppt" => "application/vnd.ms-powerpoint",
-            "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            // Text
-            "txt" => "text/plain",
-            "html" | "htm" => "text/html",
-            "css" => "text/css",
-            "js" => "text/javascript",
-            "json" => "application/json",
-            "xml" => "application/xml",
-            "md" => "text/markdown",
-            // Archives
-            "zip" => "application/zip",
-            "tar" => "application/x-tar",
-            "gz" => "application/gzip",
-            "rar" => "application/vnd.rar",
-            "7z" => "application/x-7z-compressed",
-            // Default
-            _ => "application/octet-stream",
-        }
-        .to_string()
+        mime_guess::from_path(filename).first_or_octet_stream().to_string()
     }
 }
 

@@ -72,53 +72,8 @@ use uuid::Uuid;
 
 /// Detect MIME type from a filename's extension.
 fn mime_from_extension(filename: &str) -> Option<String> {
-    let ext = filename.rsplit('.').next()?.to_ascii_lowercase();
-    let mime = match ext.as_str() {
-        // Images
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "bmp" => "image/bmp",
-        "ico" => "image/x-icon",
-        // Audio
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "ogg" => "audio/ogg",
-        "flac" => "audio/flac",
-        "aac" => "audio/aac",
-        "opus" => "audio/opus",
-        "m4a" => "audio/mp4",
-        // Video
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "mkv" => "video/x-matroska",
-        "avi" => "video/x-msvideo",
-        "mov" => "video/quicktime",
-        // Documents
-        "pdf" => "application/pdf",
-        "txt" => "text/plain",
-        "html" | "htm" => "text/html",
-        "css" => "text/css",
-        "js" => "application/javascript",
-        "json" => "application/json",
-        "xml" => "application/xml",
-        "csv" => "text/csv",
-        "md" => "text/markdown",
-        // Archives
-        "zip" => "application/zip",
-        "gz" | "gzip" => "application/gzip",
-        "tar" => "application/x-tar",
-        "7z" => "application/x-7z-compressed",
-        "rar" => "application/vnd.rar",
-        "xz" => "application/x-xz",
-        // Other
-        "exe" => "application/octet-stream",
-        "wasm" => "application/wasm",
-        _ => return None,
-    };
-    Some(mime.to_string())
+    let guess = mime_guess::from_path(filename).first()?;
+    Some(guess.to_string())
 }
 
 /// Map a raw error message to a user-friendly description.
