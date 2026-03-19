@@ -203,6 +203,10 @@ impl FileTransferRelayPlugin {
 
         // Store in cache.
         let actual_size = data.len() as u64;
+        // If overwriting an existing entry, subtract its size first
+        if let Some(old) = self.cache.get(&transfer_id) {
+            self.total_cached.fetch_sub(old.file_size, Ordering::Relaxed);
+        }
         self.cache.insert(
             transfer_id.clone(),
             CachedFile {

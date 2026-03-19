@@ -108,13 +108,6 @@ impl FileTransferRelayPlugin {
             room_id: parking_lot::Mutex::new(String::new()),
         }
     }
-
-    /// Set the current room ID (hex UUID string).
-    ///
-    /// Must be called before `share()` so uploads are tagged with the correct room.
-    pub fn set_room_id(&self, room_id: String) {
-        *self.room_id.lock() = room_id;
-    }
 }
 
 /// Write a stream header for the "file-relay" plugin.
@@ -360,6 +353,10 @@ async fn do_fetch(
         }
     }
 
+    if received != file_size {
+        anyhow::bail!("incomplete download: received {received} of {file_size} bytes");
+    }
+
     tokio::io::AsyncWriteExt::flush(&mut writer).await?;
 
     Ok(dest)
@@ -367,6 +364,10 @@ async fn do_fetch(
 
 #[async_trait]
 impl FileTransferPlugin for FileTransferRelayPlugin {
+    fn set_room_id(&self, room_id: String) {
+        *self.room_id.lock() = room_id;
+    }
+
     fn share(&self, path: PathBuf) -> Result<FileOffer> {
         let metadata = std::fs::metadata(&path)?;
         let file_name = path

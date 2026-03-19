@@ -120,6 +120,15 @@ pub trait FileTransferPlugin: Send + Sync + 'static {
     /// Get the local file path for a completed transfer.
     fn get_file_path(&self, id: &TransferId) -> anyhow::Result<PathBuf>;
 
+    /// Update the current room ID (e.g., hex UUID string).
+    ///
+    /// Called by the backend when the user joins or changes rooms so that
+    /// uploads are tagged with the correct room. The default is a no-op
+    /// (plugins that don't need room context can ignore it).
+    fn set_room_id(&self, _room_id: String) {
+        // Default: no-op
+    }
+
     /// Handle an incoming server-initiated stream dispatched by the stream dispatch task.
     ///
     /// Called when the server opens a bi-directional stream with a `StreamHeader`

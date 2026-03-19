@@ -414,6 +414,7 @@ async fn run_connection_task<P: Platform>(
     let mut transport: Option<P::Transport> = None;
     let mut client_name = String::new();
     let mut _session_identity: Option<SessionIdentity> = None;
+    let mut file_transfer: Option<Arc<dyn FileTransferPlugin>> = None;
 
     loop {
         tokio::select! {
@@ -495,21 +496,31 @@ async fn run_connection_task<P: Platform>(
                                     opener,
                                     downloads_dir,
                                 );
-                                let file_transfer: Option<Arc<dyn FileTransferPlugin>> =
-                                    Some(Arc::new(relay_plugin));
+                                let ft_arc: Arc<dyn FileTransferPlugin> = Arc::new(relay_plugin);
+
+                                // Set the initial room ID on the relay plugin
+                                if let Some(room_uuid) = read_state(&state).my_room_id {
+                                    ft_arc.set_room_id(room_uuid.to_string());
+                                }
+
+                                // Keep a reference for room-change updates
+                                file_transfer = Some(ft_arc.clone());
+
+                                let ft_for_dispatch: Option<Arc<dyn FileTransferPlugin>> = Some(ft_arc.clone());
 
                                 // Spawn receiver task for reliable messages
                                 let state_clone = state.clone();
                                 let repaint_clone = repaint.clone();
                                 let audio_task_clone = audio_task.clone();
                                 let command_tx_clone = command_tx.clone();
+                                let ft_for_recv = Some(ft_arc);
                                 tokio::spawn(async move {
-                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone).await;
+                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv).await;
                                 });
 
                                 // Spawn stream dispatch task for server-initiated bi-directional streams
                                 tokio::spawn(async move {
-                                    run_stream_dispatch(bi_handle, file_transfer).await;
+                                    run_stream_dispatch(bi_handle, ft_for_dispatch).await;
                                 });
                             }
                             Err(e) => {
@@ -645,21 +656,31 @@ async fn run_connection_task<P: Platform>(
                                         opener,
                                         downloads_dir,
                                     );
-                                    let file_transfer: Option<Arc<dyn FileTransferPlugin>> =
-                                        Some(Arc::new(relay_plugin));
+                                    let ft_arc: Arc<dyn FileTransferPlugin> = Arc::new(relay_plugin);
+
+                                    // Set the initial room ID on the relay plugin
+                                    if let Some(room_uuid) = read_state(&state).my_room_id {
+                                        ft_arc.set_room_id(room_uuid.to_string());
+                                    }
+
+                                    // Keep a reference for room-change updates
+                                    file_transfer = Some(ft_arc.clone());
+
+                                    let ft_for_dispatch: Option<Arc<dyn FileTransferPlugin>> = Some(ft_arc.clone());
 
                                     // Spawn receiver task
                                     let state_clone = state.clone();
                                     let repaint_clone = repaint.clone();
                                     let audio_task_clone = audio_task.clone();
                                     let command_tx_clone = command_tx.clone();
+                                    let ft_for_recv = Some(ft_arc);
                                     tokio::spawn(async move {
-                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone).await;
+                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv).await;
                                     });
 
                                     // Spawn stream dispatch task for server-initiated bi-directional streams
                                     tokio::spawn(async move {
-                                        run_stream_dispatch(bi_handle, file_transfer).await;
+                                        run_stream_dispatch(bi_handle, ft_for_dispatch).await;
                                     });
                                 }
                                 Err(e) => {
@@ -698,6 +719,7 @@ async fn run_connection_task<P: Platform>(
                         if let Some(t) = transport.take() {
                             t.close().await;
                         }
+                        file_transfer = None;
                         {
                             let mut s = write_state(&state);
                             s.connection = ConnectionState::Disconnected;
@@ -994,9 +1016,39 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::ShareFile { path } => {
-                        // TODO: Wire up relay-based file sharing via FileTransferPlugin.
-                        warn!("ShareFile not yet wired up to relay plugin: {:?}", path);
-                        add_local_message(&state, "File sharing is not currently available".to_string(), &repaint);
+                        if let Some(ref ft) = file_transfer {
+                            match ft.share(path) {
+                                Ok(offer) => {
+                                    info!("File shared via relay: {} ({})", offer.name, offer.id.0);
+                                    // Broadcast the share_data to the room via chat
+                                    if let Some(t) = &mut transport {
+                                        let env = proto::Envelope {
+                                            state_hash: Vec::new(),
+                                            payload: Some(Payload::ChatMessage(proto::ChatMessage {
+                                                id: uuid::Uuid::new_v4().into_bytes().to_vec(),
+                                                sender: String::new(),
+                                                text: format!("[file:{}]", offer.share_data),
+                                                timestamp_ms: std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_millis() as i64,
+                                                ..Default::default()
+                                            })),
+                                        };
+                                        if let Err(e) = send_envelope(t, &env).await {
+                                            error!("Failed to send file share message: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("File share failed: {}", e);
+                                    add_local_message(&state, format!("File share failed: {}", e), &repaint);
+                                }
+                            }
+                        } else {
+                            warn!("ShareFile: no file transfer plugin available");
+                            add_local_message(&state, "File sharing is not currently available".to_string(), &repaint);
+                        }
                     }
 
                     Command::RequestChatHistory => {
@@ -1329,12 +1381,13 @@ async fn run_receiver_task(
     repaint: Arc<dyn Fn() + Send + Sync>,
     audio_task: AudioTaskHandle,
     command_tx: mpsc::UnboundedSender<Command>,
+    file_transfer: Option<Arc<dyn FileTransferPlugin>>,
 ) {
     loop {
         match recv.recv().await {
             Ok(Some(frame)) => {
                 if let Ok(env) = proto::Envelope::decode(&*frame) {
-                    handle_server_message(env, &state, &repaint, &audio_task, &command_tx);
+                    handle_server_message(env, &state, &repaint, &audio_task, &command_tx, &file_transfer);
                 }
             }
             Ok(None) => {
@@ -1442,6 +1495,7 @@ fn handle_server_message(
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_task: &AudioTaskHandle,
     command_tx: &mpsc::UnboundedSender<Command>,
+    file_transfer: &Option<Arc<dyn FileTransferPlugin>>,
 ) {
     match env.payload {
         Some(Payload::CommandResult(cr)) => {
@@ -1502,7 +1556,7 @@ fn handle_server_message(
                         repaint();
                     }
                     proto::server_event::Kind::StateUpdate(su) => {
-                        apply_state_update(su, state, repaint, audio_task);
+                        apply_state_update(su, state, repaint, audio_task, file_transfer);
                     }
                     proto::server_event::Kind::ChatBroadcast(cb) => {
                         // Extract message ID or generate a fallback
@@ -1632,6 +1686,7 @@ fn apply_state_update(
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_task: &AudioTaskHandle,
+    file_transfer: &Option<Arc<dyn FileTransferPlugin>>,
 ) {
     if let Some(u) = update.update {
         let mut s = write_state(&state);
@@ -1775,6 +1830,11 @@ fn apply_state_update(
                     // Check if this is us moving
                     if my_user_id == Some(uid.value) {
                         s.my_room_id = to_room_id;
+
+                        // Update the relay plugin's room ID
+                        if let Some(ft) = file_transfer {
+                            ft.set_room_id(to_room_id.map(|r| r.to_string()).unwrap_or_default());
+                        }
 
                         // We changed rooms - rebuild decoder list
                         if let Some(new_room_id) = to_room_id {
