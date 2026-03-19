@@ -1034,7 +1034,7 @@ async fn start_server(port: u16) -> Result<ServerHandle> {
         key,
         data_dir: None,
         welcome_message: None,
-        plugins: vec![],
+        plugins: vec![Box::new(server::FileTransferRelayPlugin::new())],
     };
 
     let server = Server::new(config)?;

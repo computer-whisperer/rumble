@@ -17,8 +17,8 @@
 //! Run with `--help` for available options.
 
 use anyhow::Result;
-use server::{Config, FileTransferRelayPlugin, Persistence, Server, ServerConfig};
-use tracing::info;
+use server::{Config, FileTransferRelayFactory, Persistence, Server, ServerConfig, plugin::PluginFactory};
+use tracing::{info, warn};
 
 /// Handle admin CLI subcommands that run against the database and then exit.
 /// Returns `Some(())` if a subcommand was handled, `None` if normal startup should proceed.
@@ -117,13 +117,37 @@ async fn main() -> Result<()> {
         info!("Welcome message: {}", msg);
     }
 
+    // Construct plugins via factories, passing config sections from TOML
+    let factories: Vec<Box<dyn PluginFactory>> = vec![Box::new(FileTransferRelayFactory)];
+
+    let mut plugins: Vec<Box<dyn server::ServerPlugin>> = Vec::new();
+    for factory in &factories {
+        let section = server_config.plugins.get(factory.name()).cloned();
+        match factory.create(section) {
+            Ok(plugin) => {
+                info!("loaded plugin: {}", factory.name());
+                plugins.push(plugin);
+            }
+            Err(e) => {
+                anyhow::bail!("failed to configure plugin '{}': {}", factory.name(), e);
+            }
+        }
+    }
+
+    // Warn about unknown plugin sections in config
+    for key in server_config.plugins.keys() {
+        if !factories.iter().any(|f| f.name() == key) {
+            warn!("unknown plugin in config: [plugins.{}]", key);
+        }
+    }
+
     let config = Config {
         bind: server_config.bind,
         certs,
         key,
         data_dir,
         welcome_message: server_config.welcome_message,
-        plugins: vec![Box::new(FileTransferRelayPlugin::new())],
+        plugins,
     };
 
     let server = Server::new(config)?;

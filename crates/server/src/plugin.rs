@@ -169,6 +169,21 @@ impl ServerCtx {
     }
 }
 
+/// Factory for constructing a configured server plugin.
+///
+/// Each plugin provides a factory that knows how to deserialize its
+/// own config section from TOML and construct a plugin instance.
+/// The server passes raw TOML `[plugins.<name>]` sections to matching
+/// factories at startup.
+pub trait PluginFactory: Send + Sync {
+    /// Plugin name — matches the `[plugins.<name>]` section in the config file.
+    fn name(&self) -> &str;
+
+    /// Create the plugin from an optional TOML config section.
+    /// If `None`, the plugin should use its default configuration.
+    fn create(&self, config: Option<toml::Value>) -> anyhow::Result<Box<dyn ServerPlugin>>;
+}
+
 /// A server plugin that can handle messages and streams.
 ///
 /// Plugins are registered at server startup and receive callbacks

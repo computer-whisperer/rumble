@@ -17,6 +17,7 @@ use clap::Parser;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     io::BufReader,
     net::SocketAddr,
@@ -66,6 +67,17 @@ domain = "localhost"
 # If not set, no welcome message is sent.
 # Can also be set via RUMBLE_WELCOME_MESSAGE environment variable.
 # welcome_message = "Welcome to the Rumble server!"
+
+# Plugin Configuration
+# ====================
+# Each plugin has its own [plugins.<name>] section.
+# Omit a section to use the plugin's default settings.
+
+# [plugins.file-relay]
+# ttl = "30m"                    # Cache entry lifetime
+# max_file_size = "100 MB"       # Max single file upload
+# max_total_size = "500 MB"      # Max total cache size
+# evict_on_room_clear = true     # Evict when room empties
 "#;
 
 /// Command-line arguments for the server.
@@ -127,6 +139,11 @@ pub struct FileConfig {
     /// Welcome message (MOTD) sent to clients after authentication.
     #[serde(default)]
     pub welcome_message: Option<String>,
+
+    /// Plugin configuration sections.
+    /// Each key is a plugin name, value is plugin-specific TOML.
+    #[serde(default)]
+    pub plugins: HashMap<String, toml::Value>,
 }
 
 fn default_bind() -> String {
@@ -158,6 +175,7 @@ impl Default for FileConfig {
             cert_dir: default_cert_dir(),
             domain: default_domain(),
             welcome_message: None,
+            plugins: HashMap::new(),
         }
     }
 }
@@ -181,6 +199,8 @@ pub struct ServerConfig {
     pub base_dir: PathBuf,
     /// Welcome message (MOTD) sent to clients after authentication.
     pub welcome_message: Option<String>,
+    /// Plugin configuration sections (raw TOML, passed to plugin factories).
+    pub plugins: HashMap<String, toml::Value>,
 }
 
 impl ServerConfig {
@@ -262,6 +282,7 @@ impl ServerConfig {
             domain,
             base_dir,
             welcome_message,
+            plugins: file_config.plugins,
         })
     }
 

@@ -49,24 +49,48 @@ struct CachedFile {
 }
 
 /// Configuration for the relay cache.
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct RelayCacheConfig {
-    /// Max age of a cache entry (default 30 min).
+    /// Cache entry lifetime (default "30m").
+    #[serde(default = "default_ttl", with = "humantime_serde")]
     pub ttl: Duration,
+
     /// Evict entries when their room empties (default true).
+    #[serde(default = "default_evict_on_room_clear")]
     pub evict_on_room_clear: bool,
-    /// Max total cache size in bytes (default 500 MB).
-    pub max_total_size: u64,
-    /// Max single file size in bytes (default 100 MB).
-    pub max_file_size: u64,
+
+    /// Max total cache size (default "500 MB").
+    #[serde(default = "default_max_total_size")]
+    pub max_total_size: bytesize::ByteSize,
+
+    /// Max single file size (default "100 MB").
+    #[serde(default = "default_max_file_size")]
+    pub max_file_size: bytesize::ByteSize,
+}
+
+fn default_ttl() -> Duration {
+    Duration::from_secs(30 * 60)
+}
+
+fn default_evict_on_room_clear() -> bool {
+    true
+}
+
+fn default_max_total_size() -> bytesize::ByteSize {
+    bytesize::ByteSize::mb(500)
+}
+
+fn default_max_file_size() -> bytesize::ByteSize {
+    bytesize::ByteSize::mb(100)
 }
 
 impl Default for RelayCacheConfig {
     fn default() -> Self {
         Self {
-            ttl: Duration::from_secs(30 * 60),
-            evict_on_room_clear: true,
-            max_total_size: 500 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
+            ttl: default_ttl(),
+            evict_on_room_clear: default_evict_on_room_clear(),
+            max_total_size: default_max_total_size(),
+            max_file_size: default_max_file_size(),
         }
     }
 }
@@ -135,7 +159,7 @@ impl FileTransferRelayPlugin {
         );
 
         // Validate file size limit.
-        if upload.file_size > self.config.max_file_size {
+        if upload.file_size > self.config.max_file_size.as_u64() {
             let resp = proto::RelayUploadResponse {
                 status: proto::RelayResult::TooLarge.into(),
                 error: format!(
@@ -149,7 +173,7 @@ impl FileTransferRelayPlugin {
 
         // Check total cache quota (approximate — race-free enough for our purposes).
         let current_total = self.total_cached.load(Ordering::Relaxed);
-        if current_total + upload.file_size > self.config.max_total_size {
+        if current_total + upload.file_size > self.config.max_total_size.as_u64() {
             let resp = proto::RelayUploadResponse {
                 status: proto::RelayResult::TooLarge.into(),
                 error: "server cache full".to_owned(),
@@ -458,9 +482,9 @@ impl ServerPlugin for FileTransferRelayPlugin {
         });
 
         info!(
-            ttl_secs = self.config.ttl.as_secs(),
-            max_file = self.config.max_file_size,
-            max_total = self.config.max_total_size,
+            ttl = ?self.config.ttl,
+            max_file = %self.config.max_file_size,
+            max_total = %self.config.max_total_size,
             "file relay plugin started"
         );
 
@@ -471,5 +495,22 @@ impl ServerPlugin for FileTransferRelayPlugin {
         self.cancel.cancel();
         info!("file relay plugin stopped");
         Ok(())
+    }
+}
+
+/// Factory for creating [`FileTransferRelayPlugin`] from TOML config.
+pub struct FileTransferRelayFactory;
+
+impl crate::plugin::PluginFactory for FileTransferRelayFactory {
+    fn name(&self) -> &str {
+        "file-relay"
+    }
+
+    fn create(&self, config: Option<toml::Value>) -> anyhow::Result<Box<dyn ServerPlugin>> {
+        let config: RelayCacheConfig = match config {
+            Some(v) => v.try_into()?,
+            None => RelayCacheConfig::default(),
+        };
+        Ok(Box::new(FileTransferRelayPlugin::with_config(config)))
     }
 }
