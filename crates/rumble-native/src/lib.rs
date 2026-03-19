@@ -20,7 +20,9 @@ pub use codec::{NativeOpusCodec, NativeOpusDecoder, NativeOpusEncoder};
 pub use file_transfer_relay::FileTransferRelayPlugin;
 pub use keys::NativeKeySigning;
 pub use storage::FileStorage;
-pub use transport::{QuinnDatagramHandle, QuinnRecvStream, QuinnTransport};
+pub use transport::{
+    QuinnBiRecvStream, QuinnBiSendStream, QuinnBiStreamHandle, QuinnDatagramHandle, QuinnRecvStream, QuinnTransport,
+};
 
 // Re-export quinn::Connection for downstream crates that need raw QUIC access
 // (e.g., mumble-bridge for datagrams and close detection)

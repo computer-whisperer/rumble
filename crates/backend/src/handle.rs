@@ -52,10 +52,10 @@ use api::{
 use ed25519_dalek::SigningKey;
 use prost::Message;
 use rumble_client::{
-    AudioBackend, Platform,
+    AudioBackend, FileTransferPlugin, Platform, StreamHeader,
     auth::{send_envelope, wait_for_auth_result, wait_for_server_hello},
     cert::{CapturedCert, is_cert_error_message, new_captured_cert, take_captured_cert},
-    transport::{TlsConfig, Transport, TransportRecvStream},
+    transport::{BiStreamHandle, TlsConfig, Transport, TransportRecvStream},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -477,6 +477,10 @@ async fn run_connection_task<P: Platform>(
 
                                 // Split off the receive stream for the receiver task
                                 let recv_stream = new_transport.take_recv();
+
+                                // Get a bi-stream handle for the stream dispatch task
+                                let bi_handle = new_transport.bi_stream_handle();
+
                                 transport = Some(new_transport);
 
                                 // Spawn receiver task for reliable messages
@@ -486,6 +490,12 @@ async fn run_connection_task<P: Platform>(
                                 let command_tx_clone = command_tx.clone();
                                 tokio::spawn(async move {
                                     run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone).await;
+                                });
+
+                                // Spawn stream dispatch task for server-initiated bi-directional streams
+                                let file_transfer: Option<Arc<dyn FileTransferPlugin>> = None; // TODO: wire up file transfer plugin
+                                tokio::spawn(async move {
+                                    run_stream_dispatch(bi_handle, file_transfer).await;
                                 });
                             }
                             Err(e) => {
@@ -603,6 +613,10 @@ async fn run_connection_task<P: Platform>(
 
                                     // Split off the receive stream for the receiver task
                                     let recv_stream = new_transport.take_recv();
+
+                                    // Get a bi-stream handle for the stream dispatch task
+                                    let bi_handle = new_transport.bi_stream_handle();
+
                                     transport = Some(new_transport);
 
                                     // Spawn receiver task
@@ -612,6 +626,12 @@ async fn run_connection_task<P: Platform>(
                                     let command_tx_clone = command_tx.clone();
                                     tokio::spawn(async move {
                                         run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone).await;
+                                    });
+
+                                    // Spawn stream dispatch task for server-initiated bi-directional streams
+                                    let file_transfer: Option<Arc<dyn FileTransferPlugin>> = None; // TODO: wire up file transfer plugin
+                                    tokio::spawn(async move {
+                                        run_stream_dispatch(bi_handle, file_transfer).await;
                                     });
                                 }
                                 Err(e) => {
@@ -1320,6 +1340,52 @@ async fn run_receiver_task(
         }
     }
     repaint();
+}
+
+/// Background task that accepts server-initiated bi-directional streams
+/// and dispatches them to the appropriate plugin based on `StreamHeader`.
+async fn run_stream_dispatch<H: BiStreamHandle>(bi_handle: H, file_transfer: Option<Arc<dyn FileTransferPlugin>>) {
+    loop {
+        match bi_handle.accept_bi().await {
+            Ok(Some((send, mut recv))) => {
+                // Read the StreamHeader to determine which plugin should handle this stream.
+                let header = match StreamHeader::read_from(&mut recv).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("failed to read stream header: {e}");
+                        continue;
+                    }
+                };
+
+                debug!(plugin = %header.plugin, "dispatching incoming stream");
+
+                match header.plugin.as_str() {
+                    "file-relay" => {
+                        if let Some(ref ft) = file_transfer {
+                            let ft = ft.clone();
+                            tokio::spawn(async move {
+                                ft.on_incoming_stream(Box::new(send), Box::new(recv)).await;
+                            });
+                        } else {
+                            warn!("received file-relay stream but no file transfer plugin configured");
+                        }
+                    }
+                    other => {
+                        warn!(plugin = other, "no handler for incoming stream plugin");
+                    }
+                }
+            }
+            Ok(None) => {
+                // Connection closed.
+                debug!("stream dispatch: connection closed");
+                break;
+            }
+            Err(e) => {
+                warn!("stream dispatch accept error: {e}");
+                break;
+            }
+        }
+    }
 }
 
 /// Add a local status message to the chat.

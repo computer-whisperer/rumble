@@ -2,6 +2,10 @@
 
 use std::path::PathBuf;
 
+use async_trait::async_trait;
+
+use crate::transport::{BiRecvStream, BiSendStream};
+
 /// Unique identifier for a file transfer (typically a UUID string).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransferId(pub String);
@@ -87,9 +91,11 @@ pub struct TransferStatus {
 /// strategies (relay, direct transfer, etc.) or disable file
 /// transfer entirely.
 ///
-/// Methods are synchronous. Implementations running inside a tokio runtime
+/// Most methods are synchronous. Implementations running inside a tokio runtime
 /// should use `tokio::task::block_in_place` + `Handle::current().block_on()`
-/// for async operations.
+/// for async operations. The [`on_incoming_stream`](Self::on_incoming_stream)
+/// method is async and called from the stream dispatch task.
+#[async_trait]
 pub trait FileTransferPlugin: Send + Sync + 'static {
     /// Share a local file and return metadata for recipients.
     fn share(&self, path: PathBuf) -> anyhow::Result<FileOffer>;
@@ -113,4 +119,15 @@ pub trait FileTransferPlugin: Send + Sync + 'static {
 
     /// Get the local file path for a completed transfer.
     fn get_file_path(&self, id: &TransferId) -> anyhow::Result<PathBuf>;
+
+    /// Handle an incoming server-initiated stream dispatched by the stream dispatch task.
+    ///
+    /// Called when the server opens a bi-directional stream with a `StreamHeader`
+    /// matching this plugin. The `StreamHeader` has already been consumed from the
+    /// recv stream; the remaining bytes are plugin-specific payload.
+    ///
+    /// The default implementation drops the streams (no-op).
+    async fn on_incoming_stream(&self, _send: Box<dyn BiSendStream>, _recv: Box<dyn BiRecvStream>) {
+        // Default: no-op
+    }
 }

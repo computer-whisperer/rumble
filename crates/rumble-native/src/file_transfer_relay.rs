@@ -16,10 +16,10 @@
 //!
 //! ## Receiving flow
 //!
-//! The plugin spawns a background task that accepts incoming QUIC streams
-//! tagged with `"file-relay"`. When a stream arrives, it reads the
-//! length-prefixed [`RelayOffer`], creates a temp file, and copies bytes
-//! from the stream.
+//! The stream dispatch task in the backend accepts incoming server-initiated
+//! streams and dispatches `"file-relay"` streams to this plugin's
+//! [`on_incoming_stream`] method. The plugin reads the length-prefixed
+//! [`RelayOffer`], creates a temp file, and copies bytes from the stream.
 
 use std::{
     collections::HashMap,
@@ -29,8 +29,12 @@ use std::{
 
 use anyhow::Result;
 use api::proto;
+use async_trait::async_trait;
 use prost::Message;
-use rumble_client::file_transfer::{FileOffer, FileTransferPlugin, TransferId, TransferStatus};
+use rumble_client::{
+    file_transfer::{FileOffer, FileTransferPlugin, TransferId, TransferStatus},
+    transport::{BiRecvStream, BiSendStream},
+};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -101,43 +105,35 @@ enum Command {
 /// Relay-based [`FileTransferPlugin`] implementation for native desktop clients.
 ///
 /// Construct with [`FileTransferRelayPlugin::new`], passing a `quinn::Connection`
-/// and a downloads directory. The plugin spawns a background task to process
-/// outgoing commands and incoming streams.
+/// and a downloads directory. The plugin spawns a background worker task to
+/// process outgoing send commands. Incoming streams are dispatched by the
+/// backend's stream dispatch task via [`on_incoming_stream`].
 pub struct FileTransferRelayPlugin {
     transfers: Arc<Mutex<HashMap<String, TransferEntry>>>,
     cmd_tx: mpsc::UnboundedSender<Command>,
-    /// Stored for potential future use (e.g., listing downloaded files).
-    _downloads_dir: PathBuf,
+    downloads_dir: PathBuf,
 }
 
 impl FileTransferRelayPlugin {
     /// Create a new relay file transfer plugin.
     ///
-    /// - `conn`: The QUIC connection to the server.
+    /// - `conn`: The QUIC connection to the server (used for outgoing sends).
     /// - `downloads_dir`: Directory where incoming files are saved.
     pub fn new(conn: quinn::Connection, downloads_dir: PathBuf) -> Self {
         let transfers: Arc<Mutex<HashMap<String, TransferEntry>>> = Arc::new(Mutex::new(HashMap::new()));
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        // Spawn the background worker.
+        // Spawn the background worker for outgoing sends.
         let worker_transfers = transfers.clone();
-        let worker_conn = conn.clone();
         let worker_downloads = downloads_dir.clone();
         tokio::spawn(async move {
-            run_worker(worker_conn, cmd_rx, worker_transfers, worker_downloads).await;
-        });
-
-        // Spawn the incoming stream listener.
-        let recv_transfers = transfers.clone();
-        let recv_downloads = downloads_dir.clone();
-        tokio::spawn(async move {
-            run_incoming_listener(conn, recv_transfers, recv_downloads).await;
+            run_worker(conn, cmd_rx, worker_transfers, worker_downloads).await;
         });
 
         Self {
             transfers,
             cmd_tx,
-            _downloads_dir: downloads_dir,
+            downloads_dir,
         }
     }
 
@@ -170,6 +166,7 @@ impl FileTransferRelayPlugin {
     }
 }
 
+#[async_trait]
 impl FileTransferPlugin for FileTransferRelayPlugin {
     fn share(&self, path: PathBuf) -> Result<FileOffer> {
         let metadata = std::fs::metadata(&path)?;
@@ -235,8 +232,7 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
 
         // For the relay model, the download is initiated by the sender pushing
         // data through the server (incoming stream). The download() call just
-        // registers interest. The actual data arrives via the incoming stream
-        // listener.
+        // registers interest. The actual data arrives via on_incoming_stream.
 
         Ok(TransferId(transfer_id))
     }
@@ -267,6 +263,14 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             .get(&id.0)
             .and_then(|e| e.path.clone())
             .ok_or_else(|| anyhow::anyhow!("no file path for transfer {}", id.0))
+    }
+
+    async fn on_incoming_stream(&self, _send: Box<dyn BiSendStream>, recv: Box<dyn BiRecvStream>) {
+        let transfers = self.transfers.clone();
+        let downloads_dir = self.downloads_dir.clone();
+        if let Err(e) = handle_incoming_relay(recv, transfers, downloads_dir).await {
+            warn!("incoming relay error: {e}");
+        }
     }
 }
 
@@ -386,71 +390,25 @@ async fn send_file(
     Ok(())
 }
 
-/// Listen for incoming QUIC streams from the server that carry relay file data.
-async fn run_incoming_listener(
-    conn: quinn::Connection,
-    transfers: Arc<Mutex<HashMap<String, TransferEntry>>>,
-    downloads_dir: PathBuf,
-) {
-    loop {
-        match conn.accept_bi().await {
-            Ok((send, mut recv)) => {
-                // Probe for "file-relay" stream header.
-                let mut len_buf = [0u8; 2];
-                if recv.read_exact(&mut len_buf).await.is_err() {
-                    continue;
-                }
-                let name_len = u16::from_be_bytes(len_buf) as usize;
-                if name_len == 0 || name_len > 255 {
-                    continue;
-                }
-                let mut name_buf = vec![0u8; name_len];
-                if recv.read_exact(&mut name_buf).await.is_err() {
-                    continue;
-                }
-                let plugin_name = match std::str::from_utf8(&name_buf) {
-                    Ok(s) => s.to_owned(),
-                    Err(_) => continue,
-                };
-
-                if plugin_name != "file-relay" {
-                    // Not our stream; drop it.
-                    continue;
-                }
-
-                let transfers = transfers.clone();
-                let downloads_dir = downloads_dir.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_incoming_relay(send, recv, transfers, downloads_dir).await {
-                        warn!("incoming relay error: {e}");
-                    }
-                });
-            }
-            Err(_) => {
-                // Connection closed.
-                break;
-            }
-        }
-    }
-}
-
 /// Handle a single incoming relay stream (server -> client).
+///
+/// The `StreamHeader` has already been consumed by the stream dispatch task.
+/// The remaining bytes on `recv` start with a length-prefixed `RelayOffer`.
 async fn handle_incoming_relay(
-    _send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut recv: Box<dyn BiRecvStream>,
     transfers: Arc<Mutex<HashMap<String, TransferEntry>>>,
     downloads_dir: PathBuf,
 ) -> Result<()> {
     // Read length-prefixed RelayOffer.
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await?;
+    rumble_client::read_exact(&mut *recv, &mut len_buf).await?;
     let offer_len = u32::from_be_bytes(len_buf) as usize;
     if offer_len > 64 * 1024 {
         anyhow::bail!("RelayOffer too large ({offer_len} bytes)");
     }
 
     let mut offer_buf = vec![0u8; offer_len];
-    recv.read_exact(&mut offer_buf).await?;
+    rumble_client::read_exact(&mut *recv, &mut offer_buf).await?;
     let offer = proto::RelayOffer::decode(&offer_buf[..])?;
 
     let transfer_id = offer.transfer_id.clone();

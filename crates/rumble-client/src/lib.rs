@@ -28,4 +28,7 @@ pub use file_transfer::{
 pub use keys::{KeyInfo, KeySigning, KeySource};
 pub use platform::Platform;
 pub use storage::PersistentStorage;
-pub use transport::{DatagramTransport, TlsConfig, Transport, TransportRecvStream};
+pub use transport::{
+    BiRecvStream, BiSendStream, BiStreamHandle, DatagramTransport, StreamHeader, TlsConfig, Transport,
+    TransportRecvStream, read_exact,
+};

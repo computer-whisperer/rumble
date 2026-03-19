@@ -10,7 +10,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
-use rumble_client::transport::{DatagramTransport, TlsConfig, Transport, TransportRecvStream};
+use rumble_client::transport::{
+    BiRecvStream, BiSendStream, BiStreamHandle, DatagramTransport, TlsConfig, Transport, TransportRecvStream,
+};
 use rustls::RootCertStore;
 
 use crate::cert_verifier::{AcceptAllVerifier, FingerprintVerifier, InteractiveCertVerifier};
@@ -72,6 +74,64 @@ impl TransportRecvStream for QuinnRecvStream {
     }
 }
 
+/// Send half of a server-initiated bi-directional QUIC stream.
+pub struct QuinnBiSendStream(pub quinn::SendStream);
+
+#[async_trait]
+impl BiSendStream for QuinnBiSendStream {
+    async fn write_all(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        self.0.write_all(data).await?;
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> anyhow::Result<()> {
+        self.0.finish()?;
+        Ok(())
+    }
+}
+
+/// Recv half of a server-initiated bi-directional QUIC stream.
+pub struct QuinnBiRecvStream(pub quinn::RecvStream);
+
+#[async_trait]
+impl BiRecvStream for QuinnBiRecvStream {
+    async fn read(&mut self, buf: &mut [u8]) -> anyhow::Result<Option<usize>> {
+        match self.0.read(buf).await? {
+            Some(n) => Ok(Some(n)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Cloneable handle for accepting/opening bi-directional streams on a QUIC connection.
+///
+/// Wraps a `quinn::Connection` (which is internally `Arc`-based and cheaply cloneable).
+/// Used by the stream dispatch task to accept server-initiated streams independently
+/// of the connection task.
+#[derive(Clone)]
+pub struct QuinnBiStreamHandle {
+    connection: quinn::Connection,
+}
+
+#[async_trait]
+impl BiStreamHandle for QuinnBiStreamHandle {
+    type BiSend = QuinnBiSendStream;
+    type BiRecv = QuinnBiRecvStream;
+
+    async fn accept_bi(&self) -> anyhow::Result<Option<(Self::BiSend, Self::BiRecv)>> {
+        match self.connection.accept_bi().await {
+            Ok((send, recv)) => Ok(Some((QuinnBiSendStream(send), QuinnBiRecvStream(recv)))),
+            Err(quinn::ConnectionError::LocallyClosed) | Err(quinn::ConnectionError::ApplicationClosed(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn open_bi(&self) -> anyhow::Result<(Self::BiSend, Self::BiRecv)> {
+        let (send, recv) = self.connection.open_bi().await?;
+        Ok((QuinnBiSendStream(send), QuinnBiRecvStream(recv)))
+    }
+}
+
 /// QUIC transport backed by the quinn library.
 pub struct QuinnTransport {
     connection: quinn::Connection,
@@ -94,6 +154,9 @@ impl QuinnTransport {
 impl Transport for QuinnTransport {
     type Datagram = QuinnDatagramHandle;
     type RecvStream = QuinnRecvStream;
+    type BiSend = QuinnBiSendStream;
+    type BiRecv = QuinnBiRecvStream;
+    type BiHandle = QuinnBiStreamHandle;
 
     async fn connect(addr: &str, tls_config: TlsConfig) -> anyhow::Result<Self> {
         const DEFAULT_PORT: u16 = 5000;
@@ -262,6 +325,25 @@ impl Transport for QuinnTransport {
 
     fn datagram_handle(&self) -> Self::Datagram {
         QuinnDatagramHandle::new(self.connection.clone())
+    }
+
+    fn bi_stream_handle(&self) -> Self::BiHandle {
+        QuinnBiStreamHandle {
+            connection: self.connection.clone(),
+        }
+    }
+
+    async fn accept_bi(&self) -> anyhow::Result<Option<(Self::BiSend, Self::BiRecv)>> {
+        match self.connection.accept_bi().await {
+            Ok((send, recv)) => Ok(Some((QuinnBiSendStream(send), QuinnBiRecvStream(recv)))),
+            Err(quinn::ConnectionError::LocallyClosed) | Err(quinn::ConnectionError::ApplicationClosed(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn open_bi(&self) -> anyhow::Result<(Self::BiSend, Self::BiRecv)> {
+        let (send, recv) = self.connection.open_bi().await?;
+        Ok((QuinnBiSendStream(send), QuinnBiRecvStream(recv)))
     }
 
     fn peer_certificate_der(&self) -> Option<Vec<u8>> {
