@@ -1,6 +1,6 @@
 # V2 Architecture Migration — Progress & Remaining Work
 
-**Last updated:** 2026-03-13
+**Last updated:** 2026-03-17
 **Design doc:** `docs/v2-architecture.md`
 
 ---
@@ -22,151 +22,140 @@
 | **5e** | Switch `mumble-bridge` to rumble-client | Done | `7b5485d` |
 | **5f** | Backend dead code removal | Done | `7b5485d` |
 | **5g** | Auth deduplication | Done | `7a568be` |
-| **5h** | Extract torrent.rs to rumble-native | Done | `31f87cd` |
-| **5i** | File-transfer-relay plugin | Done | `d5b9e55` |
+| **5h–5i** | BitTorrent relay (superseded) | Deprecated | See file transfer rework |
 | **6** | WASM platform | Deferred indefinitely | — |
 
----
+### File Transfer Rework (2026-03-17)
 
-## Architecture Review (2026-03-12)
-
-A thorough review of the v2 implementation against the design document was conducted across all six major components. Key findings:
-
-### Trait Alignment
-
-All 7 trait families in `rumble-client` match the design doc signatures precisely. Intentional enhancements beyond the design:
-- **Transport split**: `DatagramTransport` + `TransportRecvStream` subtypes support the two-task architecture
-- **TlsConfig extension**: `captured_cert` field enables interactive cert verification UX
-- **FileTransferPlugin**: `download()` returns `TransferId` instead of `TransferHandle` (simpler API)
-- **AudioBackend**: `Default` supertrait added for ergonomic construction in generic code
-
-### rumble-native Implementations
-
-All 6 Platform trait impls are complete with no stubs or `todo!()`. Test coverage: codec (5), storage (7), keys (4), transport (0), audio (0), cert_verifier (0).
-
-### Server Plugin System
-
-Complete and production-ready: `ServerPlugin` trait, `ServerCtx`, `StreamHeader`, stream dispatch, `FileTransferBittorrentPlugin`. Plugins get first look at messages before built-in handlers.
-
-### Backend Generics
-
-`BackendHandle<P: Platform>` fully generic. Zero `quinn::` references in handle.rs. Audio task generic over Platform. ~2,350 lines of dead code removed (audio.rs 698→16, codec.rs 674→36).
-
-### Issues Identified
-
-1. **Auth handshake duplication** — `send_envelope`, `wait_for_server_hello`, `wait_for_auth_result` duplicated between handle.rs and mumble-bridge. Bridge version also drops `groups` from `wait_for_auth_result` (bug). → Phase 5g
-2. **TorrentManager not behind trait** — Still uses `dyn Any` downcast hack to get raw quinn::Connection. Needs extraction to rumble-native as `FileTransferPlugin` impl. → Phase 5h
-3. **No file-transfer-relay plugin** — Design specifies simple relay as priority, but only BitTorrent plugin exists. The `on_stream()` dispatch infrastructure is unused. → Phase 5i
-4. **p2p.rs still in backend** — Should move to rumble-native (feature-gated). Lower priority than torrent extraction.
+| Phase | Description | Status | Commits |
+|-------|-------------|--------|---------|
+| Bug fixes | Path traversal, infohash dedup, proto enum | Done | `f30d7ad` |
+| MIME consolidation | Replace manual match with `mime_guess` | Done | `98e0ee6` |
+| Torrent/P2P deprecation | Remove ~9,800 lines of BitTorrent + libp2p | Done | `7309300` |
+| Client-side stream dispatch | BiStreamHandle, StreamHeader, dispatch loop | Done | `9cd5dee` |
+| Relay rework | Store-and-serve cache model (server + client) | Done | `8aeb269` |
+| Review fixes | room_id wiring, truncation check, quota fix | Done | `d0b1602` |
+| Plugin config system | PluginFactory trait, TOML config, humantime/bytesize | Done | `642dee0` |
 
 ---
 
-## What's Done
+## Current Architecture
 
-### Phase 1 — Shared types in `api`
+### Platform Abstraction (Phases 1–5f)
 
-State, Command, AudioDeviceInfo, EncoderSettings, SigningCallback, and other shared types live in `api/src/types.rs`. Both `backend` and `egui-test` import from `api`.
+All 7 trait families in `rumble-client` implemented in `rumble-native`:
 
-### Phase 2a — Trait definitions in `rumble-client`
+| Trait | Impl | File |
+|-------|------|------|
+| `Platform` | `NativePlatform` | `platform.rs` |
+| `Transport` + `DatagramTransport` + `BiStreamHandle` | `QuinnTransport` | `transport.rs` |
+| `AudioBackend` | `CpalAudioBackend` | `audio.rs` |
+| `VoiceCodec` | `NativeOpusCodec` | `codec.rs` |
+| `PersistentStorage` | `FileStorage` | `storage.rs` |
+| `KeySigning` | `NativeKeySigning` | `keys.rs` |
+| `FileTransferPlugin` | `FileTransferRelayPlugin` | `file_transfer_relay.rs` |
 
-All trait families defined and exported:
+`BackendHandle<P: Platform>` is fully generic. Backend contains only platform-agnostic client logic — no cpal, quinn, opus, librqbit, or libp2p dependencies.
 
-| Trait | File | Methods |
-|-------|------|---------|
-| `Platform` | `platform.rs` | Bundle of 5 associated types |
-| `Transport` + `DatagramTransport` + `TransportRecvStream` | `transport.rs` | connect, send/recv, datagram, take_recv, close |
-| `AudioBackend` + streams | `audio.rs` | list devices, open input/output |
-| `VoiceCodec` + encoder/decoder | `codec.rs` | encode, decode, PLC, FEC, settings |
-| `PersistentStorage` | `storage.rs` | load, save, delete, list_keys |
-| `KeySigning` | `keys.rs` | list_keys, get_signer, generate, import |
-| `FileTransferPlugin` | `file_transfer.rs` | share, download, transfers, cancel |
+### File Transfer: Server-Cached Relay
 
-### Phase 3 — `rumble-native` implementations
+Replaced BitTorrent/P2P file transfer with a store-and-serve relay:
 
-All Platform trait impls with `NativePlatform` bundle:
+**Server-side** (`relay_plugin.rs`):
+- `FileTransferRelayPlugin` with `DashMap` cache, room-scoped entries
+- Upload: client streams file → server caches by transfer_id
+- Fetch: client requests by transfer_id → server streams from cache
+- Configurable via TOML: TTL, max file size, max total cache, room eviction
+- TTL sweep task, proper shutdown via CancellationToken
+- `PluginFactory` trait for config-driven construction
 
-| Impl | File | Tests |
-|------|------|-------|
-| `QuinnTransport` + `QuinnDatagramHandle` | `transport.rs` | 0 |
-| `CpalAudioBackend` + streams | `audio.rs` | 0 |
-| `NativeOpusCodec` + encoder/decoder | `codec.rs` | 5 |
-| `FileStorage` | `storage.rs` | 7 |
-| `NativeKeySigning` (local + SSH agent) | `keys.rs` | 4 |
-| `FingerprintVerifier` + `AcceptAllVerifier` + `InteractiveCertVerifier` | `cert_verifier.rs` | 0 |
+**Client-side** (`file_transfer_relay.rs`):
+- `FileTransferRelayPlugin` using `StreamOpener` (transport-agnostic)
+- `share()`: upload to server, return FileOffer with share_data JSON
+- `download()`: fetch from server by transfer_id
+- Real cancellation via per-transfer `CancellationToken`
+- `parking_lot::Mutex` for transfer state
+- Room tracking via `set_room_id()` on join/move
 
-### Phase 4 — Server plugin system
+**Wire protocol** on `"file-relay"` streams:
+- StreamHeader → type byte (0x01=upload, 0x02=fetch) → length-prefixed proto → raw file bytes
+- Proto: `RelayUpload`, `RelayUploadResponse`, `RelayFetch`, `RelayFetchResponse`, `RelayResult` enum
 
-- **ServerPlugin trait** (`plugin.rs`): `on_message`, `on_stream`, `on_disconnect`, `start`, `stop`
-- **ServerCtx**: send_to, broadcast_room, open_stream_to, state queries, persistence
-- **StreamHeader**: u16 name_len + name + metadata wire format
-- **Stream dispatch** (`server.rs`): secondary streams probed for StreamHeader, dispatched to matching plugin
-- **FileTransferBittorrentPlugin** (`tracker_plugin.rs`): TrackerAnnounce + TrackerScrape handling
+### Client-Side Stream Dispatch
 
-### Phase 5a-5f — Platform abstraction complete
+Mirrors server's stream routing pattern:
+- `BiSendStream` / `BiRecvStream` traits for stream halves
+- `BiStreamHandle` trait (cloneable, like `DatagramTransport`)
+- `StreamHeader` shared between client and server
+- `run_stream_dispatch()` in backend: accepts bi-streams, reads header, dispatches to plugins
+- `StreamOpener` trait for plugins to open outgoing streams
 
-- **5a**: `DatagramTransport` trait, audio_task decoupled from quinn
-- **5b**: `Transport::send()/recv()` in handle.rs, `TransportRecvStream`, `TlsConfig` with `CapturedCert`
-- **5c**: `BackendHandle<P: Platform>` fully generic, audio_task generic, type aliases
-- **5d**: egui-test switch via `pub type BackendHandle = handle::BackendHandle<NativePlatform>`
-- **5e**: mumble-bridge uses `QuinnTransport`, aws-lc-rs crypto
-- **5f**: Removed ~2,350 lines dead code (AudioSystem, AudioInput, AudioOutput, VoiceEncoder, VoiceDecoder, CodecError). Removed cpal + opus deps from backend.
+### Server Plugin Config System
 
-**Backend now contains only platform-agnostic client logic:**
-- `handle.rs`: Generic `BackendHandle<P: Platform>` — connection task, command handling
-- `audio_task.rs`: Generic audio task — jitter buffers, mixing, voice I/O
-- `bounded_voice.rs`, `sfx.rs`, `synth.rs`: Pure Rust utilities
-- `events.rs`, `processors/`, `rpc.rs`: State types, pipeline wrappers, RPC
-- `audio_dump.rs`: Debug utility
-- `torrent.rs`, `p2p.rs`: Deprecated, pending removal
-- `cert_verifier.rs`: Thin re-export shim
+- `PluginFactory` trait: plugins define config structs, deserialize from `[plugins.<name>]` TOML
+- `RelayCacheConfig` uses `bytesize` ("50 MB") and `humantime_serde` ("30m")
+- Factory-based construction in server startup
+- Unknown config sections logged as warnings
 
----
-
-### Phase 5g — Auth deduplication
-
-Extracted shared auth handshake helpers to `rumble-client/src/auth.rs`:
-- `send_envelope<T: Transport>()`, `wait_for_server_hello<T: Transport>()`, `wait_for_auth_result<T: Transport>()`
-- Both `handle.rs` and `mumble-bridge/rumble_client.rs` call shared versions
-- Fixed bug: bridge was dropping `groups` from `wait_for_auth_result`
-
-### Phase 5h — Extract torrent.rs to rumble-native
-
-- Moved `backend/torrent.rs` to `rumble-native/src/torrent.rs`
-- `BitTorrentFileTransfer` wraps `TorrentManager` implementing `FileTransferPlugin` trait
-- `BackendHandle` accepts `Option<Arc<dyn FileTransferPlugin>>` — but see bug #2 below
-- `FileTransferPlugin` trait expanded: `pause()`, `resume()`, `get_file_path()`, enriched `TransferStatus`
-- `librqbit` dependency moved from backend to rumble-native
-
-### Phase 5i — File-transfer-relay plugin
-
-Server-side (`relay_plugin.rs`):
-- `FileTransferRelayPlugin` — first plugin to use `on_stream()` dispatch
-- Sender opens stream → server pipes to recipient via `ctx.open_stream_to()`
-- Bidirectional copy with CancellationToken, DashMap tracking, disconnect cleanup
-- Proto: `RelayRequest`, `RelayOffer`, `RelayStatus` (field 94)
-
-Client-side (`rumble-native/src/file_transfer_relay.rs`):
-- `FileTransferRelayPlugin` implementing `FileTransferPlugin`
-- Background worker for outgoing sends, incoming stream listener for downloads
-- Progress tracking via shared `HashMap<String, TransferEntry>`
+Example config:
+```toml
+[plugins.file-relay]
+ttl = "30m"
+max_file_size = "100 MB"
+max_total_size = "500 MB"
+evict_on_room_clear = true
+```
 
 ---
 
-## Fixed Bugs
+## What Was Removed
 
-- **Path traversal in relay file download** — sanitized network-controlled filename with `Path::file_name()`
-- **Zero infohash breaks auto-download dedup** — skip dedup for all-zero infohashes (relay transfers)
+### BitTorrent/P2P System (~9,800 lines)
+
+| Component | Location | Status |
+|-----------|----------|--------|
+| `BitTorrentFileTransfer` | `rumble-native/src/file_transfer_bittorrent.rs` | Deleted |
+| `TorrentManager` | `rumble-native/src/torrent.rs` | Deleted |
+| `FileTransferBittorrentPlugin` | `server/src/tracker_plugin.rs` | Deleted |
+| `Tracker` | `server/src/tracker.rs` | Deleted |
+| TCP relay service | `server/src/relay.rs` | Deleted |
+| P2P manager | `backend/src/p2p.rs` | Deleted |
+| `librqbit` dependency | `rumble-native/Cargo.toml` | Removed |
+| `libp2p` dependency | `backend/Cargo.toml` | Removed |
+| Proto fields 50–53 (tracker) | `api.proto` | Removed |
+| Proto fields 60–63 (P2P voice) | `api.proto` | Removed |
+| `dyn Any` downcast hack | `backend/src/handle.rs` | Removed |
+| File transfer UI (magnet links, download modal) | `egui-test/src/app.rs` | Removed |
+| `FileMessage`, `P2pFileMessage`, `FileTransferState` | `api/src/types.rs` | Removed |
+| File transfer Command variants | `api/src/types.rs` | Removed |
+
+---
+
+## Bugs Fixed (2026-03-17)
+
+| Bug | Fix |
+|-----|-----|
+| Path traversal in relay download | Sanitize network filename with `Path::file_name()` |
+| Zero infohash dedup collision | Skip dedup for all-zero infohashes |
+| Proto enum `ACCEPTED = 0` | Add `UNSPECIFIED = 0`, shift `ACCEPTED` to 1 |
+| Relay cancel was a no-op | `CancellationToken` per transfer task |
+| Tasks outlive plugin on shutdown | Parent `CancellationToken` cancelled in `stop()` |
+| `std::sync::Mutex` poison ignored | Switched to `parking_lot::Mutex` |
+| Incoming stream listener steals bi-streams | Centralized client-side stream dispatch |
+| `dyn Any` downcast hack | Removed with torrent deprecation; relay uses `StreamOpener` |
+| Fragile magnet link parsing | Removed with torrent deprecation |
+| Duplicate MIME guessing | Consolidated to `mime_guess` crate |
+| `room_id` never set on relay plugin | Wired `set_room_id()` on connect + room change |
+| Truncated downloads accepted silently | Validate received bytes vs file_size |
+| Cache quota drift on overwrite | Subtract old entry size before inserting |
+
+---
 
 ## Remaining Work
 
 | Item | Priority | Notes |
 |------|----------|-------|
-| Relay plugin rework — store-and-serve cache | High | Replace point-to-point relay with server-cached upload/fetch model. Configurable eviction: TTL + room-clear. See design doc. |
-| Deprecate torrent plugin | High | Remove BitTorrentFileTransfer, TorrentManager, tracker plugin, TCP relay, librqbit, libp2p deps. Remove `torrent.rs`, `p2p.rs`, `file_transfer_bittorrent.rs`, `tracker_plugin.rs`, `relay.rs` (TCP). |
-| Client-side stream dispatch | High | Centralize `accept_bi()` in backend, route by StreamHeader like server. Extend Transport trait with stream acceptance. |
-| FileTransferPlugin factory callback | High | Remove `dyn Any` downcast hack in handle.rs. Accept plugin via factory callback in ConnectConfig, constructed by caller post-connect. |
-| Proto enum fix | Medium | Add `UNSPECIFIED = 0` to `RelayStatus.Status`, shift `ACCEPTED` to 1. |
-| MIME consolidation | Medium | Replace manual match blocks in handle.rs and torrent.rs with `mime_guess` crate. |
+| File transfer UI rework | Medium | egui-test needs new UI for relay-based sharing (old torrent UI was removed) |
 | Wire `P::Storage` and `P::KeyManager` into BackendHandle | Low | Currently deferred nice-to-haves |
 | WASM platform (Phase 6) | Deferred | Trait infrastructure ready when WASM threading stabilizes |
 
@@ -182,4 +171,6 @@ Client-side (`rumble-native/src/file_transfer_relay.rs`):
 | `rumble-native/keys.rs` | 4 | Good coverage of local keys; SSH agent untestable in CI |
 | `rumble-native/codec.rs` | 5 | Good coverage |
 | `rumble-native/storage.rs` | 7 | Good coverage |
+| `rumble-native/file_transfer_relay.rs` | 0 | Needs integration test with mock server |
+| `server/relay_plugin.rs` | 0 | Needs integration test for upload/fetch/eviction |
 | `rumble-client` (traits) | 0 | Could add mock Platform impl for trait boundary testing |
