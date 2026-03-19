@@ -1,31 +1,21 @@
 //! Relay-based file transfer plugin for native clients.
 //!
-//! Implements [`FileTransferPlugin`] by sending file data through the server
-//! as a relay. The server opens a corresponding stream to the recipient and
-//! pipes bytes through.
+//! Implements [`FileTransferPlugin`] using the server's store-and-serve cache.
 //!
-//! ## Sending flow
+//! ## Upload flow
 //!
-//! 1. `share(path)` stores the file metadata locally and returns a [`FileOffer`].
-//!    The offer's `share_data` contains a JSON-encoded [`RelayShareData`] with
-//!    the transfer_id and recipient information to be filled in later.
-//! 2. The caller sends the offer to a recipient (e.g., via chat message).
-//! 3. `send_to(transfer_id, recipient_user_id)` opens a QUIC stream to the
-//!    server tagged with StreamHeader `"file-relay"`, writes a length-prefixed
-//!    [`RelayRequest`], and then streams the file data.
+//! 1. `share(path)` reads file metadata, generates a transfer_id, and spawns an
+//!    upload task that opens a `"file-relay"` stream and sends the file to the
+//!    server's cache.
+//! 2. Returns a [`FileOffer`] whose `share_data` is JSON-encoded [`RelayShareData`].
 //!
-//! ## Receiving flow
+//! ## Download (fetch) flow
 //!
-//! The stream dispatch task in the backend accepts incoming server-initiated
-//! streams and dispatches `"file-relay"` streams to this plugin's
-//! [`on_incoming_stream`] method. The plugin reads the length-prefixed
-//! [`RelayOffer`], creates a temp file, and copies bytes from the stream.
+//! 1. `download(share_data)` parses the [`RelayShareData`], spawns a fetch task
+//!    that opens a `"file-relay"` stream and requests the file from the server.
+//! 2. The fetched data is written to the downloads directory.
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use api::proto;
@@ -33,9 +23,9 @@ use async_trait::async_trait;
 use prost::Message;
 use rumble_client::{
     file_transfer::{FileOffer, FileTransferPlugin, TransferId, TransferStatus},
-    transport::{BiRecvStream, BiSendStream},
+    transport::{BiRecvStream, BiSendStream, StreamOpener},
 };
-use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Serialized into `FileOffer.share_data` so recipients know this is a relay
@@ -45,21 +35,22 @@ pub struct RelayShareData {
     pub transfer_id: String,
     pub file_name: String,
     pub file_size: u64,
+    pub mime: String,
 }
 
 /// Internal state for a pending or active transfer.
-#[derive(Clone, Debug)]
 struct TransferEntry {
     id: TransferId,
     name: String,
     size: u64,
-    /// Local path (for outgoing transfers).
+    /// Local path (for completed downloads or outgoing uploads).
     path: Option<PathBuf>,
     progress: f32,
-    download_speed: u64,
-    upload_speed: u64,
     is_complete: bool,
+    is_upload: bool,
     error: Option<String>,
+    /// Cancellation token for this transfer's task.
+    cancel: CancellationToken,
 }
 
 impl TransferEntry {
@@ -68,6 +59,8 @@ impl TransferEntry {
             rumble_client::file_transfer::PluginTransferState::Error
         } else if self.is_complete {
             rumble_client::file_transfer::PluginTransferState::Seeding
+        } else if self.is_upload {
+            rumble_client::file_transfer::PluginTransferState::Initializing
         } else {
             rumble_client::file_transfer::PluginTransferState::Downloading
         };
@@ -76,8 +69,8 @@ impl TransferEntry {
             name: self.name.clone(),
             size: self.size,
             progress: self.progress,
-            download_speed: self.download_speed,
-            upload_speed: self.upload_speed,
+            download_speed: 0,
+            upload_speed: 0,
             peers: 0,
             state,
             is_finished: self.is_complete,
@@ -88,82 +81,288 @@ impl TransferEntry {
     }
 }
 
-/// Background command sent from the plugin API to the async worker.
-enum Command {
-    /// Initiate an outgoing relay: send file data to server for delivery to recipient.
-    Send {
-        transfer_id: String,
-        recipient_user_id: u64,
-        file_name: String,
-        file_size: u64,
-        path: PathBuf,
-    },
-    /// Cancel a transfer.
-    Cancel { transfer_id: String },
-}
+type TransferMap = Arc<parking_lot::Mutex<HashMap<String, TransferEntry>>>;
 
-/// Relay-based [`FileTransferPlugin`] implementation for native desktop clients.
+/// Relay-based [`FileTransferPlugin`] using the server's store-and-serve cache.
 ///
-/// Construct with [`FileTransferRelayPlugin::new`], passing a `quinn::Connection`
-/// and a downloads directory. The plugin spawns a background worker task to
-/// process outgoing send commands. Incoming streams are dispatched by the
-/// backend's stream dispatch task via [`on_incoming_stream`].
+/// Construct with [`FileTransferRelayPlugin::new`], passing a [`StreamOpener`]
+/// and a downloads directory.
 pub struct FileTransferRelayPlugin {
-    transfers: Arc<Mutex<HashMap<String, TransferEntry>>>,
-    cmd_tx: mpsc::UnboundedSender<Command>,
+    opener: Arc<dyn StreamOpener>,
     downloads_dir: PathBuf,
+    transfers: TransferMap,
+    /// Room ID (hex UUID string) for the current room. Updated externally.
+    room_id: parking_lot::Mutex<String>,
 }
 
 impl FileTransferRelayPlugin {
     /// Create a new relay file transfer plugin.
     ///
-    /// - `conn`: The QUIC connection to the server (used for outgoing sends).
-    /// - `downloads_dir`: Directory where incoming files are saved.
-    pub fn new(conn: quinn::Connection, downloads_dir: PathBuf) -> Self {
-        let transfers: Arc<Mutex<HashMap<String, TransferEntry>>> = Arc::new(Mutex::new(HashMap::new()));
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-
-        // Spawn the background worker for outgoing sends.
-        let worker_transfers = transfers.clone();
-        let worker_downloads = downloads_dir.clone();
-        tokio::spawn(async move {
-            run_worker(conn, cmd_rx, worker_transfers, worker_downloads).await;
-        });
-
+    /// - `opener`: Transport-agnostic stream opener for opening streams to the server.
+    /// - `downloads_dir`: Directory where fetched files are saved.
+    pub fn new(opener: Arc<dyn StreamOpener>, downloads_dir: PathBuf) -> Self {
         Self {
-            transfers,
-            cmd_tx,
+            opener,
             downloads_dir,
+            transfers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            room_id: parking_lot::Mutex::new(String::new()),
         }
     }
 
-    /// Initiate sending a previously shared file to a specific recipient.
+    /// Set the current room ID (hex UUID string).
     ///
-    /// Call this after `share()` returns a `FileOffer`, typically when the
-    /// recipient requests the file.
-    pub fn send_to(&self, transfer_id: &str, recipient_user_id: u64) -> Result<()> {
-        let entry = {
-            let transfers = self.transfers.lock().unwrap();
-            transfers
-                .get(transfer_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("unknown transfer_id: {transfer_id}"))?
-        };
-
-        let path = entry
-            .path
-            .ok_or_else(|| anyhow::anyhow!("no local path for transfer {transfer_id}"))?;
-
-        self.cmd_tx.send(Command::Send {
-            transfer_id: transfer_id.to_owned(),
-            recipient_user_id,
-            file_name: entry.name,
-            file_size: entry.size,
-            path,
-        })?;
-
-        Ok(())
+    /// Must be called before `share()` so uploads are tagged with the correct room.
+    pub fn set_room_id(&self, room_id: String) {
+        *self.room_id.lock() = room_id;
     }
+}
+
+/// Write a stream header for the "file-relay" plugin.
+async fn write_file_relay_header(send: &mut dyn BiSendStream) -> Result<()> {
+    let header = rumble_client::StreamHeader {
+        plugin: "file-relay".to_owned(),
+    };
+    header.write_to(send).await
+}
+
+/// Write a length-prefixed protobuf message to a send stream.
+async fn write_length_prefixed(send: &mut dyn BiSendStream, data: &[u8]) -> Result<()> {
+    let len_bytes = (data.len() as u32).to_be_bytes();
+    send.write_all(&len_bytes).await?;
+    send.write_all(data).await?;
+    Ok(())
+}
+
+/// Read a length-prefixed protobuf message from a recv stream.
+async fn read_length_prefixed(recv: &mut dyn BiRecvStream, max_len: usize) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    rumble_client::read_exact(recv, &mut len_buf).await?;
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+    if msg_len > max_len {
+        anyhow::bail!("response too large ({msg_len} bytes, max {max_len})");
+    }
+    let mut buf = vec![0u8; msg_len];
+    rumble_client::read_exact(recv, &mut buf).await?;
+    Ok(buf)
+}
+
+/// Upload a file to the server's relay cache.
+async fn run_upload(
+    opener: Arc<dyn StreamOpener>,
+    transfer_id: String,
+    room_id: String,
+    file_name: String,
+    file_size: u64,
+    mime: String,
+    path: PathBuf,
+    transfers: TransferMap,
+    cancel: CancellationToken,
+) {
+    let result = tokio::select! {
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
+        r = do_upload(
+            &opener, &transfer_id, &room_id, &file_name, file_size, &mime, &path, &transfers,
+        ) => r,
+    };
+
+    match result {
+        Ok(()) => {
+            let mut t = transfers.lock();
+            if let Some(entry) = t.get_mut(&transfer_id) {
+                entry.progress = 1.0;
+                entry.is_complete = true;
+            }
+            info!(transfer_id, "relay upload complete");
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let mut t = transfers.lock();
+            if let Some(entry) = t.get_mut(&transfer_id) {
+                entry.error = Some(msg.clone());
+            }
+            warn!(transfer_id, error = %msg, "relay upload failed");
+        }
+    }
+}
+
+async fn do_upload(
+    opener: &Arc<dyn StreamOpener>,
+    transfer_id: &str,
+    room_id: &str,
+    file_name: &str,
+    file_size: u64,
+    mime: &str,
+    path: &std::path::Path,
+    transfers: &TransferMap,
+) -> Result<()> {
+    let (mut send, mut recv) = opener.open_bi().await?;
+
+    // Write StreamHeader + type discriminator + RelayUpload.
+    write_file_relay_header(&mut *send).await?;
+    send.write_all(&[0x01]).await?; // upload type
+
+    let upload_msg = proto::RelayUpload {
+        transfer_id: transfer_id.to_owned(),
+        room_id: room_id.to_owned(),
+        file_name: file_name.to_owned(),
+        file_size,
+        mime: mime.to_owned(),
+    };
+    write_length_prefixed(&mut *send, &upload_msg.encode_to_vec()).await?;
+
+    // Stream file data.
+    let file = tokio::fs::File::open(path).await?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut sent: u64 = 0;
+
+    loop {
+        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        send.write_all(&buf[..n]).await?;
+        sent += n as u64;
+
+        // Update progress.
+        {
+            let mut t = transfers.lock();
+            if let Some(entry) = t.get_mut(transfer_id) {
+                entry.progress = if file_size > 0 {
+                    (sent as f32) / (file_size as f32)
+                } else {
+                    1.0
+                };
+            }
+        }
+    }
+
+    // Signal end of upload data.
+    send.finish().await?;
+
+    // Read server's response.
+    let resp_bytes = read_length_prefixed(&mut *recv, 64 * 1024).await?;
+    let resp = proto::RelayUploadResponse::decode(&resp_bytes[..])?;
+
+    let status = proto::RelayResult::try_from(resp.status).unwrap_or(proto::RelayResult::Error);
+    if status != proto::RelayResult::Ok {
+        anyhow::bail!("upload rejected: {} ({})", resp.error, status.as_str_name());
+    }
+
+    Ok(())
+}
+
+/// Fetch a file from the server's relay cache.
+async fn run_fetch(
+    opener: Arc<dyn StreamOpener>,
+    transfer_id: String,
+    downloads_dir: PathBuf,
+    transfers: TransferMap,
+    cancel: CancellationToken,
+) {
+    let result = tokio::select! {
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
+        r = do_fetch(&opener, &transfer_id, &downloads_dir, &transfers) => r,
+    };
+
+    match result {
+        Ok(dest) => {
+            let mut t = transfers.lock();
+            if let Some(entry) = t.get_mut(&transfer_id) {
+                entry.progress = 1.0;
+                entry.is_complete = true;
+                entry.path = Some(dest.clone());
+            }
+            info!(transfer_id, dest = %dest.display(), "relay fetch complete");
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let mut t = transfers.lock();
+            if let Some(entry) = t.get_mut(&transfer_id) {
+                entry.error = Some(msg.clone());
+            }
+            warn!(transfer_id, error = %msg, "relay fetch failed");
+        }
+    }
+}
+
+async fn do_fetch(
+    opener: &Arc<dyn StreamOpener>,
+    transfer_id: &str,
+    downloads_dir: &std::path::Path,
+    transfers: &TransferMap,
+) -> Result<PathBuf> {
+    let (mut send, mut recv) = opener.open_bi().await?;
+
+    // Write StreamHeader + type discriminator + RelayFetch.
+    write_file_relay_header(&mut *send).await?;
+    send.write_all(&[0x02]).await?; // fetch type
+
+    let fetch_msg = proto::RelayFetch {
+        transfer_id: transfer_id.to_owned(),
+    };
+    write_length_prefixed(&mut *send, &fetch_msg.encode_to_vec()).await?;
+
+    // We don't send any more data on the upload direction.
+    send.finish().await?;
+
+    // Read server's response header.
+    let resp_bytes = read_length_prefixed(&mut *recv, 64 * 1024).await?;
+    let resp = proto::RelayFetchResponse::decode(&resp_bytes[..])?;
+
+    let status = proto::RelayResult::try_from(resp.status).unwrap_or(proto::RelayResult::Error);
+    if status != proto::RelayResult::Ok {
+        anyhow::bail!("fetch failed: {} ({})", resp.error, status.as_str_name());
+    }
+
+    // Sanitize file name to prevent path traversal.
+    let file_name = std::path::Path::new(&resp.file_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_owned());
+    let file_size = resp.file_size;
+
+    // Update transfer metadata from server response.
+    {
+        let mut t = transfers.lock();
+        if let Some(entry) = t.get_mut(transfer_id) {
+            entry.name = file_name.clone();
+            entry.size = file_size;
+        }
+    }
+
+    // Write to downloads directory.
+    std::fs::create_dir_all(downloads_dir)?;
+    let dest = downloads_dir.join(&file_name);
+    let file = tokio::fs::File::create(&dest).await?;
+    let mut writer = tokio::io::BufWriter::new(file);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut received: u64 = 0;
+
+    loop {
+        match recv.read(&mut buf).await {
+            Ok(Some(n)) if n > 0 => {
+                tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await?;
+                received += n as u64;
+
+                let mut t = transfers.lock();
+                if let Some(entry) = t.get_mut(transfer_id) {
+                    entry.progress = if file_size > 0 {
+                        (received as f32) / (file_size as f32)
+                    } else {
+                        1.0
+                    };
+                }
+            }
+            Ok(Some(_)) => continue, // zero-length read
+            Ok(None) => break,       // stream closed
+            Err(e) => return Err(anyhow::anyhow!("recv error: {e}")),
+        }
+    }
+
+    tokio::io::AsyncWriteExt::flush(&mut writer).await?;
+
+    Ok(dest)
 }
 
 #[async_trait]
@@ -176,28 +375,46 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             .unwrap_or_else(|| "unnamed".to_owned());
         let file_size = metadata.len();
         let transfer_id = uuid::Uuid::new_v4().to_string();
+        let mime = mime_guess::from_path(&file_name).first_or_octet_stream().to_string();
+        let room_id = self.room_id.lock().clone();
 
         let share_data = RelayShareData {
             transfer_id: transfer_id.clone(),
             file_name: file_name.clone(),
             file_size,
+            mime: mime.clone(),
         };
 
+        let cancel = CancellationToken::new();
         let entry = TransferEntry {
             id: TransferId(transfer_id.clone()),
             name: file_name.clone(),
             size: file_size,
-            path: Some(path),
+            path: Some(path.clone()),
             progress: 0.0,
-            download_speed: 0,
-            upload_speed: 0,
             is_complete: false,
+            is_upload: true,
             error: None,
+            cancel: cancel.clone(),
         };
 
-        self.transfers.lock().unwrap().insert(transfer_id.clone(), entry);
+        self.transfers.lock().insert(transfer_id.clone(), entry);
 
-        let mime = mime_guess::from_path(&file_name).first_or_octet_stream().to_string();
+        // Spawn upload task.
+        let opener = self.opener.clone();
+        let transfers = self.transfers.clone();
+        let tid = transfer_id.clone();
+        tokio::spawn(run_upload(
+            opener,
+            tid,
+            room_id,
+            file_name.clone(),
+            file_size,
+            mime.clone(),
+            path,
+            transfers,
+            cancel,
+        ));
 
         Ok(FileOffer {
             id: TransferId(transfer_id),
@@ -209,40 +426,41 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
     }
 
     fn download(&self, share_data: &str) -> Result<TransferId> {
-        // Parse the share_data to get relay information.
         let relay_data: RelayShareData =
             serde_json::from_str(share_data).map_err(|e| anyhow::anyhow!("invalid relay share_data: {e}"))?;
 
         let transfer_id = relay_data.transfer_id.clone();
 
-        // Register the transfer as a pending download.
+        let cancel = CancellationToken::new();
         let entry = TransferEntry {
             id: TransferId(transfer_id.clone()),
             name: relay_data.file_name,
             size: relay_data.file_size,
             path: None,
             progress: 0.0,
-            download_speed: 0,
-            upload_speed: 0,
             is_complete: false,
+            is_upload: false,
             error: None,
+            cancel: cancel.clone(),
         };
 
-        self.transfers.lock().unwrap().insert(transfer_id.clone(), entry);
+        self.transfers.lock().insert(transfer_id.clone(), entry);
 
-        // For the relay model, the download is initiated by the sender pushing
-        // data through the server (incoming stream). The download() call just
-        // registers interest. The actual data arrives via on_incoming_stream.
+        // Spawn fetch task.
+        let opener = self.opener.clone();
+        let downloads_dir = self.downloads_dir.clone();
+        let transfers = self.transfers.clone();
+        let tid = transfer_id.clone();
+        tokio::spawn(run_fetch(opener, tid, downloads_dir, transfers, cancel));
 
         Ok(TransferId(transfer_id))
     }
 
     fn transfers(&self) -> Vec<TransferStatus> {
-        self.transfers.lock().unwrap().values().map(|e| e.to_status()).collect()
+        self.transfers.lock().values().map(|e| e.to_status()).collect()
     }
 
     fn pause(&self, _id: &TransferId) -> Result<()> {
-        // Relay transfers don't support pause — data streams continuously.
         anyhow::bail!("relay transfers cannot be paused")
     }
 
@@ -251,249 +469,23 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
     }
 
     fn cancel(&self, id: &TransferId, _delete_files: bool) -> Result<()> {
-        self.cmd_tx.send(Command::Cancel {
-            transfer_id: id.0.clone(),
-        })?;
+        let t = self.transfers.lock();
+        if let Some(entry) = t.get(&id.0) {
+            entry.cancel.cancel();
+        }
         Ok(())
     }
 
     fn get_file_path(&self, id: &TransferId) -> Result<PathBuf> {
-        let transfers = self.transfers.lock().unwrap();
-        transfers
-            .get(&id.0)
+        let t = self.transfers.lock();
+        t.get(&id.0)
             .and_then(|e| e.path.clone())
             .ok_or_else(|| anyhow::anyhow!("no file path for transfer {}", id.0))
     }
 
-    async fn on_incoming_stream(&self, _send: Box<dyn BiSendStream>, recv: Box<dyn BiRecvStream>) {
-        let transfers = self.transfers.clone();
-        let downloads_dir = self.downloads_dir.clone();
-        if let Err(e) = handle_incoming_relay(recv, transfers, downloads_dir).await {
-            warn!("incoming relay error: {e}");
-        }
+    async fn on_incoming_stream(&self, _send: Box<dyn BiSendStream>, _recv: Box<dyn BiRecvStream>) {
+        // In the cache model, the client always initiates streams.
+        // Server-initiated streams are not expected.
+        warn!("unexpected incoming file-relay stream from server (cache model)");
     }
-}
-
-/// Background worker that processes outgoing send commands.
-async fn run_worker(
-    conn: quinn::Connection,
-    mut cmd_rx: mpsc::UnboundedReceiver<Command>,
-    transfers: Arc<Mutex<HashMap<String, TransferEntry>>>,
-    _downloads_dir: PathBuf,
-) {
-    while let Some(cmd) = cmd_rx.recv().await {
-        match cmd {
-            Command::Send {
-                transfer_id,
-                recipient_user_id,
-                file_name,
-                file_size,
-                path,
-            } => {
-                let conn = conn.clone();
-                let transfers = transfers.clone();
-                let tid = transfer_id.clone();
-
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        send_file(conn, &tid, recipient_user_id, &file_name, file_size, &path, &transfers).await
-                    {
-                        warn!(transfer_id = %tid, "send_file error: {e}");
-                        if let Ok(mut t) = transfers.lock() {
-                            if let Some(entry) = t.get_mut(&tid) {
-                                entry.error = Some(e.to_string());
-                            }
-                        }
-                    }
-                });
-            }
-            Command::Cancel { transfer_id } => {
-                // Mark as cancelled. The actual stream abort happens implicitly
-                // when the entry is dropped or the stream is closed.
-                if let Ok(mut t) = transfers.lock() {
-                    if let Some(entry) = t.get_mut(&transfer_id) {
-                        entry.error = Some("cancelled".to_owned());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Open a QUIC stream to the server and send a file.
-async fn send_file(
-    conn: quinn::Connection,
-    transfer_id: &str,
-    recipient_user_id: u64,
-    file_name: &str,
-    file_size: u64,
-    path: &std::path::Path,
-    transfers: &Arc<Mutex<HashMap<String, TransferEntry>>>,
-) -> Result<()> {
-    // Open a bi-directional stream.
-    let (mut send, _recv) = conn.open_bi().await?;
-
-    // Write the StreamHeader: plugin name "file-relay".
-    let plugin_name = b"file-relay";
-    send.write_all(&(plugin_name.len() as u16).to_be_bytes()).await?;
-    send.write_all(plugin_name).await?;
-
-    // Write the RelayRequest (length-prefixed protobuf).
-    let request = proto::RelayRequest {
-        recipient_user_id,
-        file_name: file_name.to_owned(),
-        file_size,
-        transfer_id: transfer_id.to_owned(),
-    };
-    let req_bytes = request.encode_to_vec();
-    send.write_all(&(req_bytes.len() as u32).to_be_bytes()).await?;
-    send.write_all(&req_bytes).await?;
-
-    // Stream the file data.
-    let file = tokio::fs::File::open(path).await?;
-    let mut reader = tokio::io::BufReader::new(file);
-    let mut buf = vec![0u8; 32 * 1024];
-    let mut sent: u64 = 0;
-
-    loop {
-        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        send.write_all(&buf[..n]).await?;
-        sent += n as u64;
-
-        // Update progress.
-        if let Ok(mut t) = transfers.lock() {
-            if let Some(entry) = t.get_mut(transfer_id) {
-                entry.progress = if file_size > 0 {
-                    (sent as f32) / (file_size as f32)
-                } else {
-                    1.0
-                };
-            }
-        }
-    }
-
-    // Close the send half to signal completion.
-    send.finish()?;
-
-    // Mark complete.
-    if let Ok(mut t) = transfers.lock() {
-        if let Some(entry) = t.get_mut(transfer_id) {
-            entry.progress = 1.0;
-            entry.is_complete = true;
-        }
-    }
-
-    info!(transfer_id, bytes = sent, "relay send complete");
-    Ok(())
-}
-
-/// Handle a single incoming relay stream (server -> client).
-///
-/// The `StreamHeader` has already been consumed by the stream dispatch task.
-/// The remaining bytes on `recv` start with a length-prefixed `RelayOffer`.
-async fn handle_incoming_relay(
-    mut recv: Box<dyn BiRecvStream>,
-    transfers: Arc<Mutex<HashMap<String, TransferEntry>>>,
-    downloads_dir: PathBuf,
-) -> Result<()> {
-    // Read length-prefixed RelayOffer.
-    let mut len_buf = [0u8; 4];
-    rumble_client::read_exact(&mut *recv, &mut len_buf).await?;
-    let offer_len = u32::from_be_bytes(len_buf) as usize;
-    if offer_len > 64 * 1024 {
-        anyhow::bail!("RelayOffer too large ({offer_len} bytes)");
-    }
-
-    let mut offer_buf = vec![0u8; offer_len];
-    rumble_client::read_exact(&mut *recv, &mut offer_buf).await?;
-    let offer = proto::RelayOffer::decode(&offer_buf[..])?;
-
-    let transfer_id = offer.transfer_id.clone();
-    // Sanitize: the sender controls this value, strip path components to
-    // prevent traversal (e.g. "../../../.ssh/authorized_keys")
-    let file_name = std::path::Path::new(&offer.file_name)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".to_owned());
-    let file_size = offer.file_size;
-
-    info!(
-        transfer_id = %transfer_id,
-        sender = offer.sender_user_id,
-        file = %file_name,
-        size = file_size,
-        "incoming relay offer"
-    );
-
-    // Register the transfer if not already known.
-    {
-        let mut t = transfers.lock().unwrap();
-        t.entry(transfer_id.clone()).or_insert_with(|| TransferEntry {
-            id: TransferId(transfer_id.clone()),
-            name: file_name.clone(),
-            size: file_size,
-            path: None,
-            progress: 0.0,
-            download_speed: 0,
-            upload_speed: 0,
-            is_complete: false,
-            error: None,
-        });
-    }
-
-    // Write to downloads directory.
-    let dest = downloads_dir.join(&file_name);
-    std::fs::create_dir_all(&downloads_dir)?;
-    let file = tokio::fs::File::create(&dest).await?;
-    let mut writer = tokio::io::BufWriter::new(file);
-    let mut buf = vec![0u8; 32 * 1024];
-    let mut received: u64 = 0;
-
-    loop {
-        match recv.read(&mut buf).await {
-            Ok(Some(n)) => {
-                tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await?;
-                received += n as u64;
-
-                if let Ok(mut t) = transfers.lock() {
-                    if let Some(entry) = t.get_mut(&transfer_id) {
-                        entry.progress = if file_size > 0 {
-                            (received as f32) / (file_size as f32)
-                        } else {
-                            1.0
-                        };
-                    }
-                }
-            }
-            Ok(None) => {
-                // Stream closed -- transfer complete.
-                break;
-            }
-            Err(e) => {
-                if let Ok(mut t) = transfers.lock() {
-                    if let Some(entry) = t.get_mut(&transfer_id) {
-                        entry.error = Some(e.to_string());
-                    }
-                }
-                return Err(anyhow::anyhow!("recv error: {e}"));
-            }
-        }
-    }
-
-    tokio::io::AsyncWriteExt::flush(&mut writer).await?;
-
-    // Mark complete.
-    if let Ok(mut t) = transfers.lock() {
-        if let Some(entry) = t.get_mut(&transfer_id) {
-            entry.progress = 1.0;
-            entry.is_complete = true;
-            entry.path = Some(dest.clone());
-        }
-    }
-
-    info!(transfer_id = %transfer_id, bytes = received, dest = %dest.display(), "relay download complete");
-    Ok(())
 }

@@ -29,6 +29,6 @@ pub use keys::{KeyInfo, KeySigning, KeySource};
 pub use platform::Platform;
 pub use storage::PersistentStorage;
 pub use transport::{
-    BiRecvStream, BiSendStream, BiStreamHandle, DatagramTransport, StreamHeader, TlsConfig, Transport,
-    TransportRecvStream, read_exact,
+    BiRecvStream, BiSendStream, BiStreamHandle, BiStreamOpener, DatagramTransport, StreamHeader, StreamOpener,
+    TlsConfig, Transport, TransportRecvStream, read_exact,
 };

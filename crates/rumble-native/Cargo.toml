@@ -44,6 +44,8 @@ service-binding = "3.0"
 # File transfer relay
 uuid = { version = "1.19.0", features = ["v4"] }
 mime_guess = "2"
+parking_lot = "0.12"
+tokio-util = "0.7"
 
 
 # Shared

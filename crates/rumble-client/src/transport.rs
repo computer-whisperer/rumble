@@ -136,6 +136,38 @@ pub trait BiStreamHandle: Send + Sync + 'static {
     async fn open_bi(&self) -> anyhow::Result<(Self::BiSend, Self::BiRecv)>;
 }
 
+/// Type-erased stream opener for plugins that need to open bi-directional streams
+/// without coupling to a specific transport implementation.
+///
+/// Plugins store `Arc<dyn StreamOpener>` and use it to open streams to the server.
+#[async_trait]
+pub trait StreamOpener: Send + Sync + 'static {
+    /// Open a new bi-directional stream to the server.
+    ///
+    /// Returns boxed send and recv halves.
+    async fn open_bi(&self) -> anyhow::Result<(Box<dyn BiSendStream>, Box<dyn BiRecvStream>)>;
+}
+
+/// Adapter that implements [`StreamOpener`] for any [`BiStreamHandle`].
+pub struct BiStreamOpener<H: BiStreamHandle> {
+    handle: H,
+}
+
+impl<H: BiStreamHandle> BiStreamOpener<H> {
+    /// Create a new stream opener from a bi-stream handle.
+    pub fn new(handle: H) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait]
+impl<H: BiStreamHandle> StreamOpener for BiStreamOpener<H> {
+    async fn open_bi(&self) -> anyhow::Result<(Box<dyn BiSendStream>, Box<dyn BiRecvStream>)> {
+        let (send, recv) = self.handle.open_bi().await?;
+        Ok((Box::new(send), Box::new(recv)))
+    }
+}
+
 /// The receive half of a transport, for use in a separate task.
 ///
 /// Created by [`Transport::take_recv`]. Allows the connection task to retain

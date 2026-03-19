@@ -478,10 +478,25 @@ async fn run_connection_task<P: Platform>(
                                 // Split off the receive stream for the receiver task
                                 let recv_stream = new_transport.take_recv();
 
-                                // Get a bi-stream handle for the stream dispatch task
+                                // Get bi-stream handles: one for dispatch, one for the relay plugin
                                 let bi_handle = new_transport.bi_stream_handle();
+                                let opener_handle = new_transport.bi_stream_handle();
 
                                 transport = Some(new_transport);
+
+                                // Create the file transfer relay plugin
+                                let downloads_dir = config
+                                    .download_dir
+                                    .clone()
+                                    .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
+                                let opener: Arc<dyn rumble_client::StreamOpener> =
+                                    Arc::new(rumble_client::BiStreamOpener::new(opener_handle));
+                                let relay_plugin = rumble_native::FileTransferRelayPlugin::new(
+                                    opener,
+                                    downloads_dir,
+                                );
+                                let file_transfer: Option<Arc<dyn FileTransferPlugin>> =
+                                    Some(Arc::new(relay_plugin));
 
                                 // Spawn receiver task for reliable messages
                                 let state_clone = state.clone();
@@ -493,7 +508,6 @@ async fn run_connection_task<P: Platform>(
                                 });
 
                                 // Spawn stream dispatch task for server-initiated bi-directional streams
-                                let file_transfer: Option<Arc<dyn FileTransferPlugin>> = None; // TODO: wire up file transfer plugin
                                 tokio::spawn(async move {
                                     run_stream_dispatch(bi_handle, file_transfer).await;
                                 });
@@ -614,10 +628,25 @@ async fn run_connection_task<P: Platform>(
                                     // Split off the receive stream for the receiver task
                                     let recv_stream = new_transport.take_recv();
 
-                                    // Get a bi-stream handle for the stream dispatch task
+                                    // Get bi-stream handles: one for dispatch, one for the relay plugin
                                     let bi_handle = new_transport.bi_stream_handle();
+                                    let opener_handle = new_transport.bi_stream_handle();
 
                                     transport = Some(new_transport);
+
+                                    // Create the file transfer relay plugin
+                                    let downloads_dir = config
+                                        .download_dir
+                                        .clone()
+                                        .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
+                                    let opener: Arc<dyn rumble_client::StreamOpener> =
+                                        Arc::new(rumble_client::BiStreamOpener::new(opener_handle));
+                                    let relay_plugin = rumble_native::FileTransferRelayPlugin::new(
+                                        opener,
+                                        downloads_dir,
+                                    );
+                                    let file_transfer: Option<Arc<dyn FileTransferPlugin>> =
+                                        Some(Arc::new(relay_plugin));
 
                                     // Spawn receiver task
                                     let state_clone = state.clone();
@@ -629,7 +658,6 @@ async fn run_connection_task<P: Platform>(
                                     });
 
                                     // Spawn stream dispatch task for server-initiated bi-directional streams
-                                    let file_transfer: Option<Arc<dyn FileTransferPlugin>> = None; // TODO: wire up file transfer plugin
                                     tokio::spawn(async move {
                                         run_stream_dispatch(bi_handle, file_transfer).await;
                                     });

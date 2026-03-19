@@ -1,80 +1,322 @@
-//! File transfer relay plugin.
+//! File transfer relay plugin — store-and-serve cache model.
 //!
-//! The sender opens a QUIC stream to the server with StreamHeader
-//! `plugin = "file-relay"`. The first frame on the stream is a
-//! length-prefixed [`RelayRequest`] protobuf. The server reads it,
-//! opens a corresponding stream to the recipient with a [`RelayOffer`],
-//! and then copies bytes bidirectionally until one side closes.
+//! Clients upload files to the server, which caches them per-room.
+//! Other clients in the room can then fetch cached files by transfer ID.
+//!
+//! ## Upload flow
+//!
+//! 1. Client opens a `"file-relay"` stream to the server.
+//! 2. Sends type discriminator `0x01`, then length-prefixed [`RelayUpload`],
+//!    then raw file bytes.
+//! 3. Server stores in room-scoped cache.
+//! 4. Server responds with length-prefixed [`RelayUploadResponse`].
+//!
+//! ## Fetch flow
+//!
+//! 1. Client opens a `"file-relay"` stream to the server.
+//! 2. Sends type discriminator `0x02`, then length-prefixed [`RelayFetch`].
+//! 3. Server responds with length-prefixed [`RelayFetchResponse`], then raw
+//!    file bytes (if found).
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use api::proto::{self, envelope::Payload, relay_status};
+use api::proto;
 use dashmap::DashMap;
 use prost::Message;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     plugin::{ServerCtx, ServerPlugin, StreamHeader},
     state::ClientHandle,
 };
 
-/// Tracks a single active relay.
-struct RelayState {
-    sender_id: u64,
-    recipient_id: u64,
+/// A cached file entry.
+struct CachedFile {
+    room_id: String,
+    file_name: String,
+    file_size: u64,
+    mime: String,
+    data: Vec<u8>,
+    created_at: Instant,
+}
+
+/// Configuration for the relay cache.
+pub struct RelayCacheConfig {
+    /// Max age of a cache entry (default 30 min).
+    pub ttl: Duration,
+    /// Evict entries when their room empties (default true).
+    pub evict_on_room_clear: bool,
+    /// Max total cache size in bytes (default 500 MB).
+    pub max_total_size: u64,
+    /// Max single file size in bytes (default 100 MB).
+    pub max_file_size: u64,
+}
+
+impl Default for RelayCacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(30 * 60),
+            evict_on_room_clear: true,
+            max_total_size: 500 * 1024 * 1024,
+            max_file_size: 100 * 1024 * 1024,
+        }
+    }
+}
+
+/// Server-side file relay plugin using a store-and-serve cache model.
+///
+/// Uploaded files are held in memory keyed by transfer ID. Fetch requests
+/// look up the cache and stream the data back to the requester.
+pub struct FileTransferRelayPlugin {
+    /// Room-scoped file cache: transfer_id -> CachedFile.
+    cache: Arc<DashMap<String, CachedFile>>,
+    /// Configuration.
+    config: RelayCacheConfig,
+    /// Total bytes currently cached (for quota enforcement).
+    total_cached: Arc<AtomicU64>,
+    /// Parent cancellation token — cancelled on stop().
     cancel: CancellationToken,
 }
 
-/// Shared state across spawned tasks and the plugin.
-struct Inner {
-    /// Active relays keyed by transfer_id.
-    active: DashMap<String, RelayState>,
-    /// Total bytes relayed (stats).
-    bytes_relayed: AtomicU64,
-}
-
-/// Server-side plugin that relays file data between two clients.
-///
-/// The sender opens a plugin stream ("file-relay") with a [`RelayRequest`]
-/// header. The server opens a matching stream to the recipient with a
-/// [`RelayOffer`] header and then pipes bytes from sender to recipient.
-pub struct FileTransferRelayPlugin {
-    inner: Arc<Inner>,
-}
-
 impl FileTransferRelayPlugin {
+    /// Create a new relay plugin with default configuration.
     pub fn new() -> Self {
+        Self::with_config(RelayCacheConfig::default())
+    }
+
+    /// Create a new relay plugin with the given configuration.
+    pub fn with_config(config: RelayCacheConfig) -> Self {
         Self {
-            inner: Arc::new(Inner {
-                active: DashMap::new(),
-                bytes_relayed: AtomicU64::new(0),
-            }),
+            cache: Arc::new(DashMap::new()),
+            config,
+            total_cached: Arc::new(AtomicU64::new(0)),
+            cancel: CancellationToken::new(),
         }
     }
 
-    /// Send a [`RelayStatus`] envelope to a client on the control stream.
-    async fn send_status(
+    /// Handle an upload stream.
+    async fn handle_upload(
+        &self,
+        mut send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+        sender: &Arc<ClientHandle>,
         ctx: &ServerCtx,
-        user_id: u64,
-        transfer_id: &str,
-        status: relay_status::Status,
-        error_msg: &str,
-    ) {
-        let envelope = proto::Envelope {
-            state_hash: Vec::new(),
-            payload: Some(Payload::RelayStatus(proto::RelayStatus {
-                transfer_id: transfer_id.to_owned(),
-                status: status.into(),
-                error: error_msg.to_owned(),
-            })),
+    ) -> Result<()> {
+        // Read length-prefixed RelayUpload proto.
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        if msg_len > 64 * 1024 {
+            anyhow::bail!("RelayUpload message too large ({msg_len} bytes)");
+        }
+
+        let mut msg_buf = vec![0u8; msg_len];
+        recv.read_exact(&mut msg_buf).await?;
+        let upload = proto::RelayUpload::decode(&msg_buf[..])?;
+
+        let user_id = sender.user_id;
+        let transfer_id = upload.transfer_id.clone();
+
+        info!(
+            user_id,
+            transfer_id = %transfer_id,
+            file = %upload.file_name,
+            size = upload.file_size,
+            room = %upload.room_id,
+            "file relay upload request"
+        );
+
+        // Validate file size limit.
+        if upload.file_size > self.config.max_file_size {
+            let resp = proto::RelayUploadResponse {
+                status: proto::RelayResult::TooLarge.into(),
+                error: format!(
+                    "file too large: {} bytes (max {})",
+                    upload.file_size, self.config.max_file_size
+                ),
+            };
+            Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+            return Ok(());
+        }
+
+        // Check total cache quota (approximate — race-free enough for our purposes).
+        let current_total = self.total_cached.load(Ordering::Relaxed);
+        if current_total + upload.file_size > self.config.max_total_size {
+            let resp = proto::RelayUploadResponse {
+                status: proto::RelayResult::TooLarge.into(),
+                error: "server cache full".to_owned(),
+            };
+            Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+            return Ok(());
+        }
+
+        // Validate that the user is in the claimed room.
+        if let Some(actual_room) = ctx.get_user_room(user_id) {
+            let actual_room_str = actual_room.to_string();
+            if actual_room_str != upload.room_id {
+                let resp = proto::RelayUploadResponse {
+                    status: proto::RelayResult::Error.into(),
+                    error: format!("room mismatch: you are in {actual_room_str}, not {}", upload.room_id),
+                };
+                Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+                return Ok(());
+            }
+        }
+
+        // Read raw file data from the stream.
+        let file_size = upload.file_size as usize;
+        let mut data = Vec::with_capacity(file_size.min(32 * 1024 * 1024)); // pre-alloc capped at 32MB
+        let mut remaining = file_size;
+        let mut buf = vec![0u8; 64 * 1024];
+
+        while remaining > 0 {
+            let to_read = remaining.min(buf.len());
+            match recv.read(&mut buf[..to_read]).await {
+                Ok(Some(n)) if n > 0 => {
+                    data.extend_from_slice(&buf[..n]);
+                    remaining -= n;
+                }
+                Ok(Some(_)) => continue, // zero-length read, retry
+                Ok(None) => {
+                    // Stream closed early.
+                    let resp = proto::RelayUploadResponse {
+                        status: proto::RelayResult::Error.into(),
+                        error: format!("stream closed after {} of {} bytes", data.len(), file_size),
+                    };
+                    Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(transfer_id = %transfer_id, "upload read error: {e}");
+                    return Err(e.into());
+                }
+            }
+        }
+
+        // Store in cache.
+        let actual_size = data.len() as u64;
+        self.cache.insert(
+            transfer_id.clone(),
+            CachedFile {
+                room_id: upload.room_id.clone(),
+                file_name: upload.file_name.clone(),
+                file_size: actual_size,
+                mime: upload.mime.clone(),
+                data,
+                created_at: Instant::now(),
+            },
+        );
+        self.total_cached.fetch_add(actual_size, Ordering::Relaxed);
+
+        info!(
+            transfer_id = %transfer_id,
+            bytes = actual_size,
+            "file cached"
+        );
+
+        // Send success response.
+        let resp = proto::RelayUploadResponse {
+            status: proto::RelayResult::Ok.into(),
+            error: String::new(),
         };
-        if let Err(e) = ctx.send_to(user_id, envelope).await {
-            warn!(user_id, "failed to send relay status: {e}");
+        Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+
+        Ok(())
+    }
+
+    /// Handle a fetch stream.
+    async fn handle_fetch(&self, mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> Result<()> {
+        // Read length-prefixed RelayFetch proto.
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        if msg_len > 64 * 1024 {
+            anyhow::bail!("RelayFetch message too large ({msg_len} bytes)");
+        }
+
+        let mut msg_buf = vec![0u8; msg_len];
+        recv.read_exact(&mut msg_buf).await?;
+        let fetch = proto::RelayFetch::decode(&msg_buf[..])?;
+
+        let transfer_id = fetch.transfer_id.clone();
+
+        debug!(transfer_id = %transfer_id, "file relay fetch request");
+
+        // Look up in cache.
+        let entry = self.cache.get(&transfer_id);
+        match entry {
+            Some(cached) => {
+                let resp = proto::RelayFetchResponse {
+                    status: proto::RelayResult::Ok.into(),
+                    file_name: cached.file_name.clone(),
+                    file_size: cached.file_size,
+                    mime: cached.mime.clone(),
+                    error: String::new(),
+                };
+                let resp_bytes = resp.encode_to_vec();
+                Self::write_response(&mut send, &resp_bytes).await?;
+
+                // Write raw file bytes.
+                send.write_all(&cached.data).await?;
+                send.finish()?;
+
+                info!(
+                    transfer_id = %transfer_id,
+                    bytes = cached.file_size,
+                    "file served from cache"
+                );
+            }
+            None => {
+                let resp = proto::RelayFetchResponse {
+                    status: proto::RelayResult::NotFound.into(),
+                    file_name: String::new(),
+                    file_size: 0,
+                    mime: String::new(),
+                    error: "transfer not found or expired".to_owned(),
+                };
+                Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+                send.finish()?;
+
+                debug!(transfer_id = %transfer_id, "fetch: not found");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write a length-prefixed protobuf response on a send stream.
+    async fn write_response(send: &mut quinn::SendStream, data: &[u8]) -> Result<()> {
+        let len_bytes = (data.len() as u32).to_be_bytes();
+        send.write_all(&len_bytes).await?;
+        send.write_all(data).await?;
+        Ok(())
+    }
+
+    /// Remove all cache entries for a given room.
+    fn evict_room(&self, room_id: &str) {
+        let to_remove: Vec<String> = self
+            .cache
+            .iter()
+            .filter(|entry| entry.value().room_id == room_id)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for tid in &to_remove {
+            if let Some((_, cached)) = self.cache.remove(tid) {
+                self.total_cached.fetch_sub(cached.file_size, Ordering::Relaxed);
+            }
+        }
+
+        if !to_remove.is_empty() {
+            info!(room_id, count = to_remove.len(), "evicted room cache entries");
         }
     }
 }
@@ -93,235 +335,137 @@ impl ServerPlugin for FileTransferRelayPlugin {
 
     async fn on_message(
         &self,
-        envelope: &proto::Envelope,
+        _envelope: &proto::Envelope,
         _sender: &Arc<ClientHandle>,
         _ctx: &ServerCtx,
     ) -> Result<bool> {
-        // We handle RelayStatus messages from recipients (accept/reject).
-        match &envelope.payload {
-            Some(Payload::RelayStatus(rs)) => {
-                let status = relay_status::Status::try_from(rs.status).unwrap_or(relay_status::Status::Failed);
-                match status {
-                    relay_status::Status::Rejected => {
-                        // Recipient rejected -- cancel the relay.
-                        if let Some((_, relay)) = self.inner.active.remove(&rs.transfer_id) {
-                            relay.cancel.cancel();
-                            info!(transfer_id = %rs.transfer_id, "relay rejected by recipient");
-                        }
-                    }
-                    _ => {
-                        // Accepted / Completed / Failed -- informational for now.
-                    }
-                }
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
+        // The cache model has no control-stream messages.
+        Ok(false)
     }
 
     async fn on_stream(
         &self,
         _header: StreamHeader,
-        sender_send: quinn::SendStream,
+        send: quinn::SendStream,
         mut recv: quinn::RecvStream,
         sender: &Arc<ClientHandle>,
         ctx: &ServerCtx,
     ) -> Result<()> {
-        // The dispatch layer already consumed the plugin name from the stream.
-        // The remaining bytes on `recv` start with our RelayRequest (length-prefixed).
+        // Read the type discriminator byte.
+        let mut type_buf = [0u8; 1];
+        recv.read_exact(&mut type_buf).await?;
 
-        // Read a 4-byte big-endian length prefix for the RelayRequest protobuf.
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read RelayRequest length: {e}"))?;
-        let req_len = u32::from_be_bytes(len_buf) as usize;
+        let child_cancel = self.cancel.child_token();
 
-        if req_len > 64 * 1024 {
-            anyhow::bail!("RelayRequest too large ({req_len} bytes)");
-        }
-
-        let mut req_buf = vec![0u8; req_len];
-        recv.read_exact(&mut req_buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read RelayRequest body: {e}"))?;
-
-        let request = proto::RelayRequest::decode(&req_buf[..])
-            .map_err(|e| anyhow::anyhow!("failed to decode RelayRequest: {e}"))?;
-
-        let sender_id = sender.user_id;
-        let recipient_id = request.recipient_user_id;
-        let transfer_id = request.transfer_id.clone();
-
-        info!(
-            sender = sender_id,
-            recipient = recipient_id,
-            file = %request.file_name,
-            size = request.file_size,
-            transfer_id = %transfer_id,
-            "file relay request"
-        );
-
-        // Validate recipient is connected.
-        if ctx.get_client(recipient_id).is_none() {
-            Self::send_status(
-                ctx,
-                sender_id,
-                &transfer_id,
-                relay_status::Status::Failed,
-                "recipient not connected",
-            )
-            .await;
-            return Ok(());
-        }
-
-        // Build the offer for the recipient.
-        let offer = proto::RelayOffer {
-            sender_user_id: sender_id,
-            file_name: request.file_name.clone(),
-            file_size: request.file_size,
-            transfer_id: transfer_id.clone(),
-        };
-        let offer_bytes = offer.encode_to_vec();
-
-        // Open a stream to the recipient.
-        let offer_header = StreamHeader {
-            plugin: "file-relay".to_owned(),
-            metadata: Vec::new(), // metadata is sent inline after the header
-        };
-
-        let (mut recipient_send, recipient_recv) = match ctx.open_stream_to(recipient_id, offer_header).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!(transfer_id = %transfer_id, "cannot open stream to recipient: {e}");
-                Self::send_status(
-                    ctx,
-                    sender_id,
-                    &transfer_id,
-                    relay_status::Status::Failed,
-                    &format!("cannot reach recipient: {e}"),
-                )
-                .await;
-                return Ok(());
-            }
-        };
-
-        // Write the RelayOffer (length-prefixed) on the recipient stream.
-        let len_bytes = (offer_bytes.len() as u32).to_be_bytes();
-        if let Err(e) = recipient_send.write_all(&len_bytes).await {
-            warn!(transfer_id = %transfer_id, "failed to write offer length: {e}");
-            return Ok(());
-        }
-        if let Err(e) = recipient_send.write_all(&offer_bytes).await {
-            warn!(transfer_id = %transfer_id, "failed to write offer: {e}");
-            return Ok(());
-        }
-
-        // Register cancellation.
-        let cancel = CancellationToken::new();
-        self.inner.active.insert(
-            transfer_id.clone(),
-            RelayState {
-                sender_id,
-                recipient_id,
-                cancel: cancel.clone(),
-            },
-        );
-
-        // Spawn a bidirectional copy task.
-        let inner = self.inner.clone();
-        let tid = transfer_id.clone();
-
-        tokio::spawn(async move {
-            let result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    info!(transfer_id = %tid, "relay cancelled");
-                    Err(anyhow::anyhow!("cancelled"))
-                }
-                r = relay_copy(
-                    recv,
-                    recipient_send,
-                    recipient_recv,
-                    sender_send,
-                    &inner.bytes_relayed,
-                ) => r,
-            };
-
-            match &result {
-                Ok(bytes) => {
-                    info!(transfer_id = %tid, bytes = bytes, "relay completed");
-                }
-                Err(e) => {
-                    // Connection resets are normal when streams close.
-                    warn!(transfer_id = %tid, "relay error: {e}");
+        match type_buf[0] {
+            0x01 => {
+                // Upload
+                tokio::select! {
+                    _ = child_cancel.cancelled() => {
+                        debug!("upload stream cancelled by shutdown");
+                    }
+                    result = self.handle_upload(send, recv, sender, ctx) => {
+                        if let Err(e) = result {
+                            warn!(user_id = sender.user_id, "upload error: {e}");
+                        }
+                    }
                 }
             }
-
-            inner.active.remove(&tid);
-        });
+            0x02 => {
+                // Fetch
+                tokio::select! {
+                    _ = child_cancel.cancelled() => {
+                        debug!("fetch stream cancelled by shutdown");
+                    }
+                    result = self.handle_fetch(send, recv) => {
+                        if let Err(e) = result {
+                            warn!(user_id = sender.user_id, "fetch error: {e}");
+                        }
+                    }
+                }
+            }
+            other => {
+                warn!(user_id = sender.user_id, type_byte = other, "unknown relay stream type");
+            }
+        }
 
         Ok(())
     }
 
-    async fn on_disconnect(&self, client: &Arc<ClientHandle>, _ctx: &ServerCtx) {
+    async fn on_disconnect(&self, client: &Arc<ClientHandle>, ctx: &ServerCtx) {
+        if !self.config.evict_on_room_clear {
+            return;
+        }
+
         let user_id = client.user_id;
-        // Cancel all relays involving this user.
-        let to_remove: Vec<String> = self
-            .inner
-            .active
-            .iter()
-            .filter(|entry| {
-                let state = entry.value();
-                state.sender_id == user_id || state.recipient_id == user_id
-            })
-            .map(|entry| entry.key().clone())
-            .collect();
 
-        for tid in to_remove {
-            if let Some((_, relay)) = self.inner.active.remove(&tid) {
-                relay.cancel.cancel();
-                info!(transfer_id = %tid, user_id, "relay cancelled on disconnect");
-            }
-        }
-    }
-}
+        // Find the room the user was in.
+        let room_id = match ctx.get_user_room(user_id) {
+            Some(r) => r,
+            None => return,
+        };
 
-/// Copy data from sender -> recipient. Returns total bytes relayed.
-///
-/// The sender's send stream and recipient's recv stream are kept alive but
-/// unused for now (reserved for future bidirectional ack/flow control).
-async fn relay_copy(
-    mut sender_recv: quinn::RecvStream,
-    mut recipient_send: quinn::SendStream,
-    _recipient_recv: quinn::RecvStream,
-    _sender_send: quinn::SendStream,
-    bytes_counter: &AtomicU64,
-) -> Result<u64> {
-    let mut total: u64 = 0;
-    let mut buf = vec![0u8; 32 * 1024]; // 32 KiB chunks
+        // Check if the room is now empty (this user is the last one leaving).
+        // get_room_members returns a snapshot; the user may still be in it.
+        let members = ctx.get_room_members(room_id);
+        let remaining = members.iter().filter(|uid| **uid != user_id).count();
 
-    loop {
-        match sender_recv.read(&mut buf).await {
-            Ok(Some(n)) => {
-                recipient_send
-                    .write_all(&buf[..n])
-                    .await
-                    .map_err(|e| anyhow::anyhow!("write to recipient failed: {e}"))?;
-                total += n as u64;
-                bytes_counter.fetch_add(n as u64, Ordering::Relaxed);
-            }
-            Ok(None) => {
-                // Sender closed their send half -- transfer complete.
-                recipient_send
-                    .finish()
-                    .map_err(|e| anyhow::anyhow!("failed to finish recipient stream: {e}"))?;
-                break;
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("read from sender failed: {e}"));
-            }
+        if remaining == 0 {
+            let room_str = room_id.to_string();
+            self.evict_room(&room_str);
         }
     }
 
-    Ok(total)
+    async fn start(&self, _ctx: &ServerCtx) -> Result<()> {
+        // Spawn the TTL sweep task as a child of our cancellation token.
+        let cache = self.cache.clone();
+        let total_cached = self.total_cached.clone();
+        let ttl = self.config.ttl;
+        let child = self.cancel.child_token();
+
+        tokio::spawn(async move {
+            let interval = Duration::from_secs(60);
+            loop {
+                tokio::select! {
+                    _ = child.cancelled() => {
+                        debug!("TTL sweep task cancelled");
+                        break;
+                    }
+                    _ = tokio::time::sleep(interval) => {
+                        let now = Instant::now();
+                        let expired: Vec<String> = cache
+                            .iter()
+                            .filter(|entry| now.duration_since(entry.value().created_at) > ttl)
+                            .map(|entry| entry.key().clone())
+                            .collect();
+
+                        for tid in &expired {
+                            if let Some((_, cached)) = cache.remove(tid) {
+                                total_cached.fetch_sub(cached.file_size, Ordering::Relaxed);
+                            }
+                        }
+
+                        if !expired.is_empty() {
+                            info!(count = expired.len(), "TTL sweep evicted entries");
+                        }
+                    }
+                }
+            }
+        });
+
+        info!(
+            ttl_secs = self.config.ttl.as_secs(),
+            max_file = self.config.max_file_size,
+            max_total = self.config.max_total_size,
+            "file relay plugin started"
+        );
+
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.cancel.cancel();
+        info!("file relay plugin stopped");
+        Ok(())
+    }
 }
