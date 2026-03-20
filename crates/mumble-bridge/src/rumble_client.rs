@@ -1,15 +1,15 @@
 use anyhow::{Result, bail};
-use api::{
-    build_auth_payload, build_session_cert_payload, compute_cert_hash,
-    proto::{self, envelope::Payload},
-};
 use ed25519_dalek::{Signer, SigningKey};
 use prost::Message;
-use rumble_client::{
+use rumble_client_traits::{
     auth::{send_envelope, wait_for_auth_result, wait_for_server_hello},
     transport::{TlsConfig, Transport},
 };
-use rumble_native::QuinnTransport;
+use rumble_desktop::QuinnTransport;
+use rumble_protocol::{
+    build_auth_payload, build_session_cert_payload, compute_cert_hash,
+    proto::{self, envelope::Payload},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 

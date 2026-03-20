@@ -9,8 +9,8 @@ use crate::{
     state::{ClientHandle, ServerState},
 };
 use anyhow::Result;
-use api::proto::Envelope;
 use quinn::{RecvStream, SendStream};
+use rumble_protocol::proto::Envelope;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -80,7 +80,7 @@ impl ServerCtx {
             .state
             .get_client(user_id)
             .ok_or_else(|| anyhow::anyhow!("client {user_id} not found"))?;
-        let frame = api::encode_frame(&envelope);
+        let frame = rumble_protocol::encode_frame(&envelope);
         client
             .send_frame(&frame)
             .await
@@ -106,7 +106,7 @@ impl ServerCtx {
     /// Broadcast an envelope to all clients in a room.
     pub async fn broadcast_room(&self, room_id: Uuid, envelope: Envelope) -> Result<()> {
         let members = self.state.get_room_members(room_id).await;
-        let frame = api::encode_frame(&envelope);
+        let frame = rumble_protocol::encode_frame(&envelope);
         for uid in members {
             if let Some(client) = self.state.get_client(uid) {
                 if let Err(e) = client.send_frame(&frame).await {

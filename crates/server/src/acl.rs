@@ -7,11 +7,11 @@ use crate::{
     persistence::Persistence,
     state::{ClientHandle, ServerState},
 };
-use api::permissions::{self, AclEntry, Permissions, RoomAclData};
+use rumble_protocol::permissions::{self, AclEntry, Permissions, RoomAclData};
 use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
-use api::proto;
+use rumble_protocol::proto;
 
 /// Check if a user has the required permission in a room.
 /// Returns Ok(()) if allowed, Err(PermissionDenied) if not.
@@ -105,9 +105,9 @@ async fn build_room_chain_owned(
         }
         // Find parent of current room
         let parent = rooms.iter().find_map(|r| {
-            let rid = r.id.as_ref().and_then(api::uuid_from_room_id)?;
+            let rid = r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
             if rid == current {
-                r.parent_id.as_ref().and_then(api::uuid_from_room_id)
+                r.parent_id.as_ref().and_then(rumble_protocol::uuid_from_room_id)
             } else {
                 None
             }

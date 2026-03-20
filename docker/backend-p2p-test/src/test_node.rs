@@ -1,6 +1,6 @@
 //! Test node for backend P2P file transfer integration testing.
 //!
-//! This node uses the actual `backend::BackendHandle` to connect to a real
+//! This node uses the actual `rumble_client::BackendHandle` to connect to a real
 //! Rumble server and test:
 //! - P2P file transfer via BitTorrent
 //! - NAT traversal via server relay
@@ -18,7 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use backend::{BackendHandle, Command as BackendCommand, ConnectConfig, SigningCallback};
+use rumble_client::{BackendHandle, Command as BackendCommand, ConnectConfig, SigningCallback};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use tracing::{debug, error, info, warn};
@@ -124,7 +124,7 @@ fn create_backend(cert_path: Option<&std::path::Path>, download_dir: PathBuf, pr
 
 fn wait_for<F>(handle: &BackendHandle, timeout: Duration, condition: F) -> bool
 where
-    F: Fn(&backend::State) -> bool,
+    F: Fn(&rumble_client::State) -> bool,
 {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {

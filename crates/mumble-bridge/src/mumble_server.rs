@@ -281,7 +281,7 @@ fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
     let mut room_uuids: Vec<Option<uuid::Uuid>> = Vec::new();
 
     for (idx, room) in state.rumble_rooms.iter().enumerate() {
-        let uuid = room.id.as_ref().and_then(api::uuid_from_room_id);
+        let uuid = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id);
         room_uuids.push(uuid);
         if let Some(uuid) = uuid {
             // Ensure channel IDs are assigned
@@ -290,10 +290,10 @@ fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
             let parent_uuid = room
                 .parent_id
                 .as_ref()
-                .and_then(api::uuid_from_room_id)
-                .unwrap_or(api::ROOT_ROOM_UUID);
+                .and_then(rumble_protocol::uuid_from_room_id)
+                .unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
 
-            if uuid != api::ROOT_ROOM_UUID {
+            if uuid != rumble_protocol::ROOT_ROOM_UUID {
                 children_of.entry(parent_uuid).or_default().push(idx);
             }
         }
@@ -304,7 +304,9 @@ fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
     let mut queue = VecDeque::new();
 
     // Find the root room index
-    let root_idx = room_uuids.iter().position(|u| *u == Some(api::ROOT_ROOM_UUID));
+    let root_idx = room_uuids
+        .iter()
+        .position(|u| *u == Some(rumble_protocol::ROOT_ROOM_UUID));
 
     if let Some(root_idx) = root_idx {
         queue.push_back(root_idx);
@@ -317,7 +319,7 @@ fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
             ..Default::default()
         });
         // Still enqueue children of ROOT_ROOM_UUID
-        if let Some(children) = children_of.get(&api::ROOT_ROOM_UUID) {
+        if let Some(children) = children_of.get(&rumble_protocol::ROOT_ROOM_UUID) {
             for &idx in children {
                 queue.push_back(idx);
             }
@@ -332,14 +334,14 @@ fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
         };
 
         let channel_id = state.channels.get_or_insert(uuid);
-        let parent = if uuid == api::ROOT_ROOM_UUID {
+        let parent = if uuid == rumble_protocol::ROOT_ROOM_UUID {
             None
         } else {
             let parent_uuid = room
                 .parent_id
                 .as_ref()
-                .and_then(api::uuid_from_room_id)
-                .unwrap_or(api::ROOT_ROOM_UUID);
+                .and_then(rumble_protocol::uuid_from_room_id)
+                .unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
             Some(state.channels.get_or_insert(parent_uuid))
         };
 
@@ -379,7 +381,7 @@ fn build_user_states(state: &BridgeState, exclude_session: u32) -> Vec<mumble::U
             let channel_id = user
                 .current_room
                 .as_ref()
-                .and_then(api::uuid_from_room_id)
+                .and_then(rumble_protocol::uuid_from_room_id)
                 .and_then(|uuid| state.channels.get_mumble_id(&uuid));
 
             users.push(mumble::UserState {

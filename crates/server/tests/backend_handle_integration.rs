@@ -1,6 +1,6 @@
-//! Integration tests for the backend crate interacting with the server.
+//! Integration tests for the rumble-client crate interacting with the server.
 //!
-//! These tests use the actual `BackendHandle` from the backend crate to test
+//! These tests use the actual `BackendHandle` from the rumble-client crate to test
 //! the full client-server interaction through the state-driven API.
 
 use std::{
@@ -14,7 +14,9 @@ use std::{
     time::Duration,
 };
 
-use backend::{BackendHandle, Command as BackendCommand, ConnectConfig, ConnectionState, SigningCallback};
+use rumble_client::{Command as BackendCommand, ConnectConfig, ConnectionState, SigningCallback};
+
+type BackendHandle = rumble_client::handle::BackendHandle<rumble_desktop::NativePlatform>;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 
@@ -128,7 +130,7 @@ fn create_backend_without_cert() -> (BackendHandle, Arc<AtomicBool>) {
 /// Wait for a condition to become true, polling state periodically.
 fn wait_for<F>(handle: &BackendHandle, timeout: Duration, condition: F) -> bool
 where
-    F: Fn(&backend::State) -> bool,
+    F: Fn(&rumble_client::State) -> bool,
 {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
@@ -289,7 +291,7 @@ fn test_backend_delete_room() {
         .iter()
         .find(|r| r.name == "Room To Delete")
         .and_then(|r| r.id.as_ref())
-        .and_then(api::uuid_from_room_id)
+        .and_then(rumble_protocol::uuid_from_room_id)
         .expect("Should find created room");
 
     let count_before = handle.state().rooms.len();
@@ -334,7 +336,7 @@ fn test_backend_rename_room() {
         .iter()
         .find(|r| r.name == "Original Room Name")
         .and_then(|r| r.id.as_ref())
-        .and_then(api::uuid_from_room_id)
+        .and_then(rumble_protocol::uuid_from_room_id)
         .expect("Should find created room");
 
     // Rename the room
@@ -624,7 +626,7 @@ fn test_backend_join_room() {
         .iter()
         .find(|r| r.name == "Room To Join")
         .and_then(|r| r.id.as_ref())
-        .and_then(api::uuid_from_room_id)
+        .and_then(rumble_protocol::uuid_from_room_id)
         .expect("Should find created room");
 
     // Join the room
@@ -636,7 +638,7 @@ fn test_backend_join_room() {
         let my_id = s.my_user_id;
         s.users.iter().any(|u| {
             u.user_id.as_ref().map(|id| id.value) == my_id
-                && u.current_room.as_ref().and_then(api::uuid_from_room_id) == Some(room_uuid)
+                && u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(room_uuid)
         })
     });
 
@@ -715,7 +717,7 @@ fn test_transmission_mode_defaults_to_ptt() {
 
     let state = handle.state();
     assert!(
-        matches!(state.audio.voice_mode, backend::VoiceMode::PushToTalk),
+        matches!(state.audio.voice_mode, rumble_client::VoiceMode::PushToTalk),
         "Default voice mode should be PushToTalk"
     );
     assert!(!state.audio.self_muted, "Should not be muted initially");
@@ -738,11 +740,11 @@ fn test_set_transmission_mode_updates_state() {
 
     // Change to Continuous mode
     handle.send(BackendCommand::SetVoiceMode {
-        mode: backend::VoiceMode::Continuous,
+        mode: rumble_client::VoiceMode::Continuous,
     });
 
     let mode_changed = wait_for(&handle, Duration::from_secs(2), |s| {
-        matches!(s.audio.voice_mode, backend::VoiceMode::Continuous)
+        matches!(s.audio.voice_mode, rumble_client::VoiceMode::Continuous)
     });
     assert!(mode_changed, "Voice mode should change to Continuous");
 
@@ -771,11 +773,11 @@ fn test_set_transmission_mode_updates_state() {
 
     // Change back to PTT mode
     handle.send(BackendCommand::SetVoiceMode {
-        mode: backend::VoiceMode::PushToTalk,
+        mode: rumble_client::VoiceMode::PushToTalk,
     });
 
     let ptt = wait_for(&handle, Duration::from_secs(2), |s| {
-        matches!(s.audio.voice_mode, backend::VoiceMode::PushToTalk)
+        matches!(s.audio.voice_mode, rumble_client::VoiceMode::PushToTalk)
     });
     assert!(ptt, "Should be in PushToTalk mode");
     assert!(
@@ -828,7 +830,7 @@ fn test_ptt_in_continuous_mode_ignored() {
 
     // Switch to Continuous mode
     handle.send(BackendCommand::SetVoiceMode {
-        mode: backend::VoiceMode::Continuous,
+        mode: rumble_client::VoiceMode::Continuous,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
@@ -870,7 +872,7 @@ fn test_switch_from_continuous_to_ptt_while_ptt_held() {
 
     // Start in Continuous mode
     handle.send(BackendCommand::SetVoiceMode {
-        mode: backend::VoiceMode::Continuous,
+        mode: rumble_client::VoiceMode::Continuous,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
@@ -881,7 +883,7 @@ fn test_switch_from_continuous_to_ptt_while_ptt_held() {
 
     // Now switch to PTT mode while "holding" PTT
     handle.send(BackendCommand::SetVoiceMode {
-        mode: backend::VoiceMode::PushToTalk,
+        mode: rumble_client::VoiceMode::PushToTalk,
     });
 
     std::thread::sleep(Duration::from_millis(200));
@@ -924,7 +926,7 @@ fn test_switch_from_ptt_to_continuous_continues_transmission() {
 
     // Switch to Continuous mode while transmitting
     handle.send(BackendCommand::SetVoiceMode {
-        mode: backend::VoiceMode::Continuous,
+        mode: rumble_client::VoiceMode::Continuous,
     });
 
     std::thread::sleep(Duration::from_millis(200));
@@ -957,7 +959,7 @@ fn test_continuous_mode_starts_on_connect() {
 
     // Set continuous mode BEFORE connecting
     handle.send(BackendCommand::SetVoiceMode {
-        mode: backend::VoiceMode::Continuous,
+        mode: rumble_client::VoiceMode::Continuous,
     });
 
     std::thread::sleep(Duration::from_millis(100));
@@ -1024,7 +1026,7 @@ fn test_mute_stops_continuous_transmission() {
 
     // Start in Continuous mode
     handle.send(BackendCommand::SetVoiceMode {
-        mode: backend::VoiceMode::Continuous,
+        mode: rumble_client::VoiceMode::Continuous,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
@@ -1055,7 +1057,7 @@ fn test_disconnect_clears_transmission_state() {
 
     // Start transmitting in Continuous mode
     handle.send(BackendCommand::SetVoiceMode {
-        mode: backend::VoiceMode::Continuous,
+        mode: rumble_client::VoiceMode::Continuous,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
@@ -1082,7 +1084,7 @@ fn test_continuous_mode_resumes_on_reconnect() {
 
     // Set continuous mode
     handle.send(BackendCommand::SetVoiceMode {
-        mode: backend::VoiceMode::Continuous,
+        mode: rumble_client::VoiceMode::Continuous,
     });
 
     // Connect
@@ -1106,7 +1108,7 @@ fn test_continuous_mode_resumes_on_reconnect() {
 
     // Mode should still be Continuous
     assert!(
-        matches!(handle.state().audio.voice_mode, backend::VoiceMode::Continuous),
+        matches!(handle.state().audio.voice_mode, rumble_client::VoiceMode::Continuous),
         "Voice mode should persist through disconnect"
     );
 

@@ -25,7 +25,7 @@ use tokio::{
 };
 use tracing::{debug, error, info};
 
-use egui_test::{Args, HotkeyBinding, HotkeyModifiers, RumbleApp};
+use rumble_egui::{Args, HotkeyBinding, HotkeyModifiers, RumbleApp};
 
 /// A simple wrapper around AccessKitNode that implements NodeT for querying.
 #[derive(Clone)]
@@ -381,7 +381,7 @@ impl ClientInstance {
 
     /// Share a file via the backend.
     fn share_file(&mut self, path: &str) -> anyhow::Result<String> {
-        use backend::Command;
+        use rumble_client::Command;
 
         // Send share command to backend
         self.app.backend().send(Command::ShareFile {
@@ -816,8 +816,8 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
                 let state_json = serde_json::json!({
                     "connected": client.is_connected(),
                     "rooms": backend_state.rooms.iter().map(|r| {
-                        let room_uuid = r.id.as_ref().and_then(api::uuid_from_room_id);
-                        let parent_uuid = r.parent_id.as_ref().and_then(api::uuid_from_room_id);
+                        let room_uuid = r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id);
+                        let parent_uuid = r.parent_id.as_ref().and_then(rumble_protocol::uuid_from_room_id);
                         serde_json::json!({
                             "uuid": room_uuid.map(|u| u.to_string()),
                             "name": r.name,
@@ -825,7 +825,7 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
                         })
                     }).collect::<Vec<_>>(),
                     "users": backend_state.users.iter().map(|u| {
-                        let room_uuid = u.current_room.as_ref().and_then(api::uuid_from_room_id);
+                        let room_uuid = u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id);
                         serde_json::json!({
                             "id": u.user_id.as_ref().map(|id| id.value),
                             "name": u.username,

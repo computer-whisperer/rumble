@@ -24,10 +24,10 @@ egui_kittest = { version = "0.33.3", features = ["wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Project crates
-egui-test = { path = "../egui-test" }
+rumble-egui = { path = "../rumble-egui" }
 server = { path = "../server" }
-backend = { path = "../backend" }
-api = { path = "../api" }
+rumble-client = { path = "../rumble-client" }
+rumble-protocol = { path = "../rumble-protocol" }
 
 # For generating self-signed certs
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }

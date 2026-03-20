@@ -7,7 +7,7 @@ use prost::Message;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
-use ::rumble_client::transport::{Transport, TransportRecvStream};
+use ::rumble_client_traits::transport::{Transport, TransportRecvStream};
 use mumble_bridge::{
     bridge::{self, BridgeEvent, BridgeLoopState, read_bridge, write_bridge},
     config::BridgeConfig,
@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
 
             // Pre-populate channel and user mappings
             for room in &rumble_conn.rooms {
-                if let Some(uuid) = room.id.as_ref().and_then(api::uuid_from_room_id) {
+                if let Some(uuid) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) {
                     state.channels.get_or_insert(uuid);
                 }
             }
@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
                     result = rumble_conn_for_dgram.read_datagram() => {
                         match result {
                             Ok(data) => {
-                                if let Ok(datagram) = api::proto::VoiceDatagram::decode(&*data) {
+                                if let Ok(datagram) = rumble_protocol::proto::VoiceDatagram::decode(&*data) {
                                     let _ = rumble_bridge_tx.send(BridgeEvent::RumbleVoice(datagram));
                                 }
                             }

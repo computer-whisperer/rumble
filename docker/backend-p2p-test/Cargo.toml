@@ -2,7 +2,7 @@
 name = "backend-p2p-test"
 version = "0.1.0"
 edition = "2021"
-description = "Docker-based integration test using backend crate for file transfer and NAT traversal"
+description = "Docker-based integration test using rumble-client crate for file transfer and NAT traversal"
 
 # Keep this crate out of the parent workspace
 [workspace]
@@ -12,8 +12,8 @@ name = "test-node"
 path = "src/test_node.rs"
 
 [dependencies]
-backend = { path = "../../crates/backend" }
-api = { path = "../../crates/api" }
+rumble-client = { path = "../../crates/rumble-client" }
+rumble-protocol = { path = "../../crates/rumble-protocol" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 tracing = "0.1"

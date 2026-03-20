@@ -16,13 +16,13 @@
 //! The voice/datagram path avoids holding any locks during I/O operations
 //! by taking snapshots of needed data first.
 
-use api::{
+use dashmap::DashMap;
+use quinn::Connection;
+use rumble_protocol::{
     ROOT_ROOM_UUID,
     proto::{RoomInfo, User, UserId},
     room_id_from_uuid, root_room_id, uuid_from_room_id,
 };
-use dashmap::DashMap;
-use quinn::Connection;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -222,9 +222,9 @@ impl StateData {
 
 /// Compute a state hash from a ServerState message.
 ///
-/// Re-exports the canonical hash function from the API crate.
-pub fn compute_server_state_hash(server_state: &api::proto::ServerState) -> Vec<u8> {
-    api::compute_server_state_hash(server_state)
+/// Re-exports the canonical hash function from the rumble-protocol crate.
+pub fn compute_server_state_hash(server_state: &rumble_protocol::proto::ServerState) -> Vec<u8> {
+    rumble_protocol::compute_server_state_hash(server_state)
 }
 
 /// Pending authentication state for a client.
@@ -344,7 +344,7 @@ impl ServerState {
 
     /// Get the server's certificate hash.
     pub fn server_cert_hash(&self) -> [u8; 32] {
-        api::compute_cert_hash(&self.server_cert_der)
+        rumble_protocol::compute_cert_hash(&self.server_cert_der)
     }
 
     /// Store pending authentication state.
@@ -611,7 +611,12 @@ impl ServerState {
     }
 
     /// Update a room's ACL data in-memory. Returns true if the room was found.
-    pub async fn set_room_acl(&self, room_uuid: Uuid, inherit_acl: bool, acls: Vec<api::proto::RoomAclEntry>) -> bool {
+    pub async fn set_room_acl(
+        &self,
+        room_uuid: Uuid,
+        inherit_acl: bool,
+        acls: Vec<rumble_protocol::proto::RoomAclEntry>,
+    ) -> bool {
         let mut data = self.state_data.write().await;
         for r in data.rooms.iter_mut() {
             if uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid) {
@@ -658,7 +663,7 @@ impl ServerState {
                         room.acls = acl
                             .entries
                             .iter()
-                            .map(|e| api::proto::RoomAclEntry {
+                            .map(|e| rumble_protocol::proto::RoomAclEntry {
                                 group: e.group.clone(),
                                 grant: e.grant,
                                 deny: e.deny,
@@ -828,7 +833,7 @@ impl Default for ServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use api::is_root_room;
+    use rumble_protocol::is_root_room;
 
     /// Test that we can create server state and it has the Root room.
     #[tokio::test]

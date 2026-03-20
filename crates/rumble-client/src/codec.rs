@@ -1,40 +1,35 @@
-//! Voice codec abstraction for encoding and decoding audio.
+//! Opus codec constants and utilities for voice communication.
+//!
+//! The concrete `VoiceEncoder` / `VoiceDecoder` implementations have moved
+//! to `rumble-desktop::codec` behind the `VoiceCodec` trait. This module
+//! retains shared constants and small helpers used across the backend.
 
-pub use api::EncoderSettings;
+pub use rumble_protocol::{
+    DTX_FRAME_MAX_SIZE, EncoderSettings, OPUS_DEFAULT_BITRATE, OPUS_DEFAULT_COMPLEXITY, OPUS_DEFAULT_PACKET_LOSS_PERC,
+    OPUS_FRAME_SIZE, OPUS_MAX_PACKET_SIZE, OPUS_SAMPLE_RATE,
+};
 
-/// Encodes PCM audio into compressed frames.
-pub trait VoiceEncoder: Send {
-    /// Encode a frame of PCM samples into `output`. Returns the number of
-    /// bytes written.
-    fn encode(&mut self, pcm: &[f32], output: &mut [u8]) -> anyhow::Result<usize>;
-
-    /// Apply new encoder settings (bitrate, complexity, etc.).
-    fn apply_settings(&mut self, settings: &EncoderSettings) -> anyhow::Result<()>;
-}
-
-/// Decodes compressed frames back to PCM audio.
-pub trait VoiceDecoder: Send {
-    /// Decode a compressed frame into PCM samples. Returns the number of
-    /// samples written.
-    fn decode(&mut self, data: &[u8], output: &mut [f32]) -> anyhow::Result<usize>;
-
-    /// Generate a packet-loss concealment frame (no data received).
-    fn decode_plc(&mut self, output: &mut [f32]) -> anyhow::Result<usize>;
-
-    /// Decode using Forward Error Correction data from a later packet.
-    fn decode_fec(&mut self, data: &[u8], output: &mut [f32]) -> anyhow::Result<usize>;
-}
-
-/// Factory for creating voice encoder and decoder instances.
+/// Check if an encoded Opus frame is a DTX (discontinuous transmission) silence frame.
 ///
-/// Implementations wrap a specific codec (e.g. Opus).
-pub trait VoiceCodec: Send + 'static {
-    type Encoder: VoiceEncoder;
-    type Decoder: VoiceDecoder;
+/// When DTX is enabled and the encoder detects silence, it produces very small
+/// frames (typically 1-2 bytes). These can be skipped to save bandwidth, with
+/// periodic keepalives to maintain the connection.
+#[inline]
+pub fn is_dtx_frame(encoded: &[u8]) -> bool {
+    encoded.len() <= DTX_FRAME_MAX_SIZE
+}
 
-    /// Create a new encoder with the given settings.
-    fn create_encoder(settings: &EncoderSettings) -> anyhow::Result<Self::Encoder>;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Create a new decoder with default settings.
-    fn create_decoder() -> anyhow::Result<Self::Decoder>;
+    #[test]
+    fn test_is_dtx_frame() {
+        // DTX frames are ≤2 bytes
+        assert!(is_dtx_frame(&[]), "empty frame should be DTX");
+        assert!(is_dtx_frame(&[0x00]), "1-byte frame should be DTX");
+        assert!(is_dtx_frame(&[0x00, 0x01]), "2-byte frame should be DTX");
+        assert!(!is_dtx_frame(&[0x00, 0x01, 0x02]), "3-byte frame should not be DTX");
+        assert!(!is_dtx_frame(&[0x00; 100]), "100-byte frame should not be DTX");
+    }
 }

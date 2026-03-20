@@ -1,34 +1,161 @@
-//! Platform-agnostic Rumble client library.
+//! Backend library for the Rumble voice chat client.
 //!
-//! This crate contains the client logic that works across all platforms.
-//! Platform-specific implementations (audio, transport, codec, etc.) are
-//! injected via the `Platform` trait.
+//! This crate provides the core client functionality:
+//! - Connection management via QUIC
+//! - Audio capture and playback
+//! - State-driven API for UI integration
+//!
+//! # Architecture
+//!
+//! The backend exposes a **state-driven API** to the UI. The UI does not poll for
+//! individual events; instead:
+//!
+//! 1. The backend exposes a `State` object representing the complete client state
+//! 2. The UI renders based on this state
+//! 3. User actions result in **commands** sent to the backend
+//! 4. The backend updates state and notifies the UI via a **repaint callback**
+//! 5. The UI re-renders from the new state
+//!
+//! # Usage
+//!
+//! ```ignore
+//! use rumble_client::{handle::BackendHandle, Command, State};
+//!
+//! // Create handle with a repaint callback (generic over Platform)
+//! let handle = BackendHandle::<MyPlatform>::new(|| {
+//!     // Request UI repaint
+//! });
+//!
+//! // Send commands
+//! handle.send(Command::Connect {
+//!     addr: "127.0.0.1:5000".to_string(),
+//!     name: "user".to_string(),
+//!     password: None,
+//! });
+//!
+//! // Read state for rendering
+//! let state = handle.state();
+//! match &state.connection {
+//!     ConnectionState::Connected { .. } => { /* render connected UI */ }
+//!     _ => { /* render disconnected UI */ }
+//! }
+//! ```
+//!
+//! ## Invariants / gotchas
+//! - Remote Opus decoders must be **per-peer and long-lived** (persist across talk spurts).
+//!   They should be cleared only when the peer leaves (or as a long-TTL fallback), otherwise
+//!   you will hear a crackle at speech start and see repeated `decoder initialized` logs.
 
+use std::path::PathBuf;
+
+// Audio constants and types (concrete I/O moved to rumble-desktop)
 pub mod audio;
-pub mod auth;
-pub mod cert;
-pub mod codec;
-pub mod file_transfer;
-pub mod keys;
-pub mod platform;
-pub mod storage;
-pub mod transport;
+pub use audio::{AudioDeviceInfo, CHANNELS, SAMPLE_RATE};
 
-// Re-export key types
-pub use audio::{AudioBackend, AudioCaptureStream, AudioPlaybackStream};
-pub use cert::{
+// Opus codec constants and utilities (concrete encoder/decoder moved to rumble-desktop)
+pub mod codec;
+pub use codec::{EncoderSettings, OPUS_FRAME_SIZE, OPUS_MAX_PACKET_SIZE, OPUS_SAMPLE_RATE, is_dtx_frame};
+
+// Bounded voice channel for handling slow connections
+pub mod bounded_voice;
+pub use bounded_voice::{
+    BoundedVoiceReceiver, BoundedVoiceSender, VoiceChannelConfig, VoiceChannelStats, bounded_voice_channel,
+};
+
+// Audio task (handles datagrams, cpal streams, Opus, jitter buffers)
+pub mod audio_task;
+pub use audio_task::{AudioCommand, AudioTaskConfig, AudioTaskHandle, spawn_audio_task};
+
+// Audio dumping for debugging
+pub mod audio_dump;
+pub use audio_dump::{AudioDumpConfig, AudioDumper};
+
+// Certificate verification for self-signed cert handling
+pub mod cert_verifier;
+pub use cert_verifier::{
     CapturedCert, ServerCertInfo, compute_sha256_fingerprint, is_cert_error_message, new_captured_cert,
     peek_captured_cert, take_captured_cert,
 };
-pub use codec::{VoiceCodec, VoiceDecoder, VoiceEncoder};
-pub use file_transfer::{
-    FileOffer, FileTransferPlugin, PluginPeerConnectionType, PluginPeerInfo, PluginPeerState, PluginTransferState,
-    TransferId, TransferStatus,
+
+// State and command types
+pub mod events;
+// Replace the brittle, hand-maintained re-export list with a wildcard re-export to avoid
+// build breaks when items in `events` are renamed/moved.
+pub use events::*;
+
+// Backend handle (generic over Platform)
+pub mod handle;
+
+// RPC server for external process control (Unix only — uses Unix domain sockets)
+#[cfg(unix)]
+pub mod rpc;
+
+// Waveform synthesizer for sound effects
+pub mod synth;
+
+// Sound effect definitions and library
+pub mod sfx;
+pub use sfx::{SfxKind, SfxLibrary};
+
+// Audio processing pipeline - processors
+pub mod processors;
+pub use processors::{
+    DenoiseProcessor, DenoiseProcessorFactory, GainProcessor, GainProcessorFactory, VadProcessor, VadProcessorFactory,
+    build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
 };
-pub use keys::{KeyInfo, KeySigning, KeySource};
-pub use platform::Platform;
-pub use storage::PersistentStorage;
-pub use transport::{
-    BiRecvStream, BiSendStream, BiStreamHandle, BiStreamOpener, DatagramTransport, StreamHeader, StreamOpener,
-    TlsConfig, Transport, TransportRecvStream, read_exact,
+
+// Re-export pipeline crate types
+pub use rumble_audio::{
+    AudioPipeline, AudioProcessor, PipelineConfig, ProcessorConfig, ProcessorFactory, ProcessorRegistry,
+    ProcessorResult, UserRxConfig, calculate_peak_db, calculate_rms_db, db_to_linear, linear_to_db,
 };
+
+// Re-exports from rumble-protocol crate
+pub use rumble_protocol::{ROOT_ROOM_UUID, proto::VoiceDatagram};
+
+/// Configuration for the backend client.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectConfig {
+    /// Additional certificate paths (DER or PEM format) to trust for server verification.
+    /// These are added to the system root certificates (webpki_roots).
+    /// Use this to add self-signed or development certificates from files.
+    pub additional_certs: Vec<PathBuf>,
+
+    /// Certificates that have been accepted by the user during this session.
+    /// These are DER-encoded certificate bytes that will be added to the trust store.
+    /// This is typically populated when the user accepts a self-signed certificate prompt.
+    pub accepted_certs: Vec<Vec<u8>>,
+
+    /// Directory to store downloaded files.
+    /// If None, defaults to system temp dir + "rumble_downloads".
+    pub download_dir: Option<PathBuf>,
+
+    /// If true, always use relay mode for file transfers.
+    /// This is useful when behind NAT or when you want to hide your IP.
+    pub prefer_relay: bool,
+}
+
+impl ConnectConfig {
+    /// Create a new config with default settings (only webpki system roots trusted).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an additional certificate path to trust (DER or PEM format).
+    pub fn with_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.additional_certs.push(path.into());
+        self
+    }
+
+    /// Set the download directory.
+    pub fn with_download_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.download_dir = Some(path.into());
+        self
+    }
+
+    /// Enable relay mode for file transfers (useful behind NAT).
+    pub fn with_prefer_relay(mut self, prefer: bool) -> Self {
+        self.prefer_relay = prefer;
+        self
+    }
+}

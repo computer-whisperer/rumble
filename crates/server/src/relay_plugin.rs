@@ -27,9 +27,9 @@ use std::{
 };
 
 use anyhow::Result;
-use api::proto;
 use dashmap::DashMap;
 use prost::Message;
+use rumble_protocol::proto;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 

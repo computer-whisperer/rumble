@@ -13,7 +13,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 bytes = "1"
-api = { path = "../api" }
+rumble-protocol = { path = "../rumble-protocol" }
 tokio-stream = "0.1"
 webpki-roots = "1.0.4"
 prost = "0.14"
@@ -42,6 +42,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # quinn = "0.11"
 # rcgen = "0.14"
 # rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-backend = { path = "../backend" }
+rumble-client = { path = "../rumble-client" }
+rumble-desktop = { path = "../rumble-desktop" }
 tempfile = "3.24.0"
 rustls-pemfile = "2"

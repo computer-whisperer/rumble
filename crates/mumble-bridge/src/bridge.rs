@@ -4,8 +4,8 @@ use std::{
 };
 
 use anyhow::Result;
-use api::proto::{self, envelope::Payload};
 use prost::Message;
+use rumble_protocol::proto::{self, envelope::Payload};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -102,8 +102,8 @@ pub async fn run_bridge(
     config: Arc<BridgeConfig>,
     bridge_state: Arc<RwLock<BridgeState>>,
     mut bridge_rx: mpsc::UnboundedReceiver<BridgeEvent>,
-    rumble_conn: rumble_native::QuinnConnection,
-    rumble_send: &mut rumble_native::QuinnTransport,
+    rumble_conn: rumble_desktop::QuinnConnection,
+    rumble_send: &mut rumble_desktop::QuinnTransport,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     loop_state: &mut BridgeLoopState,
 ) -> (Result<()>, mpsc::UnboundedReceiver<BridgeEvent>) {
@@ -355,7 +355,7 @@ pub async fn run_bridge(
 
                 // Move the virtual user to the corresponding Rumble room
                 if let (Some(vid), Some(uuid)) = (virtual_user_id, room_uuid) {
-                    let room_id = api::room_id_from_uuid(uuid);
+                    let room_id = rumble_protocol::room_id_from_uuid(uuid);
                     if let Err(e) = rumble_client::send_bridge_join_room(rumble_send, vid, room_id).await {
                         warn!(error = %e, vid, "Failed to send BridgeJoinRoom");
                     }
@@ -434,8 +434,8 @@ pub async fn run_bridge(
                         let channel_id = client.map(|c| c.channel_id);
                         let room_id = channel_id
                             .and_then(|ch| state.channels.get_rumble_uuid(ch))
-                            .map(api::room_id_from_uuid)
-                            .unwrap_or_else(api::root_room_id);
+                            .map(rumble_protocol::room_id_from_uuid)
+                            .unwrap_or_else(rumble_protocol::root_room_id);
                         let is_muted = client.map(|c| c.is_muted).unwrap_or(false);
                         let is_deafened = client.map(|c| c.is_deafened).unwrap_or(false);
                         (room_id, is_muted, is_deafened)
@@ -516,7 +516,7 @@ fn handle_rumble_envelope(
                             }
                         }
                         for room in &ss.rooms {
-                            if let Some(uuid) = room.id.as_ref().and_then(api::uuid_from_room_id) {
+                            if let Some(uuid) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) {
                                 state.channels.get_or_insert(uuid);
                             }
                         }
@@ -672,7 +672,7 @@ fn handle_state_update(
                 let channel_id = user
                     .current_room
                     .as_ref()
-                    .and_then(api::uuid_from_room_id)
+                    .and_then(rumble_protocol::uuid_from_room_id)
                     .map(|uuid| state.channels.get_or_insert(uuid))
                     .unwrap_or(0);
 
@@ -735,7 +735,7 @@ fn handle_state_update(
             let channel_id = um
                 .to_room_id
                 .as_ref()
-                .and_then(api::uuid_from_room_id)
+                .and_then(rumble_protocol::uuid_from_room_id)
                 .map(|uuid| state.channels.get_or_insert(uuid));
 
             if let (Some(session), Some(channel_id)) = (session, channel_id) {
@@ -773,13 +773,13 @@ fn handle_state_update(
         Some(proto::state_update::Update::RoomCreated(rc)) => {
             if let Some(room) = rc.room {
                 let mut state = write_bridge(&bridge_state);
-                let uuid = room.id.as_ref().and_then(api::uuid_from_room_id);
+                let uuid = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id);
                 if let Some(uuid) = uuid {
                     let channel_id = state.channels.get_or_insert(uuid);
                     let parent = room
                         .parent_id
                         .as_ref()
-                        .and_then(api::uuid_from_room_id)
+                        .and_then(rumble_protocol::uuid_from_room_id)
                         .map(|p| state.channels.get_or_insert(p))
                         .unwrap_or(0);
 
@@ -800,14 +800,14 @@ fn handle_state_update(
         }
 
         Some(proto::state_update::Update::RoomDeleted(rd)) => {
-            let uuid = rd.room_id.as_ref().and_then(api::uuid_from_room_id);
+            let uuid = rd.room_id.as_ref().and_then(rumble_protocol::uuid_from_room_id);
             if let Some(uuid) = uuid {
                 let mut state = write_bridge(&bridge_state);
                 let channel_id = state.channels.get_mumble_id(&uuid);
                 state.channels.remove_by_uuid(&uuid);
                 state
                     .rumble_rooms
-                    .retain(|r| r.id.as_ref().and_then(api::uuid_from_room_id) != Some(uuid));
+                    .retain(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) != Some(uuid));
 
                 if let Some(channel_id) = channel_id {
                     let remove = mumble::ChannelRemove { channel_id };
@@ -819,7 +819,7 @@ fn handle_state_update(
         }
 
         Some(proto::state_update::Update::RoomRenamed(rr)) => {
-            let uuid = rr.room_id.as_ref().and_then(api::uuid_from_room_id);
+            let uuid = rr.room_id.as_ref().and_then(rumble_protocol::uuid_from_room_id);
             if let Some(uuid) = uuid {
                 let state = read_bridge(&bridge_state);
                 let channel_id = state.channels.get_mumble_id(&uuid);
@@ -836,8 +836,8 @@ fn handle_state_update(
         }
 
         Some(proto::state_update::Update::RoomMoved(rm)) => {
-            let uuid = rm.room_id.as_ref().and_then(api::uuid_from_room_id);
-            let new_parent_uuid = rm.new_parent_id.as_ref().and_then(api::uuid_from_room_id);
+            let uuid = rm.room_id.as_ref().and_then(rumble_protocol::uuid_from_room_id);
+            let new_parent_uuid = rm.new_parent_id.as_ref().and_then(rumble_protocol::uuid_from_room_id);
             if let (Some(uuid), Some(parent_uuid)) = (uuid, new_parent_uuid) {
                 let state = read_bridge(&bridge_state);
                 let channel_id = state.channels.get_mumble_id(&uuid);
@@ -855,7 +855,7 @@ fn handle_state_update(
         }
 
         Some(proto::state_update::Update::RoomDescriptionChanged(rdc)) => {
-            let uuid = rdc.room_id.as_ref().and_then(api::uuid_from_room_id);
+            let uuid = rdc.room_id.as_ref().and_then(rumble_protocol::uuid_from_room_id);
             if let Some(uuid) = uuid {
                 // Update cached room description
                 {
@@ -863,7 +863,7 @@ fn handle_state_update(
                     if let Some(room) = state
                         .rumble_rooms
                         .iter_mut()
-                        .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(uuid))
+                        .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(uuid))
                     {
                         room.description = if rdc.description.is_empty() {
                             None

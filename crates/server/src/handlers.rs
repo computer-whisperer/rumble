@@ -17,14 +17,14 @@ use crate::{
     state::{ClientHandle, PendingAuth, ServerState, SessionEntry, UserStatus, compute_server_state_hash},
 };
 use anyhow::Result;
-use api::{
+use ed25519_dalek::{Signature, VerifyingKey};
+use prost::Message;
+use rumble_protocol::{
     ROOT_ROOM_UUID, build_auth_payload, build_session_cert_payload, compute_session_id, encode_frame,
     permissions::Permissions,
     proto::{self, ServerState as ProtoServerState, VoiceDatagram, envelope::Payload},
     room_id_from_uuid, uuid_from_room_id,
 };
-use ed25519_dalek::{Signature, VerifyingKey};
-use prost::Message;
 use std::{
     sync::{Arc, atomic::Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -416,14 +416,15 @@ async fn handle_authenticate(
         // Build group permissions map
         let mut group_perms = std::collections::HashMap::new();
         for (name, pg) in persist.list_groups() {
-            if let Some(perms) = api::permissions::Permissions::from_bits(pg.permissions) {
+            if let Some(perms) = rumble_protocol::permissions::Permissions::from_bits(pg.permissions) {
                 group_perms.insert(name, perms);
             }
         }
         // Evaluate at root - if BANNED flag is present, reject
         let root_chain = vec![(ROOT_ROOM_UUID, None)];
-        let effective = api::permissions::effective_permissions(&check_groups, &group_perms, &root_chain, false);
-        if effective.contains(api::permissions::Permissions::BANNED) {
+        let effective =
+            rumble_protocol::permissions::effective_permissions(&check_groups, &group_perms, &root_chain, false);
+        if effective.contains(rumble_protocol::permissions::Permissions::BANNED) {
             return send_auth_failed(&sender, "You are banned from this server").await;
         }
     }

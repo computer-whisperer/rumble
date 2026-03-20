@@ -9,13 +9,13 @@ use crate::{
     state::{ClientHandle, ServerState},
 };
 use anyhow::Result;
-use api::{
-    proto::{self, Envelope},
-    try_decode_frame,
-};
 use bytes::BytesMut;
 use prost::Message;
 use quinn::{Endpoint, ServerConfig};
+use rumble_protocol::{
+    proto::{self, Envelope},
+    try_decode_frame,
+};
 use std::{
     net::SocketAddr,
     sync::{Arc, atomic::AtomicBool},
@@ -112,7 +112,7 @@ impl Server {
             for (uuid_bytes, room) in rooms {
                 let uuid = uuid::Uuid::from_bytes(uuid_bytes);
                 // Skip the root room UUID (all zeros)
-                if uuid == api::ROOT_ROOM_UUID {
+                if uuid == rumble_protocol::ROOT_ROOM_UUID {
                     continue;
                 }
                 // Convert parent bytes to UUID if present
@@ -436,7 +436,7 @@ async fn run_envelope_stream_with_prefix(
                     state_hash: Vec::new(),
                     payload: None,
                 };
-                let frame = api::encode_frame(&env);
+                let frame = rumble_protocol::encode_frame(&env);
                 if handle.send_frame(&frame).await.is_err() {
                     info!("connection dead after read timeout");
                     break;

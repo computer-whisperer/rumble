@@ -99,7 +99,7 @@ enum Commands {
     /// Clean teardown: close all clients, stop server, stop daemon
     Down,
 
-    /// Rebuild egui-test and take a new screenshot (agent iteration loop)
+    /// Rebuild rumble-egui and take a new screenshot (agent iteration loop)
     Iterate {
         /// Client ID (default: 1)
         #[arg(short, long, default_value = "1")]
@@ -783,10 +783,10 @@ async fn handle_iterate(
     println!("Closing client {}...", client_id);
     let _ = send_command(socket_path, Command::ClientClose { id: client_id }).await;
 
-    // Step 2: Rebuild egui-test
-    println!("Building egui-test...");
+    // Step 2: Rebuild rumble-egui
+    println!("Building rumble-egui...");
     let build_status = std::process::Command::new("cargo")
-        .args(["build", "-p", "egui-test"])
+        .args(["build", "-p", "rumble-egui"])
         .status()
         .context("Failed to run cargo build")?;
 

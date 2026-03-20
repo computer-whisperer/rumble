@@ -12,15 +12,15 @@ use std::{
 };
 
 use anyhow::Result;
-use api::{
-    build_auth_payload, build_session_cert_payload, compute_cert_hash, compute_session_id, encode_frame,
-    proto::{self, Envelope, RoomInfo, User, envelope::Payload},
-    room_id_from_uuid, try_decode_frame, uuid_from_room_id,
-};
 use bytes::BytesMut;
 use ed25519_dalek::{Signer, SigningKey};
 use prost::Message;
 use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
+use rumble_protocol::{
+    build_auth_payload, build_session_cert_payload, compute_cert_hash, compute_session_id, encode_frame,
+    proto::{self, Envelope, RoomInfo, User, envelope::Payload},
+    room_id_from_uuid, try_decode_frame, uuid_from_room_id,
+};
 use rustls_pemfile;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -797,11 +797,11 @@ impl TestClient {
                     }
                 }
                 proto::state_update::Update::RoomAclChanged(rac) => {
-                    if let Some(rid) = rac.room_id.and_then(|r| api::uuid_from_room_id(&r)) {
+                    if let Some(rid) = rac.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
                         if let Some(room) = self
                             .rooms
                             .iter_mut()
-                            .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(rid))
+                            .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(rid))
                         {
                             room.inherit_acl = rac.inherit_acl;
                             room.acls = rac.entries;
@@ -1719,7 +1719,7 @@ async fn test_unregistered_user_starts_in_root() {
 
     assert_eq!(
         current_room_uuid,
-        api::ROOT_ROOM_UUID,
+        rumble_protocol::ROOT_ROOM_UUID,
         "unregistered user should start in Root room"
     );
 
@@ -1797,7 +1797,7 @@ async fn test_last_room_deleted_falls_back_to_root() {
 
     assert_eq!(
         current_room_uuid,
-        api::ROOT_ROOM_UUID,
+        rumble_protocol::ROOT_ROOM_UUID,
         "user should fall back to Root when last room is deleted"
     );
 

@@ -11,25 +11,25 @@ Rumble is a voice chat application (similar to Discord/Mumble) written in Rust. 
 ```bash
 cargo build                    # Build all crates
 cargo run --bin server         # Run the server
-cargo run -p egui-test         # Run the GUI client
+cargo run -p rumble-egui       # Run the GUI client
 cargo test                     # Run all tests
 cargo +nightly fmt             # Format code
-RUST_LOG=debug cargo run -p egui-test  # Run with debug logging
+RUST_LOG=debug cargo run -p rumble-egui  # Run with debug logging
 ```
 
-When fixing build issues, run `cargo build -p egui-test` and address the **first** error (later errors are often cascading).
+When fixing build issues, run `cargo build -p rumble-egui` and address the **first** error (later errors are often cascading).
 
 ## Crate Architecture
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│              egui-test (GUI Application)            │
+│           rumble-egui (GUI Application)             │
 │              Uses egui + eframe for UI              │
 └───────────────────────┬─────────────────────────────┘
                         │ Commands / State reads
                         ▼
 ┌─────────────────────────────────────────────────────┐
-│              backend (Client Library)               │
+│           rumble-client (Client Library)            │
 │   BackendHandle with Arc<RwLock<State>>             │
 │   ┌─────────────────┐  ┌────────────────────┐       │
 │   │ Connection Task │  │ Audio Task         │       │
@@ -41,11 +41,11 @@ When fixing build issues, run `cargo build -p egui-test` and address the **first
                         │
          ┌──────────────┼──────────────┐
          ▼              ▼              ▼
-    ┌────────┐    ┌──────────┐   ┌────────────┐
-    │  api   │    │ pipeline │   │   server   │
-    │ proto  │    │ audio    │   │  handlers  │
-    │ types  │    │ procs    │   │  state     │
-    └────────┘    └──────────┘   └────────────┘
+┌──────────────┐ ┌─────────────┐ ┌────────────┐
+│rumble-protocol│ │ rumble-audio│ │   server   │
+│    proto     │ │   audio     │ │  handlers  │
+│    types     │ │   procs     │ │  state     │
+└──────────────┘ └─────────────┘ └────────────┘
                                       ▲
                                       │ Bridge protocol
                                ┌──────┴──────┐
@@ -57,20 +57,22 @@ When fixing build issues, run `cargo build -p egui-test` and address the **first
 
 ### Crate Responsibilities
 
-- **api**: Protocol Buffers definitions (`proto/api.proto`), message framing, BLAKE3 state hashing
-- **backend**: Client library - QUIC connection, audio I/O (cpal), Opus codec, jitter buffers
+- **rumble-protocol**: Protocol Buffers definitions (`proto/api.proto`), message framing, BLAKE3 state hashing
+- **rumble-client**: Client library - QUIC connection, audio I/O (cpal), Opus codec, jitter buffers
+- **rumble-client-traits**: Platform-agnostic client traits (transport, audio, codec, keys, storage)
+- **rumble-desktop**: Native desktop Platform implementation (quinn, cpal, opus, ed25519)
 - **server**: Server binary - room management, user auth, message relay, persistence (sled)
-- **pipeline**: Pluggable audio processor framework (denoise, VAD, gain control)
-- **egui-test**: GUI client using egui with tree view for room hierarchy; also exports `TestHarness` for programmatic UI control
+- **rumble-audio**: Pluggable audio processor framework (denoise, VAD, gain control)
+- **rumble-egui**: GUI client using egui with tree view for room hierarchy; also exports `TestHarness` for programmatic UI control
 - **harness-cli**: Daemon-based CLI for automated GUI testing with screenshots and input injection
 - **mumble-bridge**: Bidirectional bridge between Mumble and Rumble servers, proxying voice and chat
 
 ## Key Architecture Patterns
 
 ### State-Driven UI
-The backend exposes a shared `State` via `Arc<RwLock<State>>`. The UI reads state directly for rendering and sends fire-and-forget commands. Backend updates state and calls repaint callback to notify UI.
+The client exposes a shared `State` via `Arc<RwLock<State>>`. The UI reads state directly for rendering and sends fire-and-forget commands. Client updates state and calls repaint callback to notify UI.
 
-### Two-Task Backend Design
+### Two-Task Client Design
 1. **Connection Task**: QUIC reliable streams for protocol messages and state sync
 2. **Audio Task**: QUIC unreliable datagrams for voice, cpal streams for audio I/O
 
@@ -86,14 +88,14 @@ Server sends incremental `StateUpdate` messages with BLAKE3 hash. Client verifie
 ## Protocol Details
 
 - **Transport**: QUIC (quinn) - reliable streams for control, unreliable datagrams for voice
-- **Serialization**: Protocol Buffers (prost) - see `crates/api/proto/api.proto`
+- **Serialization**: Protocol Buffers (prost) - see `crates/rumble-protocol/proto/api.proto`
 - **Audio Format**: Opus at 48kHz, 20ms frames (960 samples)
 - **Authentication**: Ed25519 signatures with optional SSH agent support
 - **File Sharing**: Server relay (with plugin architecture for alternative backends)
 
 ## Audio: Opus Decoder Lifetime (important)
 
-Each remote peer must have a **long-lived Opus decoder instance** that persists across talk spurts. It should only be dropped when the peer leaves the room/session (or after a very long TTL GC fallback). Re-initializing decoders per received packet/talkspurt will cause `backend::codec: codec: decoder initialized` spam and audible crackle/pop at start of speech.
+Each remote peer must have a **long-lived Opus decoder instance** that persists across talk spurts. It should only be dropped when the peer leaves the room/session (or after a very long TTL GC fallback). Re-initializing decoders per received packet/talkspurt will cause `rumble_client::codec: codec: decoder initialized` spam and audible crackle/pop at start of speech.
 
 ## Formatting
 
@@ -110,7 +112,7 @@ Located in `vendor/`. Used primarily for reference; code links against GitHub ve
 
 ## GUI Test Harness
 
-The `egui-test` crate is structured as both a library and binary, enabling programmatic control of the GUI for agents and integration tests. See [docs/test-harness.md](docs/test-harness.md) for API details and code examples.
+The `rumble-egui` crate is structured as both a library and binary, enabling programmatic control of the GUI for agents and integration tests. See [docs/test-harness.md](docs/test-harness.md) for API details and code examples.
 
 ## Harness CLI (for agent iteration loops)
 

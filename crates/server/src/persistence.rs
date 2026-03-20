@@ -10,7 +10,7 @@
 //! - Sudo password (fixed key → bcrypt hash)
 
 use anyhow::Result;
-use api::permissions::{ADMIN_PERMISSIONS, DEFAULT_PERMISSIONS};
+use rumble_protocol::permissions::{ADMIN_PERMISSIONS, DEFAULT_PERMISSIONS};
 use serde::{Deserialize, Serialize};
 use sled::Db;
 use std::path::Path;

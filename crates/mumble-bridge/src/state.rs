@@ -26,7 +26,7 @@ impl ChannelMap {
     /// Get or create a Mumble channel ID for a Rumble room UUID.
     /// Root room (UUID nil) always maps to channel 0.
     pub fn get_or_insert(&mut self, uuid: Uuid) -> u32 {
-        if uuid == api::ROOT_ROOM_UUID {
+        if uuid == rumble_protocol::ROOT_ROOM_UUID {
             self.rumble_to_mumble.insert(uuid, 0);
             self.mumble_to_rumble.insert(0, uuid);
             return 0;
@@ -134,9 +134,9 @@ pub struct BridgeState {
     /// Next Mumble session ID for local Mumble clients.
     pub next_mumble_session: u32,
     /// Cached Rumble rooms (from latest ServerState/StateUpdate).
-    pub rumble_rooms: Vec<api::proto::RoomInfo>,
+    pub rumble_rooms: Vec<rumble_protocol::proto::RoomInfo>,
     /// Cached Rumble users (from latest ServerState/StateUpdate).
-    pub rumble_users: Vec<api::proto::User>,
+    pub rumble_users: Vec<rumble_protocol::proto::User>,
     /// Our bridge user ID on the Rumble server.
     pub bridge_user_id: Option<u64>,
     /// Whether we are connected to the Rumble server.

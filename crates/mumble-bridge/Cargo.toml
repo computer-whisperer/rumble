@@ -8,9 +8,9 @@ name = "mumble-bridge"
 path = "src/main.rs"
 
 [dependencies]
-api = { path = "../api" }
-rumble-client = { path = "../rumble-client" }
-rumble-native = { path = "../rumble-native" }
+rumble-protocol = { path = "../rumble-protocol" }
+rumble-client-traits = { path = "../rumble-client-traits" }
+rumble-desktop = { path = "../rumble-desktop" }
 tokio = { version = "1", features = ["full"] }
 prost = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }

@@ -295,28 +295,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "170433209e817da6aae2c51aa0dd443009a613425dd041ebfb2492d1c4c11a25"
 
 [[package]]
-name = "api"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.11.0",
- "blake3",
- "bytes",
- "ed25519-dalek 3.0.0-pre.6",
- "hex",
- "pipeline",
- "prost",
- "prost-build",
- "prost-types",
- "rand 0.10.0",
- "rand_core 0.10.0",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -764,43 +742,6 @@ dependencies = [
  "cmake",
  "dunce",
  "fs_extra",
-]
-
-[[package]]
-name = "backend"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "api",
- "async-trait",
- "blake3",
- "bytes",
- "ed25519-dalek 3.0.0-pre.6",
- "futures",
- "hex",
- "mime_guess",
- "nnnoiseless",
- "open",
- "pipeline",
- "prost",
- "quinn",
- "rand 0.10.0",
- "rand_core 0.10.0",
- "rumble-client",
- "rumble-native",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "urlencoding",
- "uuid",
- "webpki-roots",
 ]
 
 [[package]]
@@ -1871,46 +1812,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "egui-test"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "api",
- "arboard",
- "argon2",
- "ashpd 0.12.3",
- "backend",
- "base64 0.22.1",
- "chacha20poly1305",
- "clap",
- "directories",
- "ed25519-dalek 3.0.0-pre.6",
- "eframe",
- "egui_extras",
- "egui_kittest",
- "egui_ltreeview",
- "futures-util",
- "getrandom 0.3.4",
- "global-hotkey",
- "hex",
- "image",
- "rand 0.10.0",
- "rand_core 0.10.0",
- "rfd",
- "serde",
- "serde_json",
- "service-binding",
- "sha2 0.10.9",
- "ssh-agent-lib",
- "ssh-key",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "egui-wgpu"
 version = "0.33.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2720,15 +2621,15 @@ name = "harness-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "api",
- "backend",
  "clap",
  "eframe",
- "egui-test",
  "egui_kittest",
  "hex",
  "image",
  "rcgen 0.13.2",
+ "rumble-client",
+ "rumble-egui",
+ "rumble-protocol",
  "rustls",
  "serde",
  "serde_json",
@@ -3441,7 +3342,6 @@ name = "mumble-bridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "api",
  "bytes",
  "clap",
  "dashmap",
@@ -3451,8 +3351,9 @@ dependencies = [
  "prost-build",
  "rand 0.10.0",
  "rcgen 0.13.2",
- "rumble-client",
- "rumble-native",
+ "rumble-client-traits",
+ "rumble-desktop",
+ "rumble-protocol",
  "rustls",
  "tokio",
  "tokio-rustls",
@@ -4356,14 +4257,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pipeline"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "piper"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5090,25 +4983,68 @@ dependencies = [
 ]
 
 [[package]]
+name = "rumble-audio"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rumble-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "api",
  "async-trait",
- "pipeline",
+ "blake3",
+ "bytes",
+ "ed25519-dalek 3.0.0-pre.6",
+ "futures",
+ "hex",
+ "mime_guess",
+ "nnnoiseless",
+ "open",
  "prost",
+ "quinn",
+ "rand 0.10.0",
+ "rand_core 0.10.0",
+ "rumble-audio",
+ "rumble-client-traits",
+ "rumble-protocol",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "uuid",
+ "webpki-roots",
+]
+
+[[package]]
+name = "rumble-client-traits"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "prost",
+ "rumble-audio",
+ "rumble-protocol",
  "serde",
  "sha2 0.10.9",
  "uuid",
 ]
 
 [[package]]
-name = "rumble-native"
+name = "rumble-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "api",
  "argon2",
  "async-trait",
  "bytes",
@@ -5124,7 +5060,8 @@ dependencies = [
  "quinn",
  "rand 0.10.0",
  "rand_core 0.10.0",
- "rumble-client",
+ "rumble-client-traits",
+ "rumble-protocol",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -5140,6 +5077,69 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots",
+]
+
+[[package]]
+name = "rumble-egui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "argon2",
+ "ashpd 0.12.3",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "clap",
+ "directories",
+ "ed25519-dalek 3.0.0-pre.6",
+ "eframe",
+ "egui_extras",
+ "egui_kittest",
+ "egui_ltreeview",
+ "futures-util",
+ "getrandom 0.3.4",
+ "global-hotkey",
+ "hex",
+ "image",
+ "rand 0.10.0",
+ "rand_core 0.10.0",
+ "rfd",
+ "rumble-client",
+ "rumble-desktop",
+ "rumble-protocol",
+ "serde",
+ "serde_json",
+ "service-binding",
+ "sha2 0.10.9",
+ "ssh-agent-lib",
+ "ssh-key",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "rumble-protocol"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "blake3",
+ "bytes",
+ "ed25519-dalek 3.0.0-pre.6",
+ "hex",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "rand 0.10.0",
+ "rand_core 0.10.0",
+ "rumble-audio",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "urlencoding",
+ "uuid",
 ]
 
 [[package]]
@@ -5467,9 +5467,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "api",
  "async-trait",
- "backend",
  "base64 0.21.7",
  "bcrypt",
  "bincode",
@@ -5486,6 +5484,9 @@ dependencies = [
  "rand 0.10.0",
  "rand_core 0.10.0",
  "rcgen 0.14.7",
+ "rumble-client",
+ "rumble-desktop",
+ "rumble-protocol",
  "rustls",
  "rustls-pemfile",
  "serde",
