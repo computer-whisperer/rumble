@@ -5070,17 +5070,11 @@ impl RumbleApp {
                             .add(egui::Button::new(egui::RichText::new("Ban").color(egui::Color32::RED)))
                             .clicked()
                         {
-                            let reason = self.ban_modal.reason.clone();
-
-                            // TODO: Send ban command when BanUser command is available.
-                            // For now, kick the user with the ban reason.
-                            self.backend.send(Command::KickUser {
+                            let duration_secs = BAN_DURATIONS[self.ban_modal.duration_index].1;
+                            self.backend.send(Command::BanUser {
                                 target_user_id: self.ban_modal.target_user_id,
-                                reason: if reason.is_empty() {
-                                    "Banned".to_string()
-                                } else {
-                                    format!("Banned: {}", reason)
-                                },
+                                reason: self.ban_modal.reason.clone(),
+                                duration_seconds: if duration_secs == 0 { None } else { Some(duration_secs) },
                             });
 
                             ui.close();

@@ -140,6 +140,7 @@ message Envelope {
     // ACL Messages (80-93)
     // Client -> Server
     KickUser kick_user = 80;
+    BanUser ban_user = 81;
     SetServerMute set_server_mute = 83;
     Elevate elevate = 84;
     CreateGroup create_group = 85;
@@ -485,6 +486,14 @@ message PermissionDenied {
 message KickUser {
   uint64 target_user_id = 1;
   string reason = 2;
+}
+
+// Ban user from server (adds to "banned" group and kicks).
+message BanUser {
+  uint64 target_user_id = 1;
+  string reason = 2;
+  // Duration in seconds; 0 = permanent.
+  uint64 duration_seconds = 3;
 }
 
 // Notification that a user was kicked.

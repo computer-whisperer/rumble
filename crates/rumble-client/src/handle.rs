@@ -1108,6 +1108,25 @@ async fn run_connection_task<P: Platform>(
                             }
                         }
                     }
+                    Command::BanUser {
+                        target_user_id,
+                        reason,
+                        duration_seconds,
+                    } => {
+                        if let Some(t) = &mut transport {
+                            let env = proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::BanUser(proto::BanUser {
+                                    target_user_id,
+                                    reason,
+                                    duration_seconds: duration_seconds.unwrap_or(0),
+                                })),
+                            };
+                            if let Err(e) = send_envelope(t, &env).await {
+                                error!("Failed to send BanUser: {}", e);
+                            }
+                        }
+                    }
                     Command::SetServerMute { target_user_id, muted } => {
                         if let Some(t) = &mut transport {
                             let env = proto::Envelope {

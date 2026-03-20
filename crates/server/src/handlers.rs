@@ -201,6 +201,12 @@ pub async fn handle_envelope(
             }
             handle_kick_user(ku, sender, state, persistence).await?;
         }
+        Some(Payload::BanUser(bu)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_ban_user(bu, sender, state, persistence).await?;
+        }
         Some(Payload::SetServerMute(ssm)) => {
             if !sender.authenticated.load(Ordering::SeqCst) {
                 return Ok(());
@@ -1848,6 +1854,119 @@ async fn handle_kick_user(
     cleanup_client(&target_client, &state).await;
 
     send_command_result(&sender, "KickUser", true, &format!("Kicked '{}'", target_username)).await
+}
+
+/// Handle BanUser - ban a user from the server.
+///
+/// This adds the target user to a "banned" group (creating it if needed with the
+/// BANNED permission flag), then kicks them. The BANNED flag is checked at auth
+/// time to reject future connections.
+async fn handle_ban_user(
+    bu: proto::BanUser,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    // Permission check: BAN at root
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::BAN, &persistence).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let target_user_id = bu.target_user_id;
+
+    // Cannot ban yourself
+    if target_user_id == sender.user_id {
+        return send_command_result(&sender, "BanUser", false, "Cannot ban yourself").await;
+    }
+
+    let target_client = match state.get_client(target_user_id) {
+        Some(c) => c,
+        None => {
+            return send_command_result(&sender, "BanUser", false, "User not found").await;
+        }
+    };
+
+    // Cannot ban elevated superusers
+    if target_client.is_superuser.load(Ordering::Relaxed) {
+        return send_command_result(&sender, "BanUser", false, "Cannot ban a superuser").await;
+    }
+
+    // Cannot ban bridge connections
+    if target_client.is_bridge.load(Ordering::SeqCst) {
+        return send_command_result(&sender, "BanUser", false, "Cannot ban a bridge connection").await;
+    }
+
+    let Some(persist) = &persistence else {
+        return send_command_result(&sender, "BanUser", false, "Persistence not enabled").await;
+    };
+
+    // Ensure "banned" group exists with the BANNED permission flag
+    if persist.get_group("banned").is_none() {
+        let _ = persist.create_group("banned", Permissions::BANNED.bits());
+    }
+
+    // Add target to "banned" group
+    let target_key = state.get_user_public_key(target_user_id);
+    if let Some(key) = target_key {
+        let _ = persist.add_user_to_group(&key, "banned");
+    } else {
+        return send_command_result(&sender, "BanUser", false, "Cannot resolve user's public key").await;
+    }
+
+    // Update cached groups if they're connected
+    {
+        let mut groups = target_client.groups.write().await;
+        if !groups.contains(&"banned".to_string()) {
+            groups.push("banned".to_string());
+        }
+    }
+
+    let banned_by = sender.get_username().await;
+    let target_username = target_client.get_username().await;
+    let duration_desc = if bu.duration_seconds == 0 {
+        "permanent".to_string()
+    } else {
+        format!("{}s", bu.duration_seconds)
+    };
+    info!(
+        banned_by = %banned_by,
+        target = %target_username,
+        reason = %bu.reason,
+        duration = %duration_desc,
+        "BanUser"
+    );
+
+    // Send UserKicked to the target (they see a ban message)
+    let ban_reason = if bu.reason.is_empty() {
+        format!("Banned by {} ({})", banned_by, duration_desc)
+    } else {
+        format!("Banned by {} ({}): {}", banned_by, duration_desc, bu.reason)
+    };
+    let kicked_env = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::UserKicked(proto::UserKicked {
+            user_id: target_user_id,
+            reason: ban_reason,
+            kicked_by: banned_by.clone(),
+        })),
+    };
+    let frame = encode_frame(&kicked_env);
+    let _ = target_client.send_frame(&frame).await;
+
+    // Close the target's connection
+    target_client.conn.close(quinn::VarInt::from_u32(3), b"banned");
+
+    // Clean up the banned user (broadcasts UserLeft)
+    cleanup_client(&target_client, &state).await;
+
+    send_command_result(
+        &sender,
+        "BanUser",
+        true,
+        &format!("Banned '{}' ({})", target_username, duration_desc),
+    )
+    .await
 }
 
 /// Handle SetServerMute - set server mute on another user.

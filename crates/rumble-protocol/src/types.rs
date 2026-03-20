@@ -1217,6 +1217,13 @@ pub enum Command {
         target_user_id: u64,
         reason: String,
     },
+    /// Ban a user from the server (adds to "banned" group and kicks).
+    BanUser {
+        target_user_id: u64,
+        reason: String,
+        /// Duration in seconds; None = permanent.
+        duration_seconds: Option<u64>,
+    },
     /// Set server mute on another user.
     SetServerMute {
         target_user_id: u64,
@@ -1358,6 +1365,16 @@ impl std::fmt::Debug for Command {
                 .debug_struct("KickUser")
                 .field("target_user_id", target_user_id)
                 .field("reason", reason)
+                .finish(),
+            Command::BanUser {
+                target_user_id,
+                reason,
+                duration_seconds,
+            } => f
+                .debug_struct("BanUser")
+                .field("target_user_id", target_user_id)
+                .field("reason", reason)
+                .field("duration_seconds", duration_seconds)
                 .finish(),
             Command::SetServerMute { target_user_id, muted } => f
                 .debug_struct("SetServerMute")

@@ -1282,9 +1282,9 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                     if should_send {
                         let datagram = VoiceDatagram {
                             sender_id: Some(my_user_id),
-                            room_id: None, // TODO: set room ID
+                            room_id: None, // Server determines room from connection state
                             sequence: send_sequence,
-                            timestamp_us: 0, // TODO: track timestamp
+                            timestamp_us: 0, // Optional per proto; receiver uses arrival time
                             opus_data,
                             end_of_stream,
                         };
