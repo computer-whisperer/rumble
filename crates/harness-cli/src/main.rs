@@ -894,9 +894,10 @@ fn print_response(response: &Response) {
             ResponseData::Connected { connected } => {
                 println!("{}", connected);
             }
-            ResponseData::State { state } => {
-                println!("{}", serde_json::to_string_pretty(state).unwrap());
-            }
+            ResponseData::State { state } => match serde_json::to_string_pretty(state) {
+                Ok(json) => println!("{json}"),
+                Err(e) => eprintln!("Failed to serialize state: {e}"),
+            },
             ResponseData::FramesRun { count } => {
                 println!("Ran {} frames", count);
             }

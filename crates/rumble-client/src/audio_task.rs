@@ -1671,7 +1671,9 @@ fn handle_voice_datagram<C: VoiceCodec>(
         new_state.volume_db = volume_db;
         user_audio.insert(sender_id, new_state);
     }
-    let user_state = user_audio.get_mut(&sender_id).unwrap();
+    let Some(user_state) = user_audio.get_mut(&sender_id) else {
+        return; // Entry was just inserted above; unreachable in practice
+    };
 
     // Insert packet into jitter buffer
     user_state.insert_packet(sequence, opus_data);
