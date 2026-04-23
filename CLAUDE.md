@@ -101,6 +101,26 @@ Each remote peer must have a **long-lived Opus decoder instance** that persists 
 
 Uses `imports_granularity = "Crate"` in rustfmt.toml - group imports by crate.
 
+## rumble-widgets: pixel snapping
+
+egui's tessellator already pixel-snaps `RectShape`, line segments, and text by default (`TessellationOptions::round_{rects,line_segments,text}_to_pixels = true`). **Circles and `Shape::Path` (e.g. `convex_polygon`) are NOT snapped** — the tessellator uses their coordinates verbatim.
+
+That means if a widget composes an outer rect with an inner circle/polygon, and the outer rect has sub-pixel coordinates from the layout (very common — `ui.horizontal()` + `allocate_exact_size` often returns fractional `left()` / `center().y`), the outer shape snaps one way at tessellate time while the inner shape stays sub-pixel — and they stop agreeing on "center". Visible symptom: radio/switch dots look off-center, slider thumbs drift, pentagon/triangle glyphs look asymmetric. This is invisible at `pixels_per_point=2.0` (screenshot default) because sub-pixel logical coords land on integer physical pixels; it only shows up at `ppp=1.0` which is what `cargo run --bin gallery` actually uses.
+
+**Rule**: at the point in a widget's `paint()` where you derive an indicator/thumb/avatar rect from the outer allocated rect, pixel-snap it before computing any `.center()` or inner geometry:
+
+```rust
+use eframe::egui::emath::GuiRounding;
+
+let ppp = ui.ctx().pixels_per_point();
+let indicator_rect = Rect::from_min_size(...).round_to_pixels(ppp);
+// Inner geometry derived from indicator_rect now co-aligns with the tessellator's snap.
+```
+
+Use `round_to_pixels` for filled shapes / even-pixel strokes, `round_to_pixel_center` for explicit 1-px-wide line segments that you want to land on a pixel row.
+
+Sites in `crates/rumble-widgets` that need snapping: any `paint()` or `paint_caret` / `paint_arrow` that composes a circle or `convex_polygon` inside an allocated rect. Current applied sites: `radio.rs`, `toggle.rs`, `slider.rs`, `tree.rs` (DefaultTree caret), `combo_box.rs` (arrow), and the Luna overrides in `luna.rs` (`LunaToggle`, `LunaSlider`, `LunaPresence`, `LunaTree::paint_caret`).
+
 ## Vendored Dependencies
 
 Located in `vendor/`. Used primarily for reference; code links against GitHub versions if modified from upstream.
