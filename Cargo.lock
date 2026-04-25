@@ -5080,15 +5080,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "rumble-desktop-shell"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "ashpd 0.12.3",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "directories",
+ "ed25519-dalek 3.0.0-pre.6",
+ "eframe",
+ "futures-util",
+ "getrandom 0.3.4",
+ "global-hotkey",
+ "hex",
+ "rand 0.10.0",
+ "rumble-client",
+ "serde",
+ "serde_json",
+ "service-binding",
+ "sha2 0.10.9",
+ "ssh-agent-lib",
+ "ssh-key",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rumble-egui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
- "argon2",
- "ashpd 0.12.3",
  "base64 0.22.1",
- "chacha20poly1305",
  "clap",
  "directories",
  "ed25519-dalek 3.0.0-pre.6",
@@ -5096,9 +5121,6 @@ dependencies = [
  "egui_extras",
  "egui_kittest",
  "egui_ltreeview",
- "futures-util",
- "getrandom 0.3.4",
- "global-hotkey",
  "hex",
  "image",
  "rand 0.10.0",
@@ -5106,14 +5128,37 @@ dependencies = [
  "rfd",
  "rumble-client",
  "rumble-desktop",
+ "rumble-desktop-shell",
  "rumble-protocol",
  "serde",
  "serde_json",
- "service-binding",
- "sha2 0.10.9",
- "ssh-agent-lib",
- "ssh-key",
  "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "rumble-next"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "directories",
+ "ed25519-dalek 3.0.0-pre.6",
+ "eframe",
+ "egui_kittest",
+ "hex",
+ "image",
+ "rand 0.10.0",
+ "rumble-client",
+ "rumble-client-traits",
+ "rumble-desktop",
+ "rumble-desktop-shell",
+ "rumble-protocol",
+ "rumble-widgets",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

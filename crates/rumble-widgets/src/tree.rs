@@ -258,11 +258,19 @@ pub trait TreeImpl: Send + Sync + 'static {
             tree_response.request_focus();
         }
 
-        // Tests can't easily simulate "clicked then keyboard". To keep
-        // keyboard testable in isolation, also process keys when the
-        // caller is supplying a selection (which implies they're driving
-        // navigation).
-        if tree_response.has_focus() || args.selected.is_some() {
+        // Keyboard handling fires when the tree itself has focus —
+        // the obvious case. We *also* allow it when the caller is
+        // supplying a selection AND no other widget claims focus, so
+        // tests (which never click) can drive navigation purely from
+        // keys. Without the second clause's focus guard, a focused
+        // text input elsewhere on the page (e.g. the chat composer)
+        // would have its Enter eaten by the tree.
+        let other_focus = ui
+            .ctx()
+            .memory(|m| m.focused())
+            .map(|id| id != tree_id)
+            .unwrap_or(false);
+        if tree_response.has_focus() || (args.selected.is_some() && !other_focus) {
             handle_keyboard(ui, args.selected, &row_rects, &mut out);
         }
 

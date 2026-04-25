@@ -16,8 +16,8 @@ pub struct ModernTheme {
     tokens: Tokens,
 }
 
-impl Default for ModernTheme {
-    fn default() -> Self {
+impl ModernTheme {
+    pub fn light() -> Self {
         Self {
             tokens: Tokens {
                 accent: Color32::from_rgb(0x3b, 0x82, 0xf6),
@@ -51,6 +51,48 @@ impl Default for ModernTheme {
                 font_mono: FontId::new(12.0, FontFamily::Monospace),
             },
         }
+    }
+
+    pub fn dark() -> Self {
+        Self {
+            tokens: Tokens {
+                accent: Color32::from_rgb(0x60, 0xa5, 0xfa),
+                danger: Color32::from_rgb(0xef, 0x68, 0x68),
+                talking: Color32::from_rgb(0xff, 0x8a, 0x55),
+
+                surface: Color32::from_rgb(0x18, 0x18, 0x1a),
+                surface_alt: Color32::from_rgb(0x1f, 0x1f, 0x22),
+                surface_sunken: Color32::from_rgb(0x24, 0x24, 0x27),
+
+                text: Color32::from_rgb(0xf2, 0xf2, 0xf0),
+                text_muted: Color32::from_rgb(0x9b, 0x9b, 0xa0),
+                text_on_accent: Color32::from_rgb(0x0a, 0x0a, 0x0b),
+                text_on_danger: Color32::WHITE,
+
+                line: Color32::from_rgb(0x4a, 0x4a, 0x50),
+                line_soft: Color32::from_rgb(0x2e, 0x2e, 0x32),
+
+                radius_sm: 3.0,
+                radius_md: 6.0,
+                radius_pill: 999.0,
+
+                pad_sm: 4.0,
+                pad_md: 8.0,
+
+                bevel_inset: 2.0,
+
+                font_body: FontId::new(13.0, FontFamily::Proportional),
+                font_label: FontId::new(11.0, FontFamily::Proportional),
+                font_heading: FontId::new(15.0, FontFamily::Proportional),
+                font_mono: FontId::new(12.0, FontFamily::Monospace),
+            },
+        }
+    }
+}
+
+impl Default for ModernTheme {
+    fn default() -> Self {
+        Self::light()
     }
 }
 
@@ -234,6 +276,21 @@ impl Theme for ModernTheme {
         visuals.hyperlink_color = t.accent;
         visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0x3b, 0x82, 0xf6, 0x44);
         visuals.selection.stroke = Stroke::new(1.0, t.accent);
+
+        // `RichText::new(...).strong()` reads from
+        // `widgets.noninteractive.fg_stroke.color`, which is independent
+        // of `override_text_color`. Without this loop, strong text in
+        // the light variant inherits eframe's default white stroke and
+        // disappears on the white surface. Sync all four widget states
+        // so hovered/active strong text also stays legible.
+        for w in [
+            &mut visuals.widgets.noninteractive,
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+        ] {
+            w.fg_stroke.color = t.text;
+        }
     }
 }
 

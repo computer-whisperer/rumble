@@ -1,14 +1,22 @@
 //! Key management for Ed25519 authentication.
 //!
-//! Handles:
-//! - Local key storage (plaintext or password-protected)
-//! - SSH agent integration (preferred for security)
-//! - First-run setup dialog coordination
+//! Lifted from `rumble-egui/src/key_manager.rs`. The on-disk format,
+//! file path (`<config>/identity.json`), and `SigningCallback` shape
+//! are unchanged so existing identities load straight in.
+//!
+//! Encrypted-key support requires the `encrypted-keys` feature; SSH
+//! agent support requires `ssh-agent`. The `KeySource` enum keeps all
+//! three variants regardless — opting out of a feature only disables
+//! the *handling* code, so an old identity file with a now-disabled
+//! variant gives a clean error rather than corrupting on save.
+
+use std::{path::PathBuf, sync::Arc};
 
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc};
+
+#[cfg(feature = "ssh-agent")]
 use tokio::sync::Mutex as TokioMutex;
 
 /// How the key is stored.
@@ -19,18 +27,17 @@ pub enum KeySource {
         /// The Ed25519 private key (32 bytes) as hex string.
         private_key_hex: String,
     },
-    /// Key is stored locally, encrypted with a password.
+    /// Key is stored locally, encrypted with a password. Requires the
+    /// `encrypted-keys` feature to read/write.
     LocalEncrypted {
-        /// The encrypted private key data.
         encrypted_data: String,
-        /// Salt used for key derivation (hex encoded).
         salt_hex: String,
-        /// Nonce used for encryption (hex encoded).
         nonce_hex: String,
     },
-    /// Key is stored in SSH agent; we remember the public key to find it.
+    /// Key is stored in SSH agent; we remember the public key to find
+    /// it again. Requires the `ssh-agent` feature.
     SshAgent {
-        /// The public key fingerprint (SHA256:base64).
+        /// SHA256:hex fingerprint of the public key.
         fingerprint: String,
         /// Comment associated with the key in the agent.
         comment: String,
@@ -40,14 +47,12 @@ pub enum KeySource {
 /// Persistent key configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyConfig {
-    /// How/where the key is stored.
     pub source: KeySource,
     /// The Ed25519 public key (32 bytes) as hex string.
     pub public_key_hex: String,
 }
 
 impl KeyConfig {
-    /// Get the public key bytes.
     pub fn public_key_bytes(&self) -> Option<[u8; 32]> {
         let bytes = hex::decode(&self.public_key_hex).ok()?;
         if bytes.len() != 32 {
@@ -62,16 +67,12 @@ impl KeyConfig {
 /// Key info for display (from agent or local).
 #[derive(Debug, Clone)]
 pub struct KeyInfo {
-    /// SHA256 fingerprint of the public key.
     pub fingerprint: String,
-    /// Comment or label for the key.
     pub comment: String,
-    /// The public key (32 bytes).
     pub public_key: [u8; 32],
 }
 
 impl KeyInfo {
-    /// Create KeyInfo from a public key.
     pub fn from_public_key(public_key: [u8; 32], comment: String) -> Self {
         Self {
             fingerprint: compute_fingerprint(&public_key),
@@ -81,76 +82,40 @@ impl KeyInfo {
     }
 }
 
-/// State of the first-run setup flow.
-#[derive(Debug, Clone, Default)]
-pub enum FirstRunState {
-    /// Not in first-run mode (key is configured).
-    #[default]
-    NotNeeded,
-    /// Showing the main selection screen.
-    SelectMethod,
-    /// Generating a new local key (with optional password).
-    GenerateLocal {
-        /// Password for encryption (empty = no encryption).
-        password: String,
-        /// Password confirmation.
-        password_confirm: String,
-        /// Error message if passwords don't match.
-        error: Option<String>,
-    },
-    /// Connecting to SSH agent.
-    ConnectingAgent,
-    /// Selecting a key from SSH agent.
-    SelectAgentKey {
-        /// Available keys from agent.
-        keys: Vec<KeyInfo>,
-        /// Currently selected key index.
-        selected: Option<usize>,
-        /// Error message if any.
-        error: Option<String>,
-    },
-    /// Generating a new key to add to agent.
-    GenerateAgentKey {
-        /// Comment for the new key.
-        comment: String,
-    },
-    /// Error state.
-    Error { message: String },
-    /// Setup complete.
-    Complete,
-}
-
-/// Result of first-run setup (for future use when key unlock dialog is needed).
+/// Result of first-run setup.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum SetupResult {
-    /// User generated a local key.
     LocalKeyGenerated(KeyConfig, SigningKey),
-    /// User selected an agent key.
     AgentKeySelected(KeyConfig),
-    /// User cancelled setup.
     Cancelled,
+}
+
+/// Async result type for SSH agent operations (UI consumes these).
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum AgentResult {
+    Connected,
+    Keys(Vec<KeyInfo>),
+    KeyAdded(KeyInfo),
+    Error(String),
 }
 
 /// Key manager handles key storage and retrieval.
 pub struct KeyManager {
-    /// Path to the config directory.
     config_dir: PathBuf,
-    /// Path to the identity config file.
     config_path: PathBuf,
-    /// Current key configuration.
     config: Option<KeyConfig>,
-    /// Cached signing key (for local keys).
     cached_signing_key: Option<SigningKey>,
 }
 
 impl KeyManager {
-    /// Create a new key manager with the given config directory.
     pub fn new(config_dir: PathBuf) -> Self {
         let config_path = config_dir.join("identity.json");
         let config = Self::load_config(&config_path);
 
-        // If we have a local plaintext key, cache the signing key
+        // Plaintext keys cache the SigningKey eagerly; encrypted keys
+        // wait for `unlock_local_key`.
         let cached_signing_key = config.as_ref().and_then(|c| {
             if let KeySource::LocalPlaintext { private_key_hex } = &c.source {
                 parse_signing_key(private_key_hex)
@@ -167,95 +132,86 @@ impl KeyManager {
         }
     }
 
-    /// Check if first-run setup is needed.
     pub fn needs_setup(&self) -> bool {
         self.config.is_none()
     }
 
-    /// Get the current key config.
     pub fn config(&self) -> Option<&KeyConfig> {
         self.config.as_ref()
     }
 
-    /// Get the public key bytes if configured.
     pub fn public_key_bytes(&self) -> Option<[u8; 32]> {
         self.config.as_ref()?.public_key_bytes()
     }
 
-    /// Get the public key as hex string.
     pub fn public_key_hex(&self) -> Option<String> {
         self.config.as_ref().map(|c| c.public_key_hex.clone())
     }
 
-    /// Get the cached signing key (for local keys).
     pub fn signing_key(&self) -> Option<&SigningKey> {
         self.cached_signing_key.as_ref()
     }
 
-    /// Create a signing callback for the backend.
-    ///
-    /// Returns None if key is not available or requires unlocking.
+    /// Build a signing callback for the backend. `None` if no key is
+    /// configured, the encrypted key hasn't been unlocked, or the
+    /// configured source variant requires a feature that isn't built
+    /// in (e.g. an SSH-agent identity loaded by a binary built without
+    /// the `ssh-agent` feature).
     pub fn create_signer(&self) -> Option<rumble_client::SigningCallback> {
         let config = self.config.as_ref()?;
-
         match &config.source {
             KeySource::LocalPlaintext { private_key_hex } => {
                 let signing_key = parse_signing_key(private_key_hex)?;
-                let signing_key_bytes = signing_key.to_bytes();
-
-                Some(Arc::new(move |payload: &[u8]| {
-                    use ed25519_dalek::Signer;
-                    let key = SigningKey::from_bytes(&signing_key_bytes);
-                    let signature = key.sign(payload);
-                    Ok(signature.to_bytes())
-                }))
+                Some(local_signer(signing_key))
             }
             KeySource::LocalEncrypted { .. } => {
-                // Encrypted keys require unlocking first
-                // Use the cached signing key if available
+                // The decryption happens in `unlock_local_key`; here
+                // we just hand out a signer based on the cached key.
                 let signing_key = self.cached_signing_key.as_ref()?;
-                let signing_key_bytes = signing_key.to_bytes();
-
-                Some(Arc::new(move |payload: &[u8]| {
-                    use ed25519_dalek::Signer;
-                    let key = SigningKey::from_bytes(&signing_key_bytes);
-                    let signature = key.sign(payload);
-                    Ok(signature.to_bytes())
-                }))
+                Some(local_signer(signing_key.clone()))
             }
             KeySource::SshAgent { fingerprint, .. } => {
-                // Use the SSH agent for signing
-                Some(create_agent_signer(fingerprint.clone()))
+                #[cfg(feature = "ssh-agent")]
+                {
+                    Some(create_agent_signer(fingerprint.clone()))
+                }
+                #[cfg(not(feature = "ssh-agent"))]
+                {
+                    let _ = fingerprint;
+                    tracing::error!("SSH-agent identity loaded but ssh-agent feature is disabled");
+                    None
+                }
             }
         }
     }
 
-    /// Generate a new local key with optional password protection.
+    /// Generate a new local key, optionally password-protected. Empty
+    /// password = plaintext storage.
     pub fn generate_local_key(&mut self, password: Option<&str>) -> anyhow::Result<KeyInfo> {
         let signing_key = SigningKey::from_bytes(&rand::random());
         let public_key = signing_key.verifying_key().to_bytes();
         let private_key = signing_key.to_bytes();
 
-        let source = if let Some(pw) = password {
-            if pw.is_empty() {
-                // Empty password = no encryption
-                KeySource::LocalPlaintext {
-                    private_key_hex: hex::encode(private_key),
+        let source = match password {
+            Some(pw) if !pw.is_empty() => {
+                #[cfg(feature = "encrypted-keys")]
+                {
+                    let (encrypted, salt, nonce) = encrypt_key(&private_key, pw)?;
+                    KeySource::LocalEncrypted {
+                        encrypted_data: encrypted,
+                        salt_hex: salt,
+                        nonce_hex: nonce,
+                    }
                 }
-            } else {
-                // Encrypt with password
-                let (encrypted, salt, nonce) = encrypt_key(&private_key, pw)?;
-                KeySource::LocalEncrypted {
-                    encrypted_data: encrypted,
-                    salt_hex: salt,
-                    nonce_hex: nonce,
+                #[cfg(not(feature = "encrypted-keys"))]
+                {
+                    let _ = pw;
+                    anyhow::bail!("encrypted-keys feature is disabled — cannot password-protect local keys");
                 }
             }
-        } else {
-            // No password = plaintext storage
-            KeySource::LocalPlaintext {
+            _ => KeySource::LocalPlaintext {
                 private_key_hex: hex::encode(private_key),
-            }
+            },
         };
 
         let config = KeyConfig {
@@ -270,8 +226,8 @@ impl KeyManager {
         Ok(KeyInfo::from_public_key(public_key, "Rumble Identity".to_string()))
     }
 
-    /// Unlock a password-protected local key.
-    #[allow(dead_code)]
+    /// Decrypt a password-protected key into the cache.
+    #[cfg(feature = "encrypted-keys")]
     pub fn unlock_local_key(&mut self, password: &str) -> anyhow::Result<()> {
         let config = self
             .config
@@ -293,7 +249,7 @@ impl KeyManager {
         }
     }
 
-    /// Check if the key requires unlocking.
+    /// Whether a key is configured but locked (requires a password).
     pub fn needs_unlock(&self) -> bool {
         if let Some(config) = &self.config {
             matches!(&config.source, KeySource::LocalEncrypted { .. }) && self.cached_signing_key.is_none()
@@ -302,14 +258,12 @@ impl KeyManager {
         }
     }
 
-    /// Set the key config (used when importing from old settings).
-    #[allow(dead_code)]
     pub fn set_config(&mut self, config: KeyConfig, signing_key: Option<SigningKey>) {
         self.config = Some(config);
         self.cached_signing_key = signing_key;
     }
 
-    /// Import a signing key from raw bytes (migration from old format).
+    /// Import a raw `SigningKey` and persist it as plaintext.
     pub fn import_signing_key(&mut self, signing_key: SigningKey) -> anyhow::Result<()> {
         let public_key = signing_key.verifying_key().to_bytes();
         let private_key = signing_key.to_bytes();
@@ -328,7 +282,8 @@ impl KeyManager {
         Ok(())
     }
 
-    /// Select an existing key from the SSH agent.
+    /// Bind the manager to a key already living in the SSH agent.
+    #[cfg(feature = "ssh-agent")]
     pub fn select_agent_key(&mut self, key_info: &KeyInfo) -> anyhow::Result<()> {
         let config = KeyConfig {
             source: KeySource::SshAgent {
@@ -339,7 +294,6 @@ impl KeyManager {
         };
 
         self.config = Some(config);
-        // No cached signing key for agent keys - we use the agent for signing
         self.cached_signing_key = None;
         self.save_config()?;
 
@@ -351,21 +305,16 @@ impl KeyManager {
         Ok(())
     }
 
-    /// Save the current config to disk.
     pub fn save_config(&self) -> anyhow::Result<()> {
         if let Some(config) = &self.config {
-            // Ensure config directory exists
             std::fs::create_dir_all(&self.config_dir)?;
-
             let contents = serde_json::to_string_pretty(config)?;
             std::fs::write(&self.config_path, contents)?;
-
             tracing::info!("Saved identity config to {}", self.config_path.display());
         }
         Ok(())
     }
 
-    /// Load config from disk.
     fn load_config(path: &PathBuf) -> Option<KeyConfig> {
         let data = std::fs::read_to_string(path).ok()?;
         match serde_json::from_str(&data) {
@@ -377,24 +326,22 @@ impl KeyManager {
         }
     }
 
-    /// Get the config directory path.
-    #[allow(dead_code)]
     pub fn config_dir(&self) -> &PathBuf {
         &self.config_dir
     }
 }
 
-/// Compute SHA256 fingerprint of a public key.
+/// SHA256 fingerprint of a public key, formatted as
+/// `SHA256:xx:xx:...` (16 bytes). Stable across releases — used as
+/// the on-disk identifier for SSH-agent key selection.
 pub fn compute_fingerprint(public_key: &[u8; 32]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(public_key);
     let hash = hasher.finalize();
-    // Use first 16 bytes, format as hex pairs separated by colons
     let hex_parts: Vec<String> = hash.iter().take(16).map(|b| format!("{:02x}", b)).collect();
     format!("SHA256:{}", hex_parts.join(":"))
 }
 
-/// Parse a signing key from hex string.
 pub fn parse_signing_key(hex_key: &str) -> Option<SigningKey> {
     let bytes = hex::decode(hex_key).ok()?;
     if bytes.len() != 32 {
@@ -405,7 +352,20 @@ pub fn parse_signing_key(hex_key: &str) -> Option<SigningKey> {
     Some(SigningKey::from_bytes(&arr))
 }
 
-/// Encrypt a private key with a password using Argon2 + ChaCha20-Poly1305.
+fn local_signer(signing_key: SigningKey) -> rumble_client::SigningCallback {
+    let signing_key_bytes = signing_key.to_bytes();
+    Arc::new(move |payload: &[u8]| {
+        use ed25519_dalek::Signer;
+        let key = SigningKey::from_bytes(&signing_key_bytes);
+        Ok(key.sign(payload).to_bytes())
+    })
+}
+
+// =============================================================================
+// Encrypted key helpers
+// =============================================================================
+
+#[cfg(feature = "encrypted-keys")]
 fn encrypt_key(key: &[u8; 32], password: &str) -> anyhow::Result<(String, String, String)> {
     use argon2::Argon2;
     use chacha20poly1305::{
@@ -413,22 +373,18 @@ fn encrypt_key(key: &[u8; 32], password: &str) -> anyhow::Result<(String, String
         aead::{Aead, KeyInit},
     };
 
-    // Generate random salt (22 bytes for Argon2 base64 salt) and nonce
     let mut salt_bytes = [0u8; 16];
     let mut nonce_bytes = [0u8; 12];
     getrandom::fill(&mut salt_bytes).map_err(|e| anyhow::anyhow!("Failed to generate random salt: {}", e))?;
     getrandom::fill(&mut nonce_bytes).map_err(|e| anyhow::anyhow!("Failed to generate random nonce: {}", e))?;
 
-    // Encode salt as hex (we'll use hex instead of base64 for simplicity)
     let salt_hex = hex::encode(salt_bytes);
 
-    // Derive encryption key using Argon2
     let mut derived_key = [0u8; 32];
     Argon2::default()
         .hash_password_into(password.as_bytes(), salt_hex.as_bytes(), &mut derived_key)
         .map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
 
-    // Encrypt with ChaCha20-Poly1305
     let cipher =
         ChaCha20Poly1305::new_from_slice(&derived_key).map_err(|e| anyhow::anyhow!("Cipher init failed: {}", e))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -439,7 +395,7 @@ fn encrypt_key(key: &[u8; 32], password: &str) -> anyhow::Result<(String, String
     Ok((hex::encode(ciphertext), salt_hex, hex::encode(nonce_bytes)))
 }
 
-/// Decrypt a private key with a password.
+#[cfg(feature = "encrypted-keys")]
 fn decrypt_key(encrypted_hex: &str, salt: &str, nonce_hex: &str, password: &str) -> anyhow::Result<[u8; 32]> {
     use argon2::Argon2;
     use chacha20poly1305::{
@@ -447,20 +403,17 @@ fn decrypt_key(encrypted_hex: &str, salt: &str, nonce_hex: &str, password: &str)
         aead::{Aead, KeyInit},
     };
 
-    // Decode hex values
     let ciphertext = hex::decode(encrypted_hex)?;
     let nonce_bytes = hex::decode(nonce_hex)?;
     if nonce_bytes.len() != 12 {
         return Err(anyhow::anyhow!("Invalid nonce length"));
     }
 
-    // Derive encryption key using Argon2
     let mut derived_key = [0u8; 32];
     Argon2::default()
         .hash_password_into(password.as_bytes(), salt.as_bytes(), &mut derived_key)
         .map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
 
-    // Decrypt with ChaCha20-Poly1305
     let cipher =
         ChaCha20Poly1305::new_from_slice(&derived_key).map_err(|e| anyhow::anyhow!("Cipher init failed: {}", e))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -481,23 +434,15 @@ fn decrypt_key(encrypted_hex: &str, salt: &str, nonce_hex: &str, password: &str)
 // SSH Agent Client
 // =============================================================================
 
-/// Get the SSH agent socket/pipe path for the current platform.
-///
-/// On Unix, this reads the SSH_AUTH_SOCK environment variable.
-/// On Windows, this checks for SSH_AUTH_SOCK first, then falls back to the default
-/// OpenSSH for Windows named pipe.
+#[cfg(feature = "ssh-agent")]
 fn get_agent_path() -> anyhow::Result<String> {
-    // First try SSH_AUTH_SOCK (works on both platforms)
     if let Ok(path) = std::env::var("SSH_AUTH_SOCK") {
         return Ok(path);
     }
 
-    // On Windows, try the default OpenSSH pipe
     #[cfg(windows)]
     {
-        // OpenSSH for Windows uses this named pipe by default
-        let default_pipe = r"\\.\pipe\openssh-ssh-agent";
-        return Ok(default_pipe.to_string());
+        Ok(r"\\.\pipe\openssh-ssh-agent".to_string())
     }
 
     #[cfg(not(windows))]
@@ -507,30 +452,18 @@ fn get_agent_path() -> anyhow::Result<String> {
 }
 
 /// SSH agent client wrapper for Ed25519 key operations.
-///
-/// Uses ssh-agent-lib to communicate with the SSH agent over Unix socket (Unix)
-/// or named pipe (Windows).
+#[cfg(feature = "ssh-agent")]
 pub struct SshAgentClient {
-    /// The underlying SSH agent session.
-    /// We use a boxed trait object to support both Unix and Windows stream types.
     client: Box<dyn ssh_agent_lib::agent::Session + Send + Sync>,
 }
 
+#[cfg(feature = "ssh-agent")]
 impl SshAgentClient {
-    /// Connect to the SSH agent.
-    ///
-    /// On Unix, uses the SSH_AUTH_SOCK environment variable.
-    /// On Windows, uses SSH_AUTH_SOCK if set, otherwise falls back to the default
-    /// OpenSSH for Windows named pipe.
     pub async fn connect() -> anyhow::Result<Self> {
         let agent_path = get_agent_path()?;
-
         tracing::debug!("Connecting to SSH agent at: {}", agent_path);
 
-        // Parse the path into a service-binding Binding
         let binding = Self::parse_agent_binding(&agent_path)?;
-
-        // Convert to Stream and connect
         let stream: service_binding::Stream = binding
             .try_into()
             .map_err(|e: std::io::Error| anyhow::anyhow!("Failed to connect to SSH agent: {}", e))?;
@@ -542,21 +475,16 @@ impl SshAgentClient {
         Ok(Self { client })
     }
 
-    /// Parse an agent path into a service-binding Binding.
     fn parse_agent_binding(path: &str) -> anyhow::Result<service_binding::Binding> {
-        // Check if it's a Windows named pipe
         if path.starts_with(r"\\") {
             return Ok(service_binding::Binding::NamedPipe(path.into()));
         }
-
-        // Check if it's a npipe:// URL
         if path.starts_with("npipe://") {
             return path
                 .parse()
                 .map_err(|e| anyhow::anyhow!("Failed to parse named pipe path: {:?}", e));
         }
 
-        // Otherwise treat it as a Unix socket path
         #[cfg(unix)]
         {
             Ok(service_binding::Binding::FilePath(path.into()))
@@ -568,12 +496,10 @@ impl SshAgentClient {
         }
     }
 
-    /// Check if SSH agent is available.
     pub fn is_available() -> bool {
         get_agent_path().is_ok()
     }
 
-    /// List Ed25519 keys from the SSH agent.
     pub async fn list_ed25519_keys(&mut self) -> anyhow::Result<Vec<KeyInfo>> {
         use ssh_key::public::KeyData;
 
@@ -583,18 +509,11 @@ impl SshAgentClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to request identities: {}", e))?;
 
-        tracing::debug!("Found {} keys in SSH agent", identities.len());
-
         let mut ed25519_keys = Vec::new();
-
         for id in identities {
-            // Check if it's an Ed25519 key
             if let KeyData::Ed25519(ed_key) = &id.pubkey {
-                // Extract the 32-byte public key
                 let public_key: [u8; 32] = ed_key.0;
-                let key_info = KeyInfo::from_public_key(public_key, id.comment.clone());
-                tracing::debug!("Found Ed25519 key: {} ({})", key_info.fingerprint, key_info.comment);
-                ed25519_keys.push(key_info);
+                ed25519_keys.push(KeyInfo::from_public_key(public_key, id.comment.clone()));
             }
         }
 
@@ -602,14 +521,10 @@ impl SshAgentClient {
         Ok(ed25519_keys)
     }
 
-    /// Sign data using a key identified by its fingerprint.
     pub async fn sign(&mut self, fingerprint: &str, data: &[u8]) -> anyhow::Result<[u8; 64]> {
         use ssh_agent_lib::proto::SignRequest;
         use ssh_key::public::KeyData;
 
-        tracing::debug!("Signing {} bytes with key {}", data.len(), fingerprint);
-
-        // Find the key by fingerprint
         let identities = self
             .client
             .request_identities()
@@ -631,7 +546,7 @@ impl SshAgentClient {
         let request = SignRequest {
             pubkey: identity.pubkey.clone(),
             data: data.to_vec(),
-            flags: 0, // No special flags for Ed25519
+            flags: 0,
         };
 
         let signature = self
@@ -640,16 +555,7 @@ impl SshAgentClient {
             .await
             .map_err(|e| anyhow::anyhow!("Signing failed: {}", e))?;
 
-        // The ssh-key crate's Signature::as_bytes() returns the raw signature data.
-        // For Ed25519, this is already the 64-byte raw signature.
         let sig_bytes = signature.as_bytes();
-
-        tracing::debug!(
-            "Signature algorithm: {:?}, length: {}",
-            signature.algorithm(),
-            sig_bytes.len()
-        );
-
         if sig_bytes.len() != 64 {
             return Err(anyhow::anyhow!(
                 "Invalid signature format: expected 64 bytes for Ed25519, got {}",
@@ -659,12 +565,9 @@ impl SshAgentClient {
 
         let mut raw_sig = [0u8; 64];
         raw_sig.copy_from_slice(sig_bytes);
-
-        tracing::debug!("Successfully signed data");
         Ok(raw_sig)
     }
 
-    /// Add a new Ed25519 key to the agent.
     pub async fn add_key(&mut self, signing_key: &SigningKey, comment: &str) -> anyhow::Result<()> {
         use ssh_agent_lib::proto::{AddIdentity, Credential};
         use ssh_key::{
@@ -672,9 +575,6 @@ impl SshAgentClient {
             public::Ed25519PublicKey,
         };
 
-        tracing::debug!("Adding key to SSH agent with comment: {}", comment);
-
-        // Create ssh-key types
         let public_key_bytes = signing_key.verifying_key().to_bytes();
         let private_key_bytes = signing_key.to_bytes();
 
@@ -683,17 +583,13 @@ impl SshAgentClient {
             private: ssh_key::private::Ed25519PrivateKey::from_bytes(&private_key_bytes),
         };
 
-        let keypair_data = KeypairData::Ed25519(ed25519_keypair);
-
         let credential = Credential::Key {
-            privkey: keypair_data,
+            privkey: KeypairData::Ed25519(ed25519_keypair),
             comment: comment.to_string(),
         };
 
-        let identity = AddIdentity { credential };
-
         self.client
-            .add_identity(identity)
+            .add_identity(AddIdentity { credential })
             .await
             .map_err(|e| anyhow::anyhow!("Failed to add key to agent: {}", e))?;
 
@@ -702,68 +598,50 @@ impl SshAgentClient {
     }
 }
 
-/// Async result type for SSH agent operations (for future enhanced UI).
-#[allow(dead_code)]
-#[derive(Debug)]
-pub enum AgentResult {
-    /// Successfully connected to agent.
-    Connected,
-    /// List of available keys.
-    Keys(Vec<KeyInfo>),
-    /// Key was added successfully.
-    KeyAdded(KeyInfo),
-    /// Error occurred.
-    Error(String),
-}
-
 /// Pending async operation for the UI to poll.
+#[cfg(feature = "ssh-agent")]
 pub enum PendingAgentOp {
-    /// Connecting to agent.
     Connect(tokio::task::JoinHandle<anyhow::Result<Vec<KeyInfo>>>),
-    /// Adding a key to agent.
     AddKey(tokio::task::JoinHandle<anyhow::Result<KeyInfo>>),
-    /// Signing data (for future use).
     #[allow(dead_code)]
     Sign(tokio::task::JoinHandle<anyhow::Result<[u8; 64]>>),
 }
 
-/// Shared agent client for async operations (for future use).
+#[cfg(feature = "ssh-agent")]
 #[allow(dead_code)]
 pub type SharedAgentClient = Arc<TokioMutex<Option<SshAgentClient>>>;
 
 /// Connect to SSH agent and list keys (async helper for UI).
+#[cfg(feature = "ssh-agent")]
 pub async fn connect_and_list_keys() -> anyhow::Result<Vec<KeyInfo>> {
     let mut client = SshAgentClient::connect().await?;
     client.list_ed25519_keys().await
 }
 
-/// Generate a key and add it to the SSH agent (async helper for UI).
+/// Generate a key and add it to the SSH agent.
+#[cfg(feature = "ssh-agent")]
 pub async fn generate_and_add_to_agent(comment: String) -> anyhow::Result<KeyInfo> {
     let mut client = SshAgentClient::connect().await?;
 
-    // Generate a new keypair
     let signing_key = SigningKey::from_bytes(&rand::random());
     let public_key = signing_key.verifying_key().to_bytes();
-
-    // Add to agent
     client.add_key(&signing_key, &comment).await?;
 
     Ok(KeyInfo::from_public_key(public_key, comment))
 }
 
-/// Create an async signer using the SSH agent.
+/// Build a SigningCallback that hits the SSH agent on every signature.
 ///
-/// Returns a closure that can be called to sign data using the SSH agent.
+/// `SigningCallback` is sync, but the agent client is async. To avoid
+/// nested-runtime issues we spawn a one-shot thread per signature. This
+/// is fine for the handshake but would be wasteful for high-frequency
+/// signing — keep an eye on it if we ever add periodic re-auth.
+#[cfg(feature = "ssh-agent")]
 pub fn create_agent_signer(fingerprint: String) -> rumble_client::SigningCallback {
     Arc::new(move |payload: &[u8]| {
-        // We need to do blocking I/O here since SigningCallback is sync.
-        // This is a limitation - ideally we'd use async all the way through.
         let fingerprint = fingerprint.clone();
         let payload = payload.to_vec();
 
-        // Spawn a dedicated thread to run the async operation.
-        // This avoids issues with nested runtimes - we can't create a runtime
-        // from within a runtime, but we can spawn a thread and create one there.
         let (tx, rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
@@ -795,40 +673,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_compute_fingerprint() {
-        let key = [0u8; 32];
-        let fp = compute_fingerprint(&key);
+    fn fingerprint_format() {
+        let fp = compute_fingerprint(&[0u8; 32]);
         assert!(fp.starts_with("SHA256:"));
     }
 
+    #[cfg(feature = "encrypted-keys")]
     #[test]
-    fn test_encrypt_decrypt_roundtrip() {
+    fn encrypt_decrypt_roundtrip() {
         let key = [42u8; 32];
-        let password = "test_password";
-
-        let (encrypted, salt, nonce) = encrypt_key(&key, password).unwrap();
-        let decrypted = decrypt_key(&encrypted, &salt, &nonce, password).unwrap();
-
+        let (encrypted, salt, nonce) = encrypt_key(&key, "test_password").unwrap();
+        let decrypted = decrypt_key(&encrypted, &salt, &nonce, "test_password").unwrap();
         assert_eq!(key, decrypted);
     }
 
+    #[cfg(feature = "encrypted-keys")]
     #[test]
-    fn test_decrypt_wrong_password() {
+    fn decrypt_wrong_password() {
         let key = [42u8; 32];
-        let password = "correct_password";
-        let wrong_password = "wrong_password";
-
-        let (encrypted, salt, nonce) = encrypt_key(&key, password).unwrap();
-        let result = decrypt_key(&encrypted, &salt, &nonce, wrong_password);
-
-        assert!(result.is_err());
+        let (encrypted, salt, nonce) = encrypt_key(&key, "correct").unwrap();
+        assert!(decrypt_key(&encrypted, &salt, &nonce, "wrong").is_err());
     }
 
     #[test]
-    fn test_parse_signing_key() {
+    fn parse_signing_key_roundtrip() {
         let key = SigningKey::from_bytes(&rand::random());
         let hex = hex::encode(key.to_bytes());
-
         let parsed = parse_signing_key(&hex).unwrap();
         assert_eq!(key.to_bytes(), parsed.to_bytes());
     }

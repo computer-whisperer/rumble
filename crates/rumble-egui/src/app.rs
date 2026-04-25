@@ -19,16 +19,18 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::{
-    hotkeys::HotkeyEvent,
-    key_manager::{
-        FirstRunState, KeyInfo, KeyManager, KeySource, PendingAgentOp, SshAgentClient, connect_and_list_keys,
-        generate_and_add_to_agent, parse_signing_key,
-    },
+    first_run::FirstRunState,
     settings::{
         AcceptedCertificate, Args, AutoDownloadRule, PersistentAudioSettings, PersistentSettings, PersistentVoiceMode,
         TimestampFormat,
     },
-    toasts::ToastManager,
+};
+use rumble_desktop_shell::{
+    KeyInfo, KeyManager, KeySource, ToastManager,
+    hotkeys::HotkeyEvent,
+    identity::key_manager::{
+        PendingAgentOp, SshAgentClient, connect_and_list_keys, generate_and_add_to_agent, parse_signing_key,
+    },
 };
 
 /// Node ID for the tree view - can be either a room or a user.
@@ -487,15 +489,17 @@ pub struct RumbleApp {
     push_to_talk_active: bool,
 
     /// Global hotkey registration status per action (set by EframeWrapper)
-    hotkey_registration_status:
-        std::collections::HashMap<crate::hotkeys::HotkeyAction, crate::hotkeys::HotkeyRegistrationStatus>,
+    hotkey_registration_status: std::collections::HashMap<
+        rumble_desktop_shell::hotkeys::HotkeyAction,
+        rumble_desktop_shell::hotkeys::HotkeyRegistrationStatus,
+    >,
 
     /// Whether XDG Portal global shortcuts are available (Wayland)
     portal_hotkeys_available: bool,
 
     /// Portal shortcut bindings (updated from HotkeyManager)
     #[cfg(target_os = "linux")]
-    portal_shortcuts: Vec<crate::portal_hotkeys::ShortcutInfo>,
+    portal_shortcuts: Vec<rumble_desktop_shell::hotkeys::portal::ShortcutInfo>,
 
     /// Callback to open portal settings (set by EframeWrapper)
     #[cfg(target_os = "linux")]
@@ -848,7 +852,10 @@ impl RumbleApp {
     /// Set the global hotkey registration status from the HotkeyManager.
     pub fn set_hotkey_registration_status(
         &mut self,
-        status: std::collections::HashMap<crate::hotkeys::HotkeyAction, crate::hotkeys::HotkeyRegistrationStatus>,
+        status: std::collections::HashMap<
+            rumble_desktop_shell::hotkeys::HotkeyAction,
+            rumble_desktop_shell::hotkeys::HotkeyRegistrationStatus,
+        >,
     ) {
         self.hotkey_registration_status = status;
     }
@@ -867,7 +874,7 @@ impl RumbleApp {
 
     /// Set the portal shortcut bindings (Linux/Wayland only).
     #[cfg(target_os = "linux")]
-    pub fn set_portal_shortcuts(&mut self, shortcuts: Vec<crate::portal_hotkeys::ShortcutInfo>) {
+    pub fn set_portal_shortcuts(&mut self, shortcuts: Vec<rumble_desktop_shell::hotkeys::portal::ShortcutInfo>) {
         self.portal_shortcuts = shortcuts;
     }
 
@@ -2070,9 +2077,8 @@ impl RumbleApp {
 
     /// Render the keyboard settings panel.
     fn render_settings_keyboard(&mut self, ui: &mut egui::Ui) {
-        use crate::{
-            hotkeys::{HotkeyAction, HotkeyManager, HotkeyRegistrationStatus},
-            settings::{HotkeyBinding, HotkeyModifiers},
+        use rumble_desktop_shell::hotkeys::{
+            HotkeyAction, HotkeyBinding, HotkeyManager, HotkeyModifiers, HotkeyRegistrationStatus,
         };
 
         ui.heading("Keyboard Shortcuts");
@@ -2153,7 +2159,7 @@ impl RumbleApp {
                     if ui.button("Configure in System Settings...").clicked() {
                         let handle = self.tokio_handle.clone();
                         handle.spawn(async {
-                            if let Err(e) = crate::portal_hotkeys::open_shortcut_settings().await {
+                            if let Err(e) = rumble_desktop_shell::hotkeys::portal::open_shortcut_settings().await {
                                 tracing::error!("Failed to open shortcut settings: {}", e);
                             }
                         });
@@ -3378,7 +3384,7 @@ impl RumbleApp {
         // to avoid triggering PTT while typing. We still detect key release to stop PTT.
         let text_input_focused = ctx.wants_keyboard_input();
         if let Some(ref binding) = self.persistent_settings.keyboard.ptt_hotkey {
-            if let Some(egui_key) = crate::hotkeys::HotkeyManager::key_string_to_egui_key(&binding.key) {
+            if let Some(egui_key) = rumble_desktop_shell::hotkeys::HotkeyManager::key_string_to_egui_key(&binding.key) {
                 let key_pressed = ctx.input(|i| {
                     let key_down = i.key_down(egui_key);
                     // Only check modifiers if the binding has any
@@ -3419,7 +3425,7 @@ impl RumbleApp {
 
         // Handle mute toggle hotkey - window-focused fallback (same pattern as PTT)
         if let Some(ref binding) = self.persistent_settings.keyboard.toggle_mute_hotkey {
-            if let Some(egui_key) = crate::hotkeys::HotkeyManager::key_string_to_egui_key(&binding.key) {
+            if let Some(egui_key) = rumble_desktop_shell::hotkeys::HotkeyManager::key_string_to_egui_key(&binding.key) {
                 let key_pressed = ctx.input(|i| {
                     // Use key_pressed for toggle (one-shot), not key_down (held)
                     let pressed = i.key_pressed(egui_key);
@@ -3448,7 +3454,7 @@ impl RumbleApp {
 
         // Handle deafen toggle hotkey - window-focused fallback
         if let Some(ref binding) = self.persistent_settings.keyboard.toggle_deafen_hotkey {
-            if let Some(egui_key) = crate::hotkeys::HotkeyManager::key_string_to_egui_key(&binding.key) {
+            if let Some(egui_key) = rumble_desktop_shell::hotkeys::HotkeyManager::key_string_to_egui_key(&binding.key) {
                 let key_pressed = ctx.input(|i| {
                     let pressed = i.key_pressed(egui_key);
                     let has_modifiers = binding.modifiers.ctrl

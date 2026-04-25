@@ -6,20 +6,22 @@
 //! - **test harness**: See [`TestHarness`] for automated testing with input injection
 
 pub mod app;
+pub mod first_run;
 pub mod harness;
-pub mod hotkeys;
-pub mod key_manager;
-#[cfg(target_os = "linux")]
-pub mod portal_hotkeys;
 pub mod rpc_client;
 pub mod settings;
-pub mod toasts;
+
+// Re-export the shared key-management module under its old name so
+// existing call sites compile unchanged.
+pub use rumble_desktop_shell::identity::key_manager;
 
 /// The default backend handle, using the native platform implementations.
 pub type BackendHandle = rumble_client::handle::BackendHandle<rumble_desktop::NativePlatform>;
 
 pub use app::RumbleApp;
 pub use harness::TestHarness;
-pub use hotkeys::{HotkeyAction, HotkeyEvent, HotkeyManager, HotkeyRegistrationStatus};
-pub use settings::{Args, HotkeyBinding, HotkeyModifiers, KeyboardSettings, PersistentSettings};
-pub use toasts::ToastManager;
+pub use rumble_desktop_shell::{
+    HotkeyAction, HotkeyBinding, HotkeyEvent, HotkeyManager, HotkeyModifiers, HotkeyRegistrationStatus,
+    KeyboardSettings, ToastManager,
+};
+pub use settings::{Args, PersistentSettings};

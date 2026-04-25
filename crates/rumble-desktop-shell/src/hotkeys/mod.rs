@@ -1,24 +1,103 @@
-//! Global hotkey management for Rumble.
+//! Global hotkey service shared between `rumble-egui` and `rumble-next`.
 //!
-//! This module provides cross-platform global hotkey support (hotkeys that work
-//! even when the application window is not focused). Essential for push-to-talk
-//! while gaming or using other applications.
+//! Three platform backends, all hidden behind one `HotkeyManager` API:
+//! - **Windows / macOS / Linux X11** via `global-hotkey` (the
+//!   `global-hotkeys` feature).
+//! - **Linux Wayland** via the XDG GlobalShortcuts portal (the
+//!   `wayland-portal` feature). The portal is contacted asynchronously
+//!   from a tokio runtime, so callers pass a `tokio::runtime::Handle`
+//!   to `init_portal_backend`.
+//! - **Anywhere else** the manager exists but is dormant — callers can
+//!   still query `is_available()`, `is_wayland()`, etc. without `cfg`.
 //!
-//! **Platform Support:**
-//! - Windows: Full support
-//! - macOS: Full support (requires main thread)
-//! - Linux X11: Full support
-//! - Linux Wayland: XDG Portal GlobalShortcuts (KDE Plasma, GNOME 47+, Hyprland)
+//! Lifted from `rumble-egui/src/{hotkeys,portal_hotkeys}.rs`. The API
+//! surface is intentionally identical so rumble-egui can re-export and
+//! its existing call sites compile unchanged.
 
-use crate::settings::{HotkeyBinding, HotkeyModifiers, KeyboardSettings};
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "global-hotkeys")]
 use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
     hotkey::{Code, HotKey, Modifiers},
 };
-use std::collections::HashMap;
 
-#[cfg(target_os = "linux")]
-use crate::portal_hotkeys::PortalHotkeyBackend;
+#[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+pub mod portal;
+
+#[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+use portal::PortalHotkeyBackend;
+
+/// Persisted keyboard configuration. Lives in the hotkey module rather
+/// than `settings::Settings` because the hotkey UI editor reads/writes
+/// this directly and the types travel together.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyboardSettings {
+    /// Push-to-talk hotkey binding.
+    pub ptt_hotkey: Option<HotkeyBinding>,
+    /// Toggle mute hotkey.
+    pub toggle_mute_hotkey: Option<HotkeyBinding>,
+    /// Toggle deafen hotkey.
+    pub toggle_deafen_hotkey: Option<HotkeyBinding>,
+    /// Whether global hotkeys are enabled (work when window unfocused).
+    pub global_hotkeys_enabled: bool,
+}
+
+impl Default for KeyboardSettings {
+    fn default() -> Self {
+        Self {
+            ptt_hotkey: Some(HotkeyBinding {
+                modifiers: HotkeyModifiers::default(),
+                key: "Space".to_string(),
+            }),
+            toggle_mute_hotkey: None,
+            toggle_deafen_hotkey: None,
+            global_hotkeys_enabled: true,
+        }
+    }
+}
+
+/// A hotkey binding with modifiers and key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HotkeyBinding {
+    /// Modifier keys (Ctrl, Shift, Alt, Super/Meta).
+    pub modifiers: HotkeyModifiers,
+    /// The main key code (e.g., "Space", "F1", "KeyA").
+    pub key: String,
+}
+
+impl HotkeyBinding {
+    /// Format the hotkey for display (e.g., "Ctrl+Shift+Space").
+    pub fn display(&self) -> String {
+        let mut parts = Vec::new();
+        if self.modifiers.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.modifiers.shift {
+            parts.push("Shift");
+        }
+        if self.modifiers.alt {
+            parts.push("Alt");
+        }
+        if self.modifiers.super_key {
+            parts.push("Super");
+        }
+        parts.push(&self.key);
+        parts.join("+")
+    }
+}
+
+/// Modifier keys for hotkey bindings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HotkeyModifiers {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub super_key: bool,
+}
 
 /// Hotkey action types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,168 +118,172 @@ pub enum HotkeyRegistrationStatus {
     NotConfigured,
 }
 
-/// Result of checking for hotkey events.
+/// Result of polling the manager. Drained by the UI thread each frame.
 #[derive(Debug, Clone, Copy)]
 pub enum HotkeyEvent {
-    /// PTT key was pressed.
     PttPressed,
-    /// PTT key was released.
     PttReleased,
-    /// Toggle mute was pressed.
     ToggleMute,
-    /// Toggle deafen was pressed.
     ToggleDeafen,
 }
 
 /// Manages global hotkey registration and events.
 ///
-/// **Important:** On macOS, this MUST be created on the main thread.
+/// On macOS this MUST be created on the main thread (a `global-hotkey`
+/// requirement that bubbles up to us).
 pub struct HotkeyManager {
+    #[cfg(feature = "global-hotkeys")]
     manager: Option<GlobalHotKeyManager>,
-    /// Map from hotkey ID to action.
+    /// Map from registered hotkey id to the action that fired it.
+    #[cfg(feature = "global-hotkeys")]
     hotkey_actions: HashMap<u32, HotkeyAction>,
-    /// Registered hotkeys (for unregistration).
+    /// Registered hotkeys (held so we can unregister cleanly on drop).
+    #[cfg(feature = "global-hotkeys")]
     registered_hotkeys: Vec<HotKey>,
-    /// Registration status per action (populated by register_from_settings).
+    /// Current status per action; drives the keyboard settings UI.
     registration_status: HashMap<HotkeyAction, HotkeyRegistrationStatus>,
-    /// Whether we're running on Wayland.
     is_wayland: bool,
-    /// Whether initialization failed.
+    /// Set when the underlying global-hotkey manager refused to init
+    /// for reasons other than "we're on Wayland". Surfaces in the UI.
     init_failed: bool,
-    /// XDG Portal backend for Wayland (Linux only).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
     portal_backend: Option<PortalHotkeyBackend>,
 }
 
 impl HotkeyManager {
-    /// Create a new HotkeyManager.
-    ///
-    /// Returns a manager that may or may not have global hotkey support,
-    /// depending on the platform and environment.
-    ///
-    /// On Wayland, call [`init_portal_backend`] after the tokio runtime is available
-    /// to enable XDG Portal-based global shortcuts.
     pub fn new() -> Self {
         let is_wayland = Self::detect_wayland();
 
+        // On Wayland, skip the global-hotkey manager entirely — X11
+        // grab APIs aren't reachable. Portal backend (if compiled) is
+        // initialised separately via `init_portal_backend`.
         if is_wayland {
             tracing::info!("Running on Wayland - will use XDG Portal for global shortcuts if available");
             return Self {
+                #[cfg(feature = "global-hotkeys")]
                 manager: None,
+                #[cfg(feature = "global-hotkeys")]
                 hotkey_actions: HashMap::new(),
+                #[cfg(feature = "global-hotkeys")]
                 registered_hotkeys: Vec::new(),
                 registration_status: HashMap::new(),
                 is_wayland: true,
                 init_failed: false,
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
                 portal_backend: None,
             };
         }
 
-        match GlobalHotKeyManager::new() {
-            Ok(manager) => {
-                tracing::info!("Global hotkey manager initialized successfully");
-                Self {
-                    manager: Some(manager),
-                    hotkey_actions: HashMap::new(),
-                    registered_hotkeys: Vec::new(),
-                    registration_status: HashMap::new(),
-                    is_wayland: false,
-                    init_failed: false,
-                    #[cfg(target_os = "linux")]
-                    portal_backend: None,
+        #[cfg(feature = "global-hotkeys")]
+        {
+            match GlobalHotKeyManager::new() {
+                Ok(manager) => {
+                    tracing::info!("Global hotkey manager initialized successfully");
+                    Self {
+                        manager: Some(manager),
+                        hotkey_actions: HashMap::new(),
+                        registered_hotkeys: Vec::new(),
+                        registration_status: HashMap::new(),
+                        is_wayland: false,
+                        init_failed: false,
+                        #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+                        portal_backend: None,
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create GlobalHotKeyManager: {}", e);
+                    Self {
+                        manager: None,
+                        hotkey_actions: HashMap::new(),
+                        registered_hotkeys: Vec::new(),
+                        registration_status: HashMap::new(),
+                        is_wayland: false,
+                        init_failed: true,
+                        #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+                        portal_backend: None,
+                    }
                 }
             }
-            Err(e) => {
-                tracing::error!("Failed to create GlobalHotKeyManager: {}", e);
-                Self {
-                    manager: None,
-                    hotkey_actions: HashMap::new(),
-                    registered_hotkeys: Vec::new(),
-                    registration_status: HashMap::new(),
-                    is_wayland: false,
-                    init_failed: true,
-                    #[cfg(target_os = "linux")]
-                    portal_backend: None,
-                }
-            }
+        }
+
+        #[cfg(not(feature = "global-hotkeys"))]
+        Self {
+            registration_status: HashMap::new(),
+            is_wayland: false,
+            init_failed: false,
+            #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+            portal_backend: None,
         }
     }
 
     /// Initialize the XDG Portal backend for Wayland global shortcuts.
-    ///
-    /// This should be called after the tokio runtime is available. On non-Wayland
-    /// systems or if the portal is unavailable, this is a no-op.
-    #[cfg(target_os = "linux")]
+    /// Call once after the tokio runtime is available. No-op outside
+    /// Linux/Wayland.
+    #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
     pub async fn init_portal_backend(&mut self, runtime_handle: tokio::runtime::Handle) {
         if !self.is_wayland {
             return;
         }
-
         tracing::info!("Initializing XDG Portal GlobalShortcuts backend");
         match PortalHotkeyBackend::new(runtime_handle).await {
             Some(backend) => {
                 if backend.is_available() {
                     tracing::info!("XDG Portal GlobalShortcuts backend initialized successfully");
                 } else {
-                    tracing::warn!("XDG Portal connected but no shortcuts bound - user may need to configure them");
+                    tracing::warn!("XDG Portal connected but no shortcuts bound — user may need to configure them");
                 }
                 self.portal_backend = Some(backend);
             }
             None => {
-                tracing::warn!("XDG Portal GlobalShortcuts not available - falling back to window-focused shortcuts");
+                tracing::warn!("XDG Portal GlobalShortcuts not available — falling back to window-focused shortcuts");
             }
         }
     }
 
-    /// Initialize the XDG Portal backend (no-op on non-Linux).
-    #[cfg(not(target_os = "linux"))]
-    pub async fn init_portal_backend(&mut self, _runtime_handle: tokio::runtime::Handle) {
-        // No-op on non-Linux platforms
-    }
+    /// No-op fallback when the wayland-portal feature or platform is
+    /// unavailable. Lets call sites stay `cfg`-free.
+    #[cfg(not(all(target_os = "linux", feature = "wayland-portal")))]
+    pub async fn init_portal_backend(&mut self, _runtime_handle: tokio::runtime::Handle) {}
 
-    /// Check if portal-based shortcuts are available (Wayland).
-    #[cfg(target_os = "linux")]
+    /// Whether the portal-based shortcut backend is bound.
     pub fn has_portal_backend(&self) -> bool {
-        self.portal_backend.as_ref().map(|b| b.is_available()).unwrap_or(false)
-    }
-
-    /// Check if portal-based shortcuts are available (always false on non-Linux).
-    #[cfg(not(target_os = "linux"))]
-    pub fn has_portal_backend(&self) -> bool {
-        false
+        #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+        {
+            self.portal_backend.as_ref().map(|b| b.is_available()).unwrap_or(false)
+        }
+        #[cfg(not(all(target_os = "linux", feature = "wayland-portal")))]
+        {
+            false
+        }
     }
 
     /// Get the current portal shortcut bindings (Linux/Wayland only).
-    #[cfg(target_os = "linux")]
-    pub fn get_portal_shortcuts(&self) -> Vec<crate::portal_hotkeys::ShortcutInfo> {
+    #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+    pub fn get_portal_shortcuts(&self) -> Vec<portal::ShortcutInfo> {
         self.portal_backend
             .as_ref()
             .map(|b| b.get_shortcuts())
             .unwrap_or_default()
     }
 
-    /// Get the current portal shortcut bindings (always empty on non-Linux).
-    #[cfg(not(target_os = "linux"))]
-    pub fn get_portal_shortcuts(&self) -> Vec<crate::portal_hotkeys::ShortcutInfo> {
+    /// Get the current portal shortcut bindings (always empty without portal).
+    #[cfg(not(all(target_os = "linux", feature = "wayland-portal")))]
+    pub fn get_portal_shortcuts(&self) -> Vec<()> {
         Vec::new()
     }
 
     /// Open the system shortcut configuration dialog (Linux/Wayland only).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
     pub fn open_portal_settings(&self) {
         if let Some(ref backend) = self.portal_backend {
             backend.open_settings();
         }
     }
 
-    /// Open the system shortcut configuration dialog (no-op on non-Linux).
-    #[cfg(not(target_os = "linux"))]
-    pub fn open_portal_settings(&self) {
-        // No-op on non-Linux
-    }
+    /// Open the system shortcut configuration dialog (no-op without portal).
+    #[cfg(not(all(target_os = "linux", feature = "wayland-portal")))]
+    pub fn open_portal_settings(&self) {}
 
-    /// Detect if running on Wayland.
     fn detect_wayland() -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -214,22 +297,25 @@ impl HotkeyManager {
         }
     }
 
-    /// Check if global hotkeys are available.
     pub fn is_available(&self) -> bool {
-        self.manager.is_some()
+        #[cfg(feature = "global-hotkeys")]
+        {
+            self.manager.is_some()
+        }
+        #[cfg(not(feature = "global-hotkeys"))]
+        {
+            false
+        }
     }
 
-    /// Check if running on Wayland.
     pub fn is_wayland(&self) -> bool {
         self.is_wayland
     }
 
-    /// Check if initialization failed (not due to Wayland).
     pub fn init_failed(&self) -> bool {
         self.init_failed
     }
 
-    /// Get the registration status for a given hotkey action.
     pub fn get_registration_status(&self, action: HotkeyAction) -> HotkeyRegistrationStatus {
         self.registration_status
             .get(&action)
@@ -237,17 +323,18 @@ impl HotkeyManager {
             .unwrap_or(HotkeyRegistrationStatus::NotConfigured)
     }
 
-    /// Get the full registration status map.
     pub fn registration_status_map(&self) -> &HashMap<HotkeyAction, HotkeyRegistrationStatus> {
         &self.registration_status
     }
 
-    /// Register hotkeys from settings.
+    /// Reconcile registered hotkeys with `settings`. Always re-registers
+    /// from scratch — diffing is fiddly and the operation is rare (only
+    /// when the user changes a binding).
     pub fn register_from_settings(&mut self, settings: &KeyboardSettings) -> Result<(), String> {
-        // Unregister existing hotkeys first
         self.unregister_all();
 
-        // Initialize all actions as not-configured
+        // Seed every action as NotConfigured so the UI can render a
+        // stable status grid even when bindings are missing.
         self.registration_status
             .insert(HotkeyAction::PushToTalk, HotkeyRegistrationStatus::NotConfigured);
         self.registration_status
@@ -255,86 +342,43 @@ impl HotkeyManager {
         self.registration_status
             .insert(HotkeyAction::ToggleDeafen, HotkeyRegistrationStatus::NotConfigured);
 
-        let Some(ref manager) = self.manager else {
-            return Ok(()); // No manager = no-op
-        };
-
         if !settings.global_hotkeys_enabled {
             tracing::info!("Global hotkeys disabled in settings");
             return Ok(());
         }
 
-        // Register PTT hotkey
-        if let Some(ref binding) = settings.ptt_hotkey {
-            match Self::binding_to_hotkey(binding) {
-                Ok(hotkey) => {
-                    let id = hotkey.id();
-                    if let Err(e) = manager.register(hotkey.clone()) {
-                        tracing::warn!("Failed to register PTT hotkey: {}", e);
-                        self.registration_status
-                            .insert(HotkeyAction::PushToTalk, HotkeyRegistrationStatus::Failed);
-                    } else {
-                        self.hotkey_actions.insert(id, HotkeyAction::PushToTalk);
-                        self.registered_hotkeys.push(hotkey);
-                        self.registration_status
-                            .insert(HotkeyAction::PushToTalk, HotkeyRegistrationStatus::Registered);
-                        tracing::info!("Registered PTT hotkey: {}", binding.display());
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Invalid PTT hotkey binding: {}", e);
-                    self.registration_status
-                        .insert(HotkeyAction::PushToTalk, HotkeyRegistrationStatus::Failed);
-                }
-            }
-        }
+        #[cfg(feature = "global-hotkeys")]
+        {
+            let Some(ref manager) = self.manager else {
+                return Ok(());
+            };
 
-        // Register toggle mute hotkey
-        if let Some(ref binding) = settings.toggle_mute_hotkey {
-            match Self::binding_to_hotkey(binding) {
-                Ok(hotkey) => {
-                    let id = hotkey.id();
-                    if let Err(e) = manager.register(hotkey.clone()) {
-                        tracing::warn!("Failed to register mute hotkey: {}", e);
-                        self.registration_status
-                            .insert(HotkeyAction::ToggleMute, HotkeyRegistrationStatus::Failed);
-                    } else {
-                        self.hotkey_actions.insert(id, HotkeyAction::ToggleMute);
-                        self.registered_hotkeys.push(hotkey);
-                        self.registration_status
-                            .insert(HotkeyAction::ToggleMute, HotkeyRegistrationStatus::Registered);
-                        tracing::info!("Registered mute hotkey: {}", binding.display());
+            for (action, binding) in [
+                (HotkeyAction::PushToTalk, &settings.ptt_hotkey),
+                (HotkeyAction::ToggleMute, &settings.toggle_mute_hotkey),
+                (HotkeyAction::ToggleDeafen, &settings.toggle_deafen_hotkey),
+            ] {
+                let Some(binding) = binding else { continue };
+                match Self::binding_to_hotkey(binding) {
+                    Ok(hotkey) => {
+                        let id = hotkey.id();
+                        if let Err(e) = manager.register(hotkey.clone()) {
+                            tracing::warn!("Failed to register {action:?}: {e}");
+                            self.registration_status
+                                .insert(action, HotkeyRegistrationStatus::Failed);
+                        } else {
+                            self.hotkey_actions.insert(id, action);
+                            self.registered_hotkeys.push(hotkey);
+                            self.registration_status
+                                .insert(action, HotkeyRegistrationStatus::Registered);
+                            tracing::info!("Registered {action:?}: {}", binding.display());
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("Invalid mute hotkey binding: {}", e);
-                    self.registration_status
-                        .insert(HotkeyAction::ToggleMute, HotkeyRegistrationStatus::Failed);
-                }
-            }
-        }
-
-        // Register toggle deafen hotkey
-        if let Some(ref binding) = settings.toggle_deafen_hotkey {
-            match Self::binding_to_hotkey(binding) {
-                Ok(hotkey) => {
-                    let id = hotkey.id();
-                    if let Err(e) = manager.register(hotkey.clone()) {
-                        tracing::warn!("Failed to register deafen hotkey: {}", e);
+                    Err(e) => {
+                        tracing::warn!("Invalid {action:?} binding: {e}");
                         self.registration_status
-                            .insert(HotkeyAction::ToggleDeafen, HotkeyRegistrationStatus::Failed);
-                    } else {
-                        self.hotkey_actions.insert(id, HotkeyAction::ToggleDeafen);
-                        self.registered_hotkeys.push(hotkey);
-                        self.registration_status
-                            .insert(HotkeyAction::ToggleDeafen, HotkeyRegistrationStatus::Registered);
-                        tracing::info!("Registered deafen hotkey: {}", binding.display());
+                            .insert(action, HotkeyRegistrationStatus::Failed);
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("Invalid deafen hotkey binding: {}", e);
-                    self.registration_status
-                        .insert(HotkeyAction::ToggleDeafen, HotkeyRegistrationStatus::Failed);
                 }
             }
         }
@@ -342,28 +386,32 @@ impl HotkeyManager {
         Ok(())
     }
 
-    /// Unregister all hotkeys.
+    /// Drop every active registration. Safe to call repeatedly.
     pub fn unregister_all(&mut self) {
-        if let Some(ref manager) = self.manager {
-            for hotkey in &self.registered_hotkeys {
-                let _ = manager.unregister(hotkey.clone());
+        #[cfg(feature = "global-hotkeys")]
+        {
+            if let Some(ref manager) = self.manager {
+                for hotkey in &self.registered_hotkeys {
+                    let _ = manager.unregister(hotkey.clone());
+                }
             }
+            self.hotkey_actions.clear();
+            self.registered_hotkeys.clear();
         }
-        self.hotkey_actions.clear();
-        self.registered_hotkeys.clear();
     }
 
-    /// Poll for hotkey events (non-blocking).
+    /// Drain pending events from every backend. Returns ordered events
+    /// (portal first, then global-hotkey) — order matters when a single
+    /// physical key triggers both backends in close succession.
     pub fn poll_events(&mut self) -> Vec<HotkeyEvent> {
         let mut events = Vec::new();
 
-        // Poll XDG Portal backend on Linux/Wayland
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
         if let Some(ref mut portal) = self.portal_backend {
             events.extend(portal.poll_events());
         }
 
-        // Poll global-hotkey backend (X11, Windows, macOS)
+        #[cfg(feature = "global-hotkeys")]
         if self.manager.is_some() {
             while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
                 if let Some(&action) = self.hotkey_actions.get(&event.id) {
@@ -390,14 +438,14 @@ impl HotkeyManager {
         events
     }
 
-    /// Convert a HotkeyBinding to a global_hotkey::HotKey.
+    #[cfg(feature = "global-hotkeys")]
     fn binding_to_hotkey(binding: &HotkeyBinding) -> Result<HotKey, String> {
         let modifiers = Self::modifiers_to_global(&binding.modifiers);
         let code = Self::key_string_to_code(&binding.key)?;
         Ok(HotKey::new(modifiers, code))
     }
 
-    /// Convert our modifiers to global_hotkey modifiers.
+    #[cfg(feature = "global-hotkeys")]
     fn modifiers_to_global(mods: &HotkeyModifiers) -> Option<Modifiers> {
         let mut result = Modifiers::empty();
         if mods.ctrl {
@@ -415,11 +463,10 @@ impl HotkeyManager {
         if result.is_empty() { None } else { Some(result) }
     }
 
-    /// Convert key string to Code enum.
+    /// Convert key string to global-hotkey `Code`.
+    #[cfg(feature = "global-hotkeys")]
     pub fn key_string_to_code(key: &str) -> Result<Code, String> {
-        // Map common key names to Code variants
         match key.to_lowercase().as_str() {
-            // Special keys
             "space" => Ok(Code::Space),
             "enter" | "return" => Ok(Code::Enter),
             "tab" => Ok(Code::Tab),
@@ -432,13 +479,11 @@ impl HotkeyManager {
             "pageup" => Ok(Code::PageUp),
             "pagedown" => Ok(Code::PageDown),
 
-            // Arrow keys
             "arrowup" | "up" => Ok(Code::ArrowUp),
             "arrowdown" | "down" => Ok(Code::ArrowDown),
             "arrowleft" | "left" => Ok(Code::ArrowLeft),
             "arrowright" | "right" => Ok(Code::ArrowRight),
 
-            // Function keys
             "f1" => Ok(Code::F1),
             "f2" => Ok(Code::F2),
             "f3" => Ok(Code::F3),
@@ -452,7 +497,6 @@ impl HotkeyManager {
             "f11" => Ok(Code::F11),
             "f12" => Ok(Code::F12),
 
-            // Letters
             "a" | "keya" => Ok(Code::KeyA),
             "b" | "keyb" => Ok(Code::KeyB),
             "c" | "keyc" => Ok(Code::KeyC),
@@ -480,7 +524,6 @@ impl HotkeyManager {
             "y" | "keyy" => Ok(Code::KeyY),
             "z" | "keyz" => Ok(Code::KeyZ),
 
-            // Numbers
             "0" | "digit0" => Ok(Code::Digit0),
             "1" | "digit1" => Ok(Code::Digit1),
             "2" | "digit2" => Ok(Code::Digit2),
@@ -492,7 +535,6 @@ impl HotkeyManager {
             "8" | "digit8" => Ok(Code::Digit8),
             "9" | "digit9" => Ok(Code::Digit9),
 
-            // Numpad
             "numpad0" => Ok(Code::Numpad0),
             "numpad1" => Ok(Code::Numpad1),
             "numpad2" => Ok(Code::Numpad2),
@@ -510,7 +552,6 @@ impl HotkeyManager {
             "numpaddecimal" => Ok(Code::NumpadDecimal),
             "numpadenter" => Ok(Code::NumpadEnter),
 
-            // Punctuation and symbols
             "minus" | "-" => Ok(Code::Minus),
             "equal" | "=" => Ok(Code::Equal),
             "bracketleft" | "[" => Ok(Code::BracketLeft),
@@ -523,7 +564,7 @@ impl HotkeyManager {
             "period" | "." => Ok(Code::Period),
             "slash" | "/" => Ok(Code::Slash),
 
-            _ => Err(format!("Unknown key: {}", key)),
+            _ => Err(format!("Unknown key: {key}")),
         }
     }
 
@@ -709,8 +750,9 @@ impl Drop for HotkeyManager {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "global-hotkeys")]
     #[test]
-    fn test_key_string_to_code() {
+    fn key_string_to_code_known_keys() {
         assert!(matches!(HotkeyManager::key_string_to_code("Space"), Ok(Code::Space)));
         assert!(matches!(HotkeyManager::key_string_to_code("space"), Ok(Code::Space)));
         assert!(matches!(HotkeyManager::key_string_to_code("F1"), Ok(Code::F1)));
@@ -718,8 +760,9 @@ mod tests {
         assert!(HotkeyManager::key_string_to_code("InvalidKey").is_err());
     }
 
+    #[cfg(feature = "global-hotkeys")]
     #[test]
-    fn test_modifiers_conversion() {
+    fn modifiers_conversion() {
         let mods = HotkeyModifiers {
             ctrl: true,
             shift: true,
@@ -732,14 +775,15 @@ mod tests {
         assert!(!global.contains(Modifiers::ALT));
     }
 
+    #[cfg(feature = "global-hotkeys")]
     #[test]
-    fn test_empty_modifiers() {
+    fn empty_modifiers() {
         let mods = HotkeyModifiers::default();
         assert!(HotkeyManager::modifiers_to_global(&mods).is_none());
     }
 
     #[test]
-    fn test_hotkey_binding_display() {
+    fn hotkey_binding_display() {
         let binding = HotkeyBinding {
             modifiers: HotkeyModifiers {
                 ctrl: true,
@@ -759,15 +803,11 @@ mod tests {
     }
 
     #[test]
-    fn test_key_string_to_egui_key() {
+    fn key_string_to_egui_roundtrip() {
         use eframe::egui::Key;
-
-        assert_eq!(HotkeyManager::key_string_to_egui_key("Space"), Some(Key::Space));
-        assert_eq!(HotkeyManager::key_string_to_egui_key("space"), Some(Key::Space));
-        assert_eq!(HotkeyManager::key_string_to_egui_key("F1"), Some(Key::F1));
-        assert_eq!(HotkeyManager::key_string_to_egui_key("A"), Some(Key::A));
-        assert_eq!(HotkeyManager::key_string_to_egui_key("a"), Some(Key::A));
-        assert_eq!(HotkeyManager::key_string_to_egui_key("0"), Some(Key::Num0));
-        assert_eq!(HotkeyManager::key_string_to_egui_key("InvalidKey"), None);
+        for key in [Key::Space, Key::F1, Key::A, Key::Num0, Key::Enter] {
+            let s = HotkeyManager::egui_key_to_string(key).unwrap();
+            assert_eq!(HotkeyManager::key_string_to_egui_key(&s), Some(key));
+        }
     }
 }

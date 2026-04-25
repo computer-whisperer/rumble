@@ -1,14 +1,12 @@
-//! Toast notification system for the Rumble UI.
-//!
-//! Provides non-intrusive, auto-dismissing notifications that appear in the
-//! bottom-right corner of the screen. Toasts stack vertically with newest at
-//! the bottom and fade out in their last second.
+//! Auto-dismissing corner notifications. Toasts stack in the
+//! bottom-right with newest at the bottom and fade out in their last
+//! second. Colors come from a hard-coded severity palette so they read
+//! the same against any theme.
 
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-/// Severity level of a toast notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastLevel {
     Success,
@@ -18,7 +16,7 @@ pub enum ToastLevel {
 }
 
 impl ToastLevel {
-    fn color(&self) -> egui::Color32 {
+    fn color(self) -> egui::Color32 {
         match self {
             ToastLevel::Success => egui::Color32::from_rgb(0x4C, 0xAF, 0x50),
             ToastLevel::Error => egui::Color32::from_rgb(0xF4, 0x43, 0x36),
@@ -27,7 +25,7 @@ impl ToastLevel {
         }
     }
 
-    fn default_duration(&self) -> Duration {
+    fn default_duration(self) -> Duration {
         match self {
             ToastLevel::Success | ToastLevel::Info => Duration::from_secs(4),
             ToastLevel::Error | ToastLevel::Warning => Duration::from_secs(6),
@@ -35,7 +33,6 @@ impl ToastLevel {
     }
 }
 
-/// A single toast notification.
 pub struct Toast {
     pub message: String,
     pub level: ToastLevel,
@@ -61,7 +58,6 @@ impl Toast {
         self.elapsed() >= self.duration
     }
 
-    /// Returns opacity in 0.0..=1.0, fading out during the last second.
     fn opacity(&self) -> f32 {
         let remaining = self.duration.saturating_sub(self.elapsed());
         let remaining_secs = remaining.as_secs_f32();
@@ -73,14 +69,14 @@ impl Toast {
     }
 }
 
-/// Manages active toast notifications and renders them each frame.
+#[derive(Default)]
 pub struct ToastManager {
     toasts: Vec<Toast>,
 }
 
 impl ToastManager {
     pub fn new() -> Self {
-        Self { toasts: Vec::new() }
+        Self::default()
     }
 
     pub fn success(&mut self, msg: impl Into<String>) {
@@ -99,19 +95,12 @@ impl ToastManager {
         self.toasts.push(Toast::new(msg, ToastLevel::Warning));
     }
 
-    /// Render all active toasts. Call this at the end of the frame.
-    ///
-    /// Toasts appear in the bottom-right corner, stacked vertically with the
-    /// newest at the bottom. Expired toasts are removed automatically.
     pub fn render(&mut self, ctx: &egui::Context) {
-        // Remove expired toasts
         self.toasts.retain(|t| !t.is_expired());
-
         if self.toasts.is_empty() {
             return;
         }
 
-        // Request repaint for fade animation
         ctx.request_repaint_after(Duration::from_millis(50));
 
         let screen = ctx.content_rect();
@@ -119,14 +108,12 @@ impl ToastManager {
         let toast_width = 320.0;
         let spacing = 6.0;
 
-        // Calculate total height to position from bottom
         let toast_heights: Vec<f32> = self
             .toasts
             .iter()
             .map(|t| {
-                // Estimate height: padding + text. Use a rough heuristic.
                 let line_count = (t.message.len() as f32 / 40.0).ceil().max(1.0);
-                8.0 + 8.0 + line_count * 16.0
+                16.0 + line_count * 16.0
             })
             .collect();
 
@@ -153,7 +140,6 @@ impl ToastManager {
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(8.0)), |ui| {
                         ui.label(egui::RichText::new(&toast.message).color(text_color));
                     });
-                    // Ensure the area takes the full size
                     ui.allocate_space(egui::vec2(toast_width, height));
                 });
 

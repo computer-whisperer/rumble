@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 rumble-client = { path = "../rumble-client" }
 rumble-desktop = { path = "../rumble-desktop" }
+rumble-desktop-shell = { path = "../rumble-desktop-shell" }
 rumble-protocol = { path = "../rumble-protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap = { version = "4.5.53", features = ["derive"] }
@@ -35,25 +36,18 @@ ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 rand_core = { workspace = true }
 hex = "0.4"
-sha2 = "0.10"
-getrandom = "0.3"
-argon2 = "0.5"
-chacha20poly1305 = "0.10"
+# Crypto + SSH agent crates moved to rumble-desktop-shell::identity
+# (the encrypted-keys + ssh-agent features). egui consumes them via
+# the shared KeyManager.
 anyhow = "1.0"
-ssh-agent-lib = "0.5"
-ssh-key = { version = "0.6", features = ["ed25519"] }
-service-binding = "3.0"
 rfd = "0.16"
 base64 = "0.22"
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "dds", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 tempfile = "3"
-global-hotkey = "0.7"
 
-# XDG Desktop Portal for Wayland global shortcuts
-[target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.12", default-features = false, features = ["tokio"] }
-futures-util = "0.3"
+# global-hotkey + ashpd live in rumble-desktop-shell's hotkeys module —
+# the egui client just consumes the shared API.
 
 # Optional test harness dependencies
 egui_kittest = { version = "0.33", features = ["wgpu", "snapshot"], optional = true }

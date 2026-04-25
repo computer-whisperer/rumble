@@ -1,0 +1,20 @@
+//! Rumble-next — parallel GUI built from the claude-design/Rumble
+//! paradigm wireframes, rendered with `rumble-widgets` themes and
+//! wired to the live `rumble-client` backend.
+
+pub mod adapters;
+pub mod app;
+pub mod connect_view;
+pub mod data;
+#[cfg(feature = "test-harness")]
+pub mod harness;
+pub mod identity;
+pub mod paradigm;
+pub mod settings_panel;
+pub mod shell;
+
+pub use app::{App, Paradigm};
+pub use rumble_desktop_shell::{ToastLevel, ToastManager};
+
+#[cfg(feature = "test-harness")]
+pub use harness::TestHarness;
