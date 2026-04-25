@@ -1,9 +1,7 @@
 # Rumble v2 Architecture: Platform Abstraction via Traits
 
-**Status:** Design decisions resolved — ready for implementation planning
+**Status:** Implemented — see crates `rumble-client`, `rumble-client-traits`, `rumble-desktop`.
 **Motivation:** The codebase has reached feature maturity. Before building higher, we need to carve proper seams so that new platforms (WASM, mobile), new clients (terminal, alternative GUIs), and new bridges don't require duplicating protocol and business logic.
-
-**Supersedes:** `docs/wasm-support.md` (which proposed `#[cfg]` flags inside `backend`)
 
 ## Design Principles
 

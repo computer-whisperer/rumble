@@ -127,8 +127,6 @@ Located in `vendor/`. Used primarily for reference; code links against GitHub ve
 
 - `egui_ltreeview` - Tree view widget for room hierarchy
 - `opus-rs` - Opus audio codec bindings
-- `rqbit` - BitTorrent client (legacy, no longer used for file sharing)
-- `torrust-tracker` - BitTorrent tracker (legacy, no longer used)
 
 ## GUI Test Harness
 
@@ -148,10 +146,6 @@ cargo run -p harness-cli -- iterate -o /tmp/ui.png
 # Clean teardown
 cargo run -p harness-cli -- down
 ```
-
-## P2P NAT Traversal Testing
-
-Docker-based test environment in `docker/p2p-test/` for P2P connectivity with NAT simulation using libp2p. See [docs/p2p-testing.md](docs/p2p-testing.md) for topology diagrams and test details.
 
 ## Emoji
 

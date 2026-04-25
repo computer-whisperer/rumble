@@ -1,2 +1,0 @@
-Hello from backend P2P file transfer test!
-This file is used to test the P2P functionality in the backend crate.

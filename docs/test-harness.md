@@ -1,21 +1,18 @@
 # GUI Test Harness
 
-The `egui-test` crate is structured as both a library and binary, enabling programmatic control of the GUI for agents and integration tests.
+The `rumble-egui` crate is structured as both a library and binary, enabling programmatic control of the GUI for agents and integration tests.
 
 ## Architecture
 
 ```
-crates/egui-test/src/
+crates/rumble-egui/src/
 ├── lib.rs              # Library exports: RumbleApp, TestHarness, Args
 ├── main.rs             # Thin eframe wrapper (human-facing app)
 ├── app.rs              # RumbleApp - core application logic
 ├── harness.rs          # TestHarness for programmatic control
-├── hotkeys.rs          # Global hotkey handling
-├── key_manager.rs      # Ed25519 key management
-├── portal_hotkeys.rs   # Portal-based global hotkeys (Linux)
+├── first_run.rs        # First-run identity setup wizard
 ├── rpc_client.rs       # RPC client for inter-process communication
-├── settings.rs         # Persistent settings types
-└── toasts.rs           # Toast notification system
+└── settings.rs         # Persistent settings types
 ```
 
 The key separation: `RumbleApp` contains all UI logic and is independent of eframe. The desktop app wraps it in an eframe runner, while tests/agents use `TestHarness` directly.
@@ -23,7 +20,7 @@ The key separation: `RumbleApp` contains all UI logic and is independent of efra
 ## Using TestHarness
 
 ```rust
-use egui_test::{TestHarness, Args};
+use rumble_egui::{TestHarness, Args};
 
 // Create harness with default settings
 let mut harness = TestHarness::new();
