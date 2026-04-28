@@ -15,7 +15,10 @@ use rumble_client::{
     build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
 };
 use rumble_protocol::permissions::Permissions;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -26,7 +29,8 @@ use crate::{
     },
 };
 use rumble_desktop_shell::{
-    KeyInfo, KeyManager, KeySource, ToastManager,
+    AcceptedCertificate as SharedAcceptedCertificate, KeyInfo, KeyManager, KeySource, RecentServer, SettingsStore,
+    ToastManager,
     hotkeys::HotkeyEvent,
     identity::key_manager::{
         PendingAgentOp, SshAgentClient, connect_and_list_keys, generate_and_add_to_agent, parse_signing_key,
@@ -186,6 +190,26 @@ impl Default for RoomAclModalState {
             entries: vec![],
         }
     }
+}
+
+/// Format an audio device for display in the picker.
+///
+/// `name` alone is ambiguous — ALSA exposes the same physical card under
+/// several pcm endpoints (e.g. `sysdefault:CARD=…`, `front:CARD=…`,
+/// `dsnoop:CARD=…`) that all share a description name. `pipeline`
+/// disambiguates them, so we always show it when the host provides one
+/// and it adds information beyond the name.
+fn device_label(d: &rumble_client::AudioDeviceInfo) -> String {
+    let mut s = d.name.clone();
+    if let Some(pipeline) = &d.pipeline
+        && pipeline != &d.name
+    {
+        s.push_str(&format!("  [{pipeline}]"));
+    }
+    if d.is_default {
+        s.push_str(" (default)");
+    }
+    s
 }
 
 /// Render permission checkboxes for group editing.
@@ -442,6 +466,10 @@ pub struct RumbleApp {
 
     // Persistent settings
     persistent_settings: PersistentSettings,
+    /// Shared desktop settings used by rumble-next too. During the
+    /// migration, egui keeps its larger legacy `settings.json` for
+    /// egui-only options, but portable connection data lives here.
+    shared_settings: SettingsStore,
     /// Whether to autoconnect on launch
     autoconnect_on_launch: bool,
 
@@ -549,6 +577,7 @@ impl RumbleApp {
 
         // Get config directory for key manager
         let config_dir = persistent_settings.config_dir().unwrap_or_else(|| PathBuf::from("."));
+        let mut shared_settings = SettingsStore::load_from_path(Some(config_dir.join("desktop-shell.json")));
 
         // Create key manager and check for migration from old format
         let mut key_manager = KeyManager::new(config_dir);
@@ -577,16 +606,36 @@ impl RumbleApp {
         let signing_key = key_manager.signing_key().cloned();
 
         // CLI args override persistent settings
+        let shared_autoconnect = shared_settings.settings().auto_connect_addr.as_ref().and_then(|addr| {
+            shared_settings
+                .settings()
+                .recent_servers
+                .iter()
+                .find(|s| &s.addr == addr)
+        });
+        let shared_recent = shared_autoconnect.or_else(|| {
+            shared_settings
+                .settings()
+                .recent_servers
+                .iter()
+                .max_by_key(|server| server.last_used_unix)
+        });
+
         let server_address = args
             .server
             .clone()
+            .or_else(|| shared_recent.map(|server| server.addr.clone()))
             .unwrap_or_else(|| persistent_settings.server_address.clone());
         let server_password = args
             .password
             .clone()
             .unwrap_or_else(|| persistent_settings.server_password.clone());
         let client_name = args.name.clone().unwrap_or_else(|| {
-            if persistent_settings.client_name.is_empty() {
+            if let Some(server) = shared_recent
+                && !server.username.is_empty()
+            {
+                server.username.clone()
+            } else if persistent_settings.client_name.is_empty() {
                 format!("user-{}", Uuid::new_v4().simple())
             } else {
                 persistent_settings.client_name.clone()
@@ -624,6 +673,20 @@ impl RumbleApp {
                             e
                         );
                     }
+                }
+            }
+        }
+        for accepted in &shared_settings.settings().accepted_certificates {
+            match accepted.der_bytes() {
+                Some(der_bytes) => {
+                    tracing::info!("Loading shared accepted certificate for {}", accepted.server_name);
+                    config.accepted_certs.push(der_bytes);
+                }
+                None => {
+                    tracing::warn!(
+                        "Failed to decode shared accepted certificate for {}",
+                        accepted.server_name
+                    );
                 }
             }
         }
@@ -691,6 +754,21 @@ impl RumbleApp {
         persistent_settings.trust_dev_cert = trust_dev_cert;
 
         let autoconnect_on_launch = persistent_settings.autoconnect_on_launch;
+        if autoconnect_on_launch && !server_address.is_empty() {
+            let addr = server_address.clone();
+            let username = client_name.clone();
+            shared_settings.modify(|s| {
+                if !s.recent_servers.iter().any(|server| server.addr == addr) {
+                    s.recent_servers.push(RecentServer {
+                        addr: addr.clone(),
+                        label: String::new(),
+                        username,
+                        last_used_unix: 0,
+                    });
+                }
+                s.auto_connect_addr = Some(addr);
+            });
+        }
 
         // Save settings
         if let Err(e) = persistent_settings.save() {
@@ -737,6 +815,7 @@ impl RumbleApp {
             pending_file_dialog: None,
             tokio_handle: runtime_handle,
             persistent_settings,
+            shared_settings,
             autoconnect_on_launch,
             backend,
             processor_registry,
@@ -969,6 +1048,7 @@ impl RumbleApp {
         self.backend.send(Command::LocalMessage {
             text: format!("Connecting to {}...", addr),
         });
+        self.remember_shared_server(&addr, &name);
         self.backend.send(Command::Connect {
             addr,
             name,
@@ -986,6 +1066,7 @@ impl RumbleApp {
         self.persistent_settings.client_name = self.client_name.clone();
         self.persistent_settings.trust_dev_cert = self.trust_dev_cert;
         self.persistent_settings.autoconnect_on_launch = self.autoconnect_on_launch;
+        self.sync_shared_connection_settings();
 
         // Save audio settings from backend state
         let audio = self.backend.state().audio.clone();
@@ -1021,6 +1102,43 @@ impl RumbleApp {
                 text: "Settings saved.".to_string(),
             });
         }
+    }
+
+    fn remember_shared_server(&mut self, addr: &str, username: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let addr = addr.to_string();
+        let username = username.to_string();
+        let autoconnect = self.autoconnect_on_launch;
+        self.shared_settings.modify(|s| {
+            match s.recent_servers.iter_mut().find(|server| server.addr == addr) {
+                Some(server) => {
+                    server.username = username.clone();
+                    server.last_used_unix = now;
+                }
+                None => s.recent_servers.push(RecentServer {
+                    addr: addr.clone(),
+                    label: String::new(),
+                    username,
+                    last_used_unix: now,
+                }),
+            }
+            if autoconnect {
+                s.auto_connect_addr = Some(addr);
+            } else if s.auto_connect_addr.as_deref() == Some(addr.as_str()) {
+                s.auto_connect_addr = None;
+            }
+        });
+    }
+
+    fn sync_shared_connection_settings(&mut self) {
+        let addr = self.connect_address.trim().to_string();
+        if addr.is_empty() {
+            return;
+        }
+        self.remember_shared_server(&addr, &self.client_name.clone());
     }
 
     /// Attempt to reconnect with the last known connection parameters.
@@ -1291,11 +1409,7 @@ impl RumbleApp {
                 }
 
                 for device in &audio.input_devices {
-                    let label = if device.is_default {
-                        format!("{} (default)", device.name)
-                    } else {
-                        device.name.clone()
-                    };
+                    let label = device_label(device);
                     if ui
                         .selectable_label(pending_input.as_ref() == Some(&device.id), &label)
                         .clicked()
@@ -1327,11 +1441,7 @@ impl RumbleApp {
                 }
 
                 for device in &audio.output_devices {
-                    let label = if device.is_default {
-                        format!("{} (default)", device.name)
-                    } else {
-                        device.name.clone()
-                    };
+                    let label = device_label(device);
                     if ui
                         .selectable_label(pending_output.as_ref() == Some(&device.id), &label)
                         .clicked()
@@ -4623,6 +4733,19 @@ impl RumbleApp {
                                     tracing::error!("Failed to save accepted certificate: {}", e);
                                 }
                             }
+                            self.shared_settings.modify(|s| {
+                                let already = s
+                                    .accepted_certificates
+                                    .iter()
+                                    .any(|c| c.server_name == server_name && c.fingerprint_hex == fingerprint);
+                                if !already {
+                                    s.accepted_certificates.push(SharedAcceptedCertificate::from_der(
+                                        server_name.clone(),
+                                        fingerprint.clone(),
+                                        &certificate_der,
+                                    ));
+                                }
+                            });
 
                             self.backend.send(Command::AcceptCertificate);
                             self.backend.send(Command::LocalMessage {

@@ -14,6 +14,7 @@ pub use hotkeys::{
 };
 pub use identity::{KeyConfig, KeyInfo, KeyManager, KeySource, compute_fingerprint, parse_signing_key};
 pub use settings::{
-    AcceptedCertificate, ChatSettings, RecentServer, Settings, SettingsStore, SfxSettings, TimestampFormat,
+    AcceptedCertificate, AutoDownloadRule, ChatSettings, FileTransferSettings, PersistentAudioSettings,
+    PersistentVoiceMode, RecentServer, Settings, SettingsStore, SfxSettings, TimestampFormat,
 };
 pub use toasts::{Toast, ToastLevel, ToastManager};

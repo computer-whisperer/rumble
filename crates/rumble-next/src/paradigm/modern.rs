@@ -2,9 +2,7 @@
 //! self-state controls, and an avatar pill. Two-column body: sidebar
 //! (server tree) + center (room header, chat, composer).
 
-use eframe::egui::{
-    self, Align, CornerRadius, Layout, Margin, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, epaint::RectShape,
-};
+use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText, Stroke, Ui, epaint::RectShape};
 use rumble_client::handle::BackendHandle;
 use rumble_client_traits::Platform;
 use rumble_protocol::{Command, State};
@@ -66,7 +64,6 @@ fn top_bar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
                         .font(tokens.font_body.clone()),
                 );
 
-                // Search pill (non-interactive decoration for now).
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     let avail = ui.available_width();
                     let search_w = (avail * 0.55).min(360.0).max(180.0);
@@ -74,28 +71,22 @@ fn top_bar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
                     if side > 0.0 {
                         ui.add_space(side);
                     }
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(search_w, 26.0), Sense::hover());
-                    ui.painter().add(RectShape::new(
-                        rect,
-                        CornerRadius::same(13),
-                        tokens.surface_sunken,
-                        Stroke::NONE,
-                        StrokeKind::Inside,
-                    ));
-                    ui.painter().text(
-                        rect.left_center() + Vec2::new(12.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        "⌕  jump to a room or person…",
-                        tokens.font_body.clone(),
-                        tokens.text_muted,
-                    );
-                    ui.painter().text(
-                        rect.right_center() - Vec2::new(12.0, 0.0),
-                        egui::Align2::RIGHT_CENTER,
-                        "⌘K",
-                        tokens.font_mono.clone(),
-                        tokens.text_muted,
-                    );
+                    let response = egui::Frame::NONE
+                        .fill(tokens.surface_sunken)
+                        .corner_radius(CornerRadius::same(13))
+                        .inner_margin(Margin::symmetric(12, 3))
+                        .show(ui, |ui| {
+                            ui.set_width(search_w);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut shell.tree_filter)
+                                    .hint_text("jump to a room or person...")
+                                    .desired_width(search_w - 24.0),
+                            )
+                        })
+                        .inner;
+                    if response.changed() {
+                        ui.ctx().request_repaint();
+                    }
                 });
 
                 // Right-aligned self-state + avatar
@@ -170,8 +161,10 @@ fn sidebar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(6.0);
-            let _ = ButtonArgs::new("⟲").role(PressableRole::Ghost).show(ui);
-            let _ = ButtonArgs::new("+ new").role(PressableRole::Ghost).show(ui);
+            if ButtonArgs::new("+ new").role(PressableRole::Ghost).show(ui).clicked() {
+                let (parent, parent_name) = current_room_parent(state);
+                shell.open_create_room(parent, parent_name);
+            }
         });
     });
     ui.add_space(4.0);
@@ -181,11 +174,24 @@ fn sidebar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
     });
 }
 
+/// Pick the parent for a "create room" action launched from a generic
+/// sidebar button: the user's current room if they're in one, else the
+/// root. The display name is used purely for the modal header.
+fn current_room_parent(state: &State) -> (Option<uuid::Uuid>, String) {
+    match state
+        .my_room_id
+        .and_then(|id| state.room_tree.get(id).map(|n| (id, n.name.clone())))
+    {
+        Some((id, name)) => (Some(id), name),
+        None => (None, "(root)".to_string()),
+    }
+}
+
 fn center_column<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
     let rect = ui.available_rect_before_wrap();
 
     let composer_h = 56.0;
-    let header_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 44.0));
+    let header_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 64.0));
     let chat_rect = egui::Rect::from_min_max(
         egui::pos2(rect.min.x, header_rect.max.y),
         egui::pos2(rect.max.x, rect.max.y - composer_h),

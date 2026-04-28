@@ -1,46 +1,31 @@
 //! Ed25519 identity wrapper. Backed by `rumble_desktop_shell::KeyManager`
 //! so plaintext / encrypted / SSH-agent identities written by either
-//! rumble-egui or a future rumble-next first-run wizard load
-//! identically.
+//! client load identically.
 
 use std::path::PathBuf;
 
 use ed25519_dalek::SigningKey;
 use rumble_client::SigningCallback;
-use rumble_desktop_shell::KeyManager;
+use rumble_desktop_shell::{KeyInfo, KeyManager};
 
 pub struct Identity {
     manager: KeyManager,
-    public_key: [u8; 32],
+    public_key: Option<[u8; 32]>,
 }
 
 impl Identity {
-    /// Load the identity from `<config_dir>/identity.json`. If none
-    /// exists, generate a fresh plaintext key and persist it.
-    ///
-    /// Encrypted-at-rest keys load with `cached_signing_key = None`
-    /// until the user provides a password — for now rumble-next has
-    /// no unlock UI, so an encrypted file effectively prevents login.
-    /// Same goes for SSH-agent identities when the agent isn't
-    /// reachable. Both paths log clearly so the failure mode is
-    /// obvious in the terminal.
-    pub fn load_or_create(config_dir: &PathBuf) -> std::io::Result<Self> {
+    /// Load the identity manager from `<config_dir>/identity.json`
+    /// without creating a replacement key. Missing config is a valid
+    /// first-run state and should be resolved by the UI wizard.
+    pub fn load(config_dir: &PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(config_dir)?;
-        let mut manager = KeyManager::new(config_dir.clone());
-
-        if manager.needs_setup() {
-            let info = manager.generate_local_key(None).map_err(std::io::Error::other)?;
-            tracing::info!("Generated fresh identity ({})", info.fingerprint);
-        }
-
-        let public_key = manager
-            .public_key_bytes()
-            .ok_or_else(|| std::io::Error::other("identity loaded but public key is invalid"))?;
+        let manager = KeyManager::new(config_dir.clone());
+        let public_key = manager.public_key_bytes();
 
         Ok(Self { manager, public_key })
     }
 
-    pub fn public_key(&self) -> [u8; 32] {
+    pub fn public_key(&self) -> Option<[u8; 32]> {
         self.public_key
     }
 
@@ -57,6 +42,28 @@ impl Identity {
                 std::sync::Arc::new(|_payload: &[u8]| Err("identity locked or unsupported".to_string()))
             }
         }
+    }
+
+    pub fn needs_setup(&self) -> bool {
+        self.manager.needs_setup()
+    }
+
+    pub fn generate_local_key(&mut self, password: Option<&str>) -> anyhow::Result<KeyInfo> {
+        let info = self.manager.generate_local_key(password)?;
+        self.public_key = Some(info.public_key);
+        Ok(info)
+    }
+
+    pub fn select_agent_key(&mut self, key_info: &KeyInfo) -> anyhow::Result<()> {
+        self.manager.select_agent_key(key_info)?;
+        self.public_key = Some(key_info.public_key);
+        Ok(())
+    }
+
+    pub fn unlock(&mut self, password: &str) -> anyhow::Result<()> {
+        self.manager.unlock_local_key(password)?;
+        self.public_key = self.manager.public_key_bytes();
+        Ok(())
     }
 
     /// Underlying manager — exposed so a future first-run wizard can
@@ -78,7 +85,9 @@ impl Identity {
     /// Hex of the SHA256 fingerprint, formatted for display
     /// (e.g. in the connect view's public-key footer).
     pub fn fingerprint(&self) -> String {
-        rumble_desktop_shell::compute_fingerprint(&self.public_key)
+        self.public_key
+            .map(|key| rumble_desktop_shell::compute_fingerprint(&key))
+            .unwrap_or_else(|| "(not set up)".to_string())
     }
 
     /// Cached `SigningKey` for plaintext / unlocked-encrypted sources.

@@ -15,7 +15,10 @@ pub mod keys;
 pub mod storage;
 pub mod transport;
 
-pub use audio::{CpalAudioBackend, CpalCaptureStream, CpalPlaybackStream};
+pub use audio::{
+    CpalAudioBackend, CpalCaptureStream, CpalPlaybackStream, DesktopAudioBackend, DesktopCaptureStream,
+    DesktopPlaybackStream,
+};
 pub use codec::{NativeOpusCodec, NativeOpusDecoder, NativeOpusEncoder};
 pub use file_transfer_relay::FileTransferRelayPlugin;
 pub use keys::NativeKeySigning;
@@ -37,7 +40,7 @@ pub struct NativePlatform;
 
 impl Platform for NativePlatform {
     type Transport = QuinnTransport;
-    type AudioBackend = CpalAudioBackend;
+    type AudioBackend = DesktopAudioBackend;
     type Codec = NativeOpusCodec;
     type Storage = FileStorage;
     type KeyManager = NativeKeySigning;

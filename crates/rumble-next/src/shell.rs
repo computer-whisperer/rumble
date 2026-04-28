@@ -16,11 +16,23 @@ use eframe::egui::{
 };
 use rumble_client::handle::BackendHandle;
 use rumble_client_traits::Platform;
-use rumble_protocol::{Command, State};
+use rumble_protocol::{Command, State, permissions::Permissions, proto::RoomAclEntry};
 use rumble_widgets::{
-    ButtonArgs, GroupBox, PressableRole, SurfaceFrame, SurfaceKind, TextInput, Tree, TreeNode, TreeNodeId, UiExt,
+    ButtonArgs, ComboBox, GroupBox, PressableRole, SurfaceFrame, SurfaceKind, TextInput, Tree, TreeNode, TreeNodeId,
+    TreeNodeKind, UiExt,
 };
 use uuid::Uuid;
+
+/// Ban-modal duration choices, matching `rumble-egui`'s set so the two
+/// clients give bans the same shape. Index → `(label, seconds)`; 0
+/// seconds means a permanent ban (the protocol's sentinel).
+const BAN_DURATIONS: &[(&str, u64)] = &[
+    ("Permanent", 0),
+    ("1 hour", 3600),
+    ("1 day", 86_400),
+    ("1 week", 604_800),
+    ("30 days", 2_592_000),
+];
 
 use crate::{
     adapters::{self, NodeRef, crumbs_for_room, is_room},
@@ -30,8 +42,16 @@ use crate::{
 /// What the right-click context menu is attached to.
 #[derive(Clone, Debug)]
 pub enum ContextTarget {
-    User { id: u64, name: String, locally_muted: bool },
-    Room { id: Uuid, name: String },
+    User {
+        id: u64,
+        name: String,
+        locally_muted: bool,
+        server_muted: bool,
+    },
+    Room {
+        id: Uuid,
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -58,15 +78,45 @@ pub enum PendingModal {
         id: Uuid,
         name: String,
     },
+    EditDescription {
+        id: Uuid,
+        name: String,
+        description: String,
+    },
+    Kick {
+        user_id: u64,
+        username: String,
+        reason: String,
+    },
     Ban {
         user_id: u64,
         username: String,
         reason: String,
+        /// Index into `BAN_DURATIONS`. Defaults to 0 (Permanent).
+        duration_idx: usize,
     },
     DirectMessage {
         user_id: u64,
         username: String,
         text: String,
+    },
+    /// Sudo elevate to superuser. Password-only — server signals
+    /// success by flipping `is_elevated` on the user's `User`.
+    Elevate {
+        password: String,
+    },
+    /// Per-room ACL editor. Edits a working copy of `inherit_acl` and
+    /// the entry list; on submit dispatches `Command::SetRoomAcl`.
+    EditAcls {
+        room_id: Uuid,
+        room_name: String,
+        inherit_acl: bool,
+        entries: Vec<RoomAclEntry>,
+        /// Index → group name for the per-entry group dropdown. Source
+        /// of truth is `state.group_definitions` snapshotted when the
+        /// modal opens; we cache it so the dropdown labels don't shift
+        /// while the user is editing.
+        group_options: Vec<String>,
     },
 }
 
@@ -93,6 +143,35 @@ pub struct Shell {
     /// `App::update` from `settings.chat` each frame, so toggling the
     /// preference reflects without restarting.
     pub chat_timestamp_format: Option<rumble_desktop_shell::TimestampFormat>,
+    /// Modern paradigm tree filter. Empty means show the full tree.
+    pub tree_filter: String,
+    /// Set when the user clicks the composer's "share file" button.
+    /// `App::update` consumes the flag at the end of the frame and
+    /// spawns the OS file picker on its tokio runtime — the composer
+    /// itself doesn't have access to a runtime handle.
+    pub share_file_requested: bool,
+}
+
+impl Shell {
+    /// Open the "create room" modal for the given parent (None = root).
+    /// Used by paradigm toolbars / sidebars whose "Add channel" button
+    /// doesn't have a specific parent in mind. Replaces any modal that
+    /// was already open.
+    pub fn open_create_room(&mut self, parent: Option<Uuid>, parent_name: impl Into<String>) {
+        self.modal = Some(PendingModal::CreateRoom {
+            parent,
+            parent_name: parent_name.into(),
+            name: String::new(),
+        });
+    }
+
+    /// Open the sudo elevate modal. Triggered from the Settings panel's
+    /// Connection page when the connected user isn't already elevated.
+    pub fn open_elevate_modal(&mut self) {
+        self.modal = Some(PendingModal::Elevate {
+            password: String::new(),
+        });
+    }
 }
 
 // ---------- Tree pane ----------
@@ -102,6 +181,9 @@ impl Shell {
     /// when a channel is double-clicked or activated via Enter.
     pub fn tree_pane<P: Platform + 'static>(&mut self, ui: &mut Ui, state: &State, backend: &BackendHandle<P>) {
         let (mut tree, id_map) = adapters::build_tree(state);
+        if !self.tree_filter.trim().is_empty() {
+            filter_tree(&mut tree, self.tree_filter.trim());
+        }
 
         // Apply our local expansion overrides. (Live tree nodes start
         // expanded; the user's preference overrides that.)
@@ -111,7 +193,10 @@ impl Shell {
         let selected = self.selected.or_else(|| state.my_room_id.map(adapters::room_node_id));
 
         ScrollArea::vertical().id_salt("rumble_next_tree").show(ui, |ui| {
-            let resp = Tree::new("rumble_next_tree", &tree).selected(selected).show(ui);
+            let resp = Tree::new("rumble_next_tree", &tree)
+                .selected(selected)
+                .drag_drop(true)
+                .show(ui);
 
             if let Some(id) = resp.toggled {
                 let current = lookup_expanded(&tree, id).unwrap_or(true);
@@ -129,19 +214,24 @@ impl Shell {
             {
                 backend.send(Command::JoinRoom { room_id: *uuid });
             }
+            if let Some(drop) = resp.dropped {
+                handle_room_drop(state, backend, &id_map, drop);
+            }
             if let Some((id, pos)) = resp.context
                 && let Some(node_ref) = id_map.get(&id)
             {
                 let target = match node_ref {
                     NodeRef::User(uid) => {
-                        let name = state
-                            .get_user(*uid)
+                        let user = state.get_user(*uid);
+                        let name = user
                             .map(|u| u.username.clone())
                             .unwrap_or_else(|| format!("user #{uid}"));
+                        let server_muted = user.map(|u| u.server_muted).unwrap_or(false);
                         ContextTarget::User {
                             id: *uid,
                             name,
                             locally_muted: state.audio.is_user_muted(*uid),
+                            server_muted,
                         }
                     }
                     NodeRef::Room(rid) => {
@@ -157,6 +247,23 @@ impl Shell {
             }
         });
     }
+}
+
+fn filter_tree(nodes: &mut Vec<TreeNode>, needle: &str) {
+    let needle = needle.to_ascii_lowercase();
+    nodes.retain_mut(|node| node_matches_filter(node, &needle));
+}
+
+fn node_matches_filter(node: &mut TreeNode, needle: &str) -> bool {
+    node.children.retain_mut(|child| node_matches_filter(child, needle));
+    if !node.children.is_empty() {
+        node.expanded = true;
+        return true;
+    }
+    let name = match &node.kind {
+        TreeNodeKind::Channel { name } | TreeNodeKind::User { name, .. } => name,
+    };
+    name.to_ascii_lowercase().contains(needle)
 }
 
 fn apply_expanded(nodes: &mut [TreeNode], overrides: &HashMap<TreeNodeId, bool>) {
@@ -186,38 +293,47 @@ pub fn room_header(ui: &mut Ui, state: &State) {
     let theme = ui.theme();
     let tokens = theme.tokens().clone();
 
-    let (crumbs, peers) = match state.my_room_id {
-        Some(id) => (crumbs_for_room(state, id), adapters::peers_in_current_room(state)),
-        None => (vec!["— not in a room —".to_string()], 0),
+    let (crumbs, peers, description) = match state.my_room_id {
+        Some(id) => (
+            crumbs_for_room(state, id),
+            adapters::peers_in_current_room(state),
+            state.room_tree.get(id).and_then(|room| room.description.clone()),
+        ),
+        None => (vec!["— not in a room —".to_string()], 0, None),
     };
 
     SurfaceFrame::new(SurfaceKind::Toolbar)
         .inner_margin(Margin::symmetric(14, 8))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.vertical(|ui| {
                 let muted = tokens.text_muted;
                 let faint = tokens.line_soft;
                 let mono = tokens.font_mono.clone();
 
-                let (last, head) = crumbs
-                    .split_last()
-                    .map(|(l, h)| (l.as_str(), h))
-                    .unwrap_or(("(no room)", &[]));
-                for c in head {
-                    ui.label(RichText::new(c).color(muted).font(mono.clone()));
-                    ui.label(RichText::new("/").color(faint).font(mono.clone()));
-                }
-                ui.label(
-                    RichText::new(last)
-                        .color(tokens.text)
-                        .strong()
-                        .font(tokens.font_body.clone()),
-                );
+                ui.horizontal(|ui| {
+                    let (last, head) = crumbs
+                        .split_last()
+                        .map(|(l, h)| (l.as_str(), h))
+                        .unwrap_or(("(no room)", &[]));
+                    for c in head {
+                        ui.label(RichText::new(c).color(muted).font(mono.clone()));
+                        ui.label(RichText::new("/").color(faint).font(mono.clone()));
+                    }
+                    ui.label(
+                        RichText::new(last)
+                            .color(tokens.text)
+                            .strong()
+                            .font(tokens.font_body.clone()),
+                    );
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let summary = format!("● {peers} connected · text: ephemeral (last 50)");
-                    ui.label(RichText::new(summary).color(muted).font(mono));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let summary = format!("● {peers} connected · text: ephemeral (last 50)");
+                        ui.label(RichText::new(summary).color(muted).font(mono.clone()));
+                    });
                 });
+                if let Some(description) = description.filter(|d| !d.trim().is_empty()) {
+                    ui.label(RichText::new(description).color(muted).font(tokens.font_label.clone()));
+                }
             });
         });
 }
@@ -399,29 +515,65 @@ fn draw_media(ui: &mut Ui, tokens: &rumble_widgets::Tokens, media: &Media) {
 
 impl Shell {
     pub fn composer<P: Platform + 'static>(&mut self, ui: &mut Ui, state: &State, backend: &BackendHandle<P>) {
-        let disabled = state.my_room_id.is_none();
+        let no_room = state.my_room_id.is_none();
+        let no_text_permission = state
+            .my_room_id
+            .map(|room| {
+                state
+                    .per_room_permissions
+                    .get(&room)
+                    .copied()
+                    .unwrap_or(state.effective_permissions)
+            })
+            .map(|bits| !Permissions::from_bits_truncate(bits).contains(Permissions::TEXT_MESSAGE))
+            .unwrap_or(false);
+        let disabled = no_room || no_text_permission;
         let placeholder = if disabled {
-            "connect and join a room to chat"
+            if no_text_permission {
+                "(no permission to send messages here)"
+            } else {
+                "connect and join a room to chat"
+            }
         } else {
             "type a message — try /msg <user> hi or /tree announcement"
         };
+
+        let can_share_file = state
+            .my_room_id
+            .map(|room| {
+                state
+                    .per_room_permissions
+                    .get(&room)
+                    .copied()
+                    .unwrap_or(state.effective_permissions)
+            })
+            .map(|bits| Permissions::from_bits_truncate(bits).contains(Permissions::SHARE_FILE))
+            .unwrap_or(false);
 
         SurfaceFrame::new(SurfaceKind::Panel)
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let _ = ButtonArgs::new("+ attach")
-                        .role(PressableRole::Ghost)
-                        .disabled(disabled)
-                        .show(ui);
-
                     if ButtonArgs::new("⟳ sync")
                         .role(PressableRole::Ghost)
-                        .disabled(disabled)
+                        .disabled(no_room)
                         .show(ui)
                         .clicked()
                     {
                         backend.send(Command::RequestChatHistory);
+                    }
+                    if ButtonArgs::new("📎 file")
+                        .role(PressableRole::Ghost)
+                        .disabled(no_room || !can_share_file)
+                        .show(ui)
+                        .on_hover_text(if can_share_file {
+                            "Share a file with this room"
+                        } else {
+                            "You don't have permission to share files here"
+                        })
+                        .clicked()
+                    {
+                        self.share_file_requested = true;
                     }
 
                     let avail = ui.available_width() - 96.0;
@@ -453,6 +605,14 @@ impl Shell {
                         dispatch_composer(state, backend, text);
                     }
                 });
+                if no_text_permission {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("(no permission to send messages here)")
+                            .color(ui.theme().tokens().text_muted)
+                            .font(ui.theme().font(rumble_widgets::TextRole::Label)),
+                    );
+                }
             });
     }
 }
@@ -613,7 +773,7 @@ impl Shell {
         // The context menu reads `state` to surface the live per-user
         // volume override; the modal needs `state` for username lookups.
         self.render_context_menu(ctx, state, backend);
-        self.render_pending_modal(ctx, state, backend);
+        self.render_pending_modal(ctx, backend);
     }
 
     fn render_context_menu<P: Platform + 'static>(
@@ -637,11 +797,13 @@ impl Shell {
                     .inner_margin(Margin::same(6))
                     .show(ui, |ui| {
                         ui.set_min_width(180.0);
+                        let perms = effective_perms_in_current_room(state);
                         match &menu.target {
                             ContextTarget::User {
                                 id,
                                 name,
                                 locally_muted,
+                                server_muted,
                             } => {
                                 header(ui, name);
                                 if ctx_btn(
@@ -658,6 +820,20 @@ impl Shell {
                                         Command::MuteUser { user_id: *id }
                                     });
                                     close = true;
+                                }
+                                if perms.contains(Permissions::MUTE_DEAFEN) {
+                                    let label = if *server_muted {
+                                        "Remove server mute"
+                                    } else {
+                                        "Server mute"
+                                    };
+                                    if ctx_btn(ui, label) {
+                                        backend.send(Command::SetServerMute {
+                                            target_user_id: *id,
+                                            muted: !*server_muted,
+                                        });
+                                        close = true;
+                                    }
                                 }
                                 // Per-user volume slider. The current
                                 // override (if any) lives in
@@ -690,19 +866,25 @@ impl Shell {
                                     });
                                     close = true;
                                 }
-                                ui.separator();
-                                if ctx_danger(ui, "Kick") {
-                                    backend.send(Command::KickUser {
-                                        target_user_id: *id,
+                                let can_kick = perms.contains(Permissions::KICK);
+                                let can_ban = perms.contains(Permissions::BAN);
+                                if can_kick || can_ban {
+                                    ui.separator();
+                                }
+                                if can_kick && ctx_danger(ui, "Kick…") {
+                                    next_modal = Some(PendingModal::Kick {
+                                        user_id: *id,
+                                        username: name.clone(),
                                         reason: String::new(),
                                     });
                                     close = true;
                                 }
-                                if ctx_danger(ui, "Ban…") {
+                                if can_ban && ctx_danger(ui, "Ban…") {
                                     next_modal = Some(PendingModal::Ban {
                                         user_id: *id,
                                         username: name.clone(),
                                         reason: String::new(),
+                                        duration_idx: 0,
                                     });
                                     close = true;
                                 }
@@ -726,6 +908,34 @@ impl Shell {
                                         id: *id,
                                         original: name.clone(),
                                         name: name.clone(),
+                                    });
+                                    close = true;
+                                }
+                                if ctx_btn(ui, "Edit description…") {
+                                    let current = state
+                                        .room_tree
+                                        .get(*id)
+                                        .and_then(|n| n.description.clone())
+                                        .unwrap_or_default();
+                                    next_modal = Some(PendingModal::EditDescription {
+                                        id: *id,
+                                        name: name.clone(),
+                                        description: current,
+                                    });
+                                    close = true;
+                                }
+                                if perms.contains(Permissions::WRITE)
+                                    && let Some(room) = state.get_room(*id)
+                                    && ctx_btn(ui, "Edit ACLs…")
+                                {
+                                    let group_options: Vec<String> =
+                                        state.group_definitions.iter().map(|g| g.name.clone()).collect();
+                                    next_modal = Some(PendingModal::EditAcls {
+                                        room_id: *id,
+                                        room_name: name.clone(),
+                                        inherit_acl: room.inherit_acl,
+                                        entries: room.acls.clone(),
+                                        group_options,
                                     });
                                     close = true;
                                 }
@@ -754,12 +964,7 @@ impl Shell {
         }
     }
 
-    fn render_pending_modal<P: Platform + 'static>(
-        &mut self,
-        ctx: &egui::Context,
-        state: &State,
-        backend: &BackendHandle<P>,
-    ) {
+    fn render_pending_modal<P: Platform + 'static>(&mut self, ctx: &egui::Context, backend: &BackendHandle<P>) {
         let Some(modal) = self.modal.as_mut() else {
             return;
         };
@@ -784,6 +989,14 @@ impl Shell {
                 title = "Delete room";
                 primary_label = "Delete";
             }
+            PendingModal::EditDescription { .. } => {
+                title = "Room description";
+                primary_label = "Save";
+            }
+            PendingModal::Kick { .. } => {
+                title = "Kick user";
+                primary_label = "Kick";
+            }
             PendingModal::Ban { .. } => {
                 title = "Ban user";
                 primary_label = "Ban";
@@ -792,9 +1005,15 @@ impl Shell {
                 title = "Direct message";
                 primary_label = "Send";
             }
+            PendingModal::Elevate { .. } => {
+                title = "Elevate to superuser";
+                primary_label = "Elevate";
+            }
+            PendingModal::EditAcls { .. } => {
+                title = "Edit ACLs";
+                primary_label = "Save";
+            }
         }
-
-        let _ = state; // future use for permission-gated flows
 
         egui::Window::new(title)
             .collapsible(false)
@@ -862,13 +1081,35 @@ impl Shell {
                         }
                     });
                 }
-                PendingModal::Ban {
+                PendingModal::EditDescription { id, name, description } => {
+                    ui.label(RichText::new(format!("Description for {name}")).color(ui.theme().tokens().text_muted));
+                    ui.add_space(6.0);
+                    GroupBox::new("Description")
+                        .inner_margin(Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            TextInput::new(description)
+                                .placeholder("describe the room")
+                                .desired_width(320.0)
+                                .show(ui);
+                        });
+                    ui.add_space(8.0);
+                    let trimmed = description.trim().to_string();
+                    modal_buttons(ui, primary_label, true, &mut close, |go| {
+                        if go {
+                            submit = Some(Command::SetRoomDescription {
+                                room_id: *id,
+                                description: trimmed.clone(),
+                            });
+                        }
+                    });
+                }
+                PendingModal::Kick {
                     user_id,
                     username,
                     reason,
                 } => {
                     ui.label(
-                        RichText::new(format!("Ban {username}"))
+                        RichText::new(format!("Kick {username}"))
                             .strong()
                             .color(ui.theme().tokens().text),
                     );
@@ -884,10 +1125,135 @@ impl Shell {
                     ui.add_space(8.0);
                     modal_buttons(ui, primary_label, true, &mut close, |go| {
                         if go {
+                            submit = Some(Command::KickUser {
+                                target_user_id: *user_id,
+                                reason: reason.trim().to_string(),
+                            });
+                        }
+                    });
+                }
+                PendingModal::Ban {
+                    user_id,
+                    username,
+                    reason,
+                    duration_idx,
+                } => {
+                    ui.label(
+                        RichText::new(format!("Ban {username}"))
+                            .strong()
+                            .color(ui.theme().tokens().text),
+                    );
+                    ui.add_space(6.0);
+                    GroupBox::new("Reason")
+                        .inner_margin(Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            TextInput::new(reason)
+                                .placeholder("optional reason shown to the user")
+                                .desired_width(320.0)
+                                .show(ui);
+                        });
+                    ui.add_space(6.0);
+                    GroupBox::new("Duration")
+                        .inner_margin(Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            let labels: Vec<String> = BAN_DURATIONS.iter().map(|(l, _)| l.to_string()).collect();
+                            ComboBox::new("ban_duration", duration_idx, labels)
+                                .width(200.0)
+                                .show(ui);
+                        });
+                    ui.add_space(8.0);
+                    let idx = (*duration_idx).min(BAN_DURATIONS.len().saturating_sub(1));
+                    let secs = BAN_DURATIONS[idx].1;
+                    let duration_seconds = if secs == 0 { None } else { Some(secs) };
+                    modal_buttons(ui, primary_label, true, &mut close, |go| {
+                        if go {
                             submit = Some(Command::BanUser {
                                 target_user_id: *user_id,
-                                reason: reason.clone(),
-                                duration_seconds: None,
+                                reason: reason.trim().to_string(),
+                                duration_seconds,
+                            });
+                        }
+                    });
+                }
+                PendingModal::Elevate { password } => {
+                    ui.label(
+                        RichText::new("Enter the server's sudo password to gain superuser rights.")
+                            .color(ui.theme().tokens().text_muted),
+                    );
+                    ui.add_space(6.0);
+                    GroupBox::new("Password")
+                        .inner_margin(Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            // Egui's `TextEdit::password(true)` handles
+                            // the masking; the rumble-widgets TextInput
+                            // doesn't expose that flag yet, so use the
+                            // raw widget here.
+                            ui.add(egui::TextEdit::singleline(password).password(true).desired_width(280.0));
+                        });
+                    ui.add_space(8.0);
+                    let can_submit = !password.is_empty();
+                    let pass = password.clone();
+                    modal_buttons(ui, primary_label, can_submit, &mut close, |go| {
+                        if go {
+                            submit = Some(Command::Elevate { password: pass.clone() });
+                        }
+                    });
+                }
+                PendingModal::EditAcls {
+                    room_id,
+                    room_name,
+                    inherit_acl,
+                    entries,
+                    group_options,
+                } => {
+                    ui.label(
+                        RichText::new(format!("ACLs for \"{room_name}\""))
+                            .strong()
+                            .color(ui.theme().tokens().text),
+                    );
+                    ui.add_space(6.0);
+                    ui.checkbox(inherit_acl, "Inherit from parent");
+                    ui.add_space(6.0);
+
+                    let mut to_remove: Option<usize> = None;
+                    ScrollArea::vertical()
+                        .id_salt("rumble_next_acl_entries")
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for (i, entry) in entries.iter_mut().enumerate() {
+                                acl_entry_row(ui, i, entry, group_options, &mut to_remove);
+                            }
+                        });
+                    if let Some(idx) = to_remove {
+                        entries.remove(idx);
+                    }
+
+                    ui.add_space(4.0);
+                    if ButtonArgs::new("+ Add entry")
+                        .role(PressableRole::Default)
+                        .show(ui)
+                        .clicked()
+                    {
+                        let default_group = group_options.first().cloned().unwrap_or_else(|| "default".to_string());
+                        entries.push(RoomAclEntry {
+                            group: default_group,
+                            grant: 0,
+                            deny: 0,
+                            apply_here: true,
+                            apply_subs: true,
+                        });
+                    }
+
+                    ui.add_space(8.0);
+                    let room_id_for_submit = *room_id;
+                    let inherit = *inherit_acl;
+                    let entries_for_submit = entries.clone();
+                    modal_buttons(ui, primary_label, true, &mut close, |go| {
+                        if go {
+                            submit = Some(Command::SetRoomAcl {
+                                room_id: room_id_for_submit,
+                                inherit_acl: inherit,
+                                entries: entries_for_submit.clone(),
                             });
                         }
                     });
@@ -961,6 +1327,150 @@ fn ctx_danger(ui: &mut Ui, label: &str) -> bool {
         .min_width(160.0)
         .show(ui)
         .clicked()
+}
+
+/// Effective permissions for the current user in their current room.
+/// Falls back to the connection-wide `effective_permissions` when the
+/// user isn't in a room. Used to gate context-menu items so we don't
+/// offer actions the server will refuse.
+fn effective_perms_in_current_room(state: &State) -> Permissions {
+    let bits = state
+        .my_room_id
+        .and_then(|room| state.per_room_permissions.get(&room).copied())
+        .unwrap_or(state.effective_permissions);
+    Permissions::from_bits_truncate(bits)
+}
+
+/// Handle a drag-drop on the room tree. Only room→room drops do
+/// anything: dropping a user is a no-op, dropping a room onto another
+/// room reparents (Into → child of target; Above/Below → sibling of
+/// target). Server validates that the source is movable; we just emit
+/// the command.
+fn handle_room_drop<P: Platform + 'static>(
+    state: &State,
+    backend: &BackendHandle<P>,
+    id_map: &HashMap<TreeNodeId, NodeRef>,
+    drop: rumble_widgets::DropEvent,
+) {
+    let Some(NodeRef::Room(source)) = id_map.get(&drop.source).copied() else {
+        return;
+    };
+    let Some(NodeRef::Room(target)) = id_map.get(&drop.target).copied() else {
+        return;
+    };
+    if source == target {
+        return;
+    }
+    // The `MoveRoom` command takes a concrete `new_parent_id: Uuid` —
+    // there's no representation for "no parent" / root. So Into → child
+    // of target; Above/Below → sibling of target only when target has a
+    // parent. Dropping next to a root room is a no-op for now.
+    let new_parent = match drop.position {
+        rumble_widgets::DropPosition::Into => Some(target),
+        rumble_widgets::DropPosition::Above | rumble_widgets::DropPosition::Below => {
+            state.room_tree.get(target).and_then(|n| n.parent_id)
+        }
+    };
+    let Some(new_parent_id) = new_parent else {
+        return;
+    };
+    if new_parent_id == source {
+        return;
+    }
+    backend.send(Command::MoveRoom {
+        room_id: source,
+        new_parent_id,
+    });
+}
+
+/// One row in the per-room ACL editor: group dropdown, here/subs
+/// toggles, remove button, then a grant + deny matrix below.
+fn acl_entry_row(
+    ui: &mut Ui,
+    idx: usize,
+    entry: &mut RoomAclEntry,
+    group_options: &[String],
+    to_remove: &mut Option<usize>,
+) {
+    GroupBox::new(format!("Entry {}", idx + 1))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Group")
+                        .color(ui.theme().tokens().text_muted)
+                        .font(ui.theme().font(rumble_widgets::TextRole::Label)),
+                );
+                if !group_options.is_empty() {
+                    let mut sel = group_options.iter().position(|g| g == &entry.group).unwrap_or(0);
+                    let labels: Vec<String> = group_options.to_vec();
+                    let before = sel;
+                    ComboBox::new(format!("acl_entry_group_{idx}"), &mut sel, labels)
+                        .width(160.0)
+                        .show(ui);
+                    if sel != before
+                        && let Some(name) = group_options.get(sel)
+                    {
+                        entry.group = name.clone();
+                    }
+                } else {
+                    ui.label(entry.group.clone());
+                }
+                ui.checkbox(&mut entry.apply_here, "Here");
+                ui.checkbox(&mut entry.apply_subs, "Subs");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ButtonArgs::new("✖").role(PressableRole::Ghost).show(ui).clicked() {
+                        *to_remove = Some(idx);
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Grant")
+                    .color(ui.theme().tokens().text_muted)
+                    .font(ui.theme().font(rumble_widgets::TextRole::Label)),
+            );
+            permission_checkboxes_compact(ui, &mut entry.grant, idx, "grant");
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Deny")
+                    .color(ui.theme().tokens().text_muted)
+                    .font(ui.theme().font(rumble_widgets::TextRole::Label)),
+            );
+            permission_checkboxes_compact(ui, &mut entry.deny, idx, "deny");
+        });
+}
+
+/// Inline grid of room-scoped permission checkboxes for an ACL entry's
+/// grant or deny mask. Mirrors `rumble-egui::render_permission_checkboxes_compact`
+/// — same flag set, same labels, same wrap behaviour.
+pub(crate) fn permission_checkboxes_compact(ui: &mut Ui, bits: &mut u32, idx: usize, role: &str) {
+    let perms: &[(Permissions, &str, &str)] = &[
+        (Permissions::TRAVERSE, "Traverse", "See this room in the tree"),
+        (Permissions::ENTER, "Enter", "Join this room"),
+        (Permissions::SPEAK, "Speak", "Transmit voice"),
+        (Permissions::TEXT_MESSAGE, "Text", "Send chat"),
+        (Permissions::SHARE_FILE, "Files", "Share files"),
+        (Permissions::MUTE_DEAFEN, "Mute", "Server-mute others"),
+        (Permissions::MOVE_USER, "Move", "Move users"),
+        (Permissions::MAKE_ROOM, "Mk Rm", "Create sub-rooms"),
+        (Permissions::MODIFY_ROOM, "Mod Rm", "Modify rooms"),
+        (Permissions::WRITE, "Edit ACL", "Edit ACL entries"),
+    ];
+    ui.horizontal_wrapped(|ui| {
+        for (perm, label, hover) in perms {
+            let mut on = Permissions::from_bits_truncate(*bits).contains(*perm);
+            let _ = ui.push_id((idx, role, label), |ui| {
+                if ui.checkbox(&mut on, *label).on_hover_text(*hover).changed() {
+                    if on {
+                        *bits |= perm.bits();
+                    } else {
+                        *bits &= !perm.bits();
+                    }
+                }
+            });
+        }
+    });
 }
 
 fn modal_buttons(ui: &mut Ui, primary: &str, can_submit: bool, close: &mut bool, mut on_action: impl FnMut(bool)) {

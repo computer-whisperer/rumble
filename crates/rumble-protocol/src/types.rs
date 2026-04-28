@@ -562,11 +562,23 @@ pub type TransmissionMode = VoiceMode;
 /// Information about an audio device.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct AudioDeviceInfo {
-    /// Stable identifier for the device (used for selection).
-    /// This is the device name, which should be stable across sessions.
+    /// Stable, host-unique identifier (used for selection + persistence).
+    ///
+    /// On ALSA this is the cpal `pcm_id` (e.g. `pipewire`, `pulse`,
+    /// `front:CARD=Generic_1,DEV=0`). On other hosts it's whatever
+    /// `Device::id()` returns. The same physical card can appear under
+    /// multiple ALSA endpoints, so two entries can share `name` but
+    /// always have distinct `id`s.
     pub id: String,
-    /// Device name for display (same as id for now, but could differ).
+    /// Human-readable name (e.g. `"AT2020USB+, USB Audio"`).
+    /// Comes from `Device::description().name()`. Not unique on its own.
     pub name: String,
+    /// Routing / driver tag the user can use to disambiguate same-named
+    /// entries — typically the ALSA pcm pipeline (`pipewire`, `pulse`,
+    /// `front:CARD=...`, `dsnoop:CARD=...`) or the host driver name
+    /// on other platforms. `None` if the host doesn't expose one.
+    #[serde(default)]
+    pub pipeline: Option<String>,
     /// Whether this is the default device.
     pub is_default: bool,
 }

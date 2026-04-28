@@ -12,10 +12,7 @@
 //! AcceptCertificate we persist the cert into `accepted_certificates`
 //! so subsequent connects skip the prompt entirely.
 
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Align, Layout, Margin, RichText, Ui};
 use rumble_client::handle::BackendHandle;
@@ -111,7 +108,7 @@ pub fn render<P: Platform + 'static>(
     state: &State,
     form: &mut ConnectForm,
     settings: &mut SettingsStore,
-    identity: &Arc<Identity>,
+    identity: &Identity,
     backend: &BackendHandle<P>,
 ) {
     form.init_if_needed(settings);
@@ -132,7 +129,7 @@ fn connect_card<P: Platform + 'static>(
     state: &State,
     form: &mut ConnectForm,
     settings: &mut SettingsStore,
-    identity: &Arc<Identity>,
+    identity: &Identity,
     backend: &BackendHandle<P>,
 ) {
     SurfaceFrame::new(SurfaceKind::Panel)
@@ -166,8 +163,15 @@ fn connect_card<P: Platform + 'static>(
             }
 
             ui.add_space(10.0);
+            let public_key = identity
+                .public_key()
+                .map(|key| {
+                    let hex = hex::encode(key);
+                    format!("Public key: {}…", &hex[..16])
+                })
+                .unwrap_or_else(|| "Public key: not set up".to_string());
             ui.label(
-                RichText::new(format!("Public key: {}…", &hex::encode(identity.public_key())[..16]))
+                RichText::new(public_key)
                     .color(ui.theme().tokens().text_muted)
                     .font(ui.theme().font(TextRole::Mono)),
             );
@@ -264,7 +268,7 @@ fn server_form<P: Platform + 'static>(
     state: &State,
     form: &mut ConnectForm,
     settings: &mut SettingsStore,
-    identity: &Arc<Identity>,
+    identity: &Identity,
     backend: &BackendHandle<P>,
     saved_idx: Option<usize>,
 ) {
@@ -346,12 +350,20 @@ fn server_form<P: Platform + 'static>(
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let connect_label = if connecting { "Connecting…" } else { "Connect" };
-                    let valid = form_valid(&form.editing);
+                    let identity_ready = identity.public_key().is_some() && !identity.needs_unlock();
+                    let valid = form_valid(&form.editing) && identity_ready;
                     if ButtonArgs::new(connect_label)
                         .role(PressableRole::Primary)
                         .disabled(connecting || !valid)
                         .min_width(120.0)
                         .show(ui)
+                        .on_disabled_hover_text(if identity.public_key().is_none() {
+                            "Set up an identity key before connecting"
+                        } else if identity.needs_unlock() {
+                            "Unlock your encrypted identity before connecting"
+                        } else {
+                            "Enter a server and username"
+                        })
                         .clicked()
                     {
                         commit_and_connect(form, settings, identity, backend);
@@ -436,7 +448,7 @@ fn persist_accepted_cert(settings: &mut SettingsStore, cert_info: &rumble_protoc
 fn commit_and_connect<P: Platform + 'static>(
     form: &mut ConnectForm,
     settings: &mut SettingsStore,
-    identity: &Arc<Identity>,
+    identity: &Identity,
     backend: &BackendHandle<P>,
 ) {
     let now = SystemTime::now()
@@ -482,10 +494,13 @@ fn commit_and_connect<P: Platform + 'static>(
     }
 
     let password = (!draft.password.is_empty()).then_some(draft.password);
+    let Some(public_key) = identity.public_key() else {
+        return;
+    };
     backend.send(Command::Connect {
         addr,
         name: username,
-        public_key: identity.public_key(),
+        public_key,
         signer: identity.signer(),
         password,
     });

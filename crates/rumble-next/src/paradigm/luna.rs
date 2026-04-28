@@ -13,7 +13,6 @@ use crate::{
 };
 
 pub fn render<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
-    menubar(ui);
     toolbar(ui, shell, state, backend);
 
     let rect = ui.available_rect_before_wrap();
@@ -54,33 +53,11 @@ pub fn render<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &Sta
     ui.advance_cursor_after_rect(rect);
 }
 
-fn menubar(ui: &mut Ui) {
-    SurfaceFrame::new(SurfaceKind::Toolbar)
-        .inner_margin(Margin::symmetric(4, 2))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for item in ["File", "Edit", "Server", "View", "Audio", "Configure", "Help"] {
-                    let _ = ButtonArgs::new(item).role(PressableRole::Ghost).show(ui);
-                }
-            });
-        });
-}
-
 fn toolbar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
     SurfaceFrame::new(SurfaceKind::Toolbar)
         .inner_margin(Margin::symmetric(6, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Luna gets Disconnect in the toolbar since we're already
-                // connected by the time this paradigm renders. (Connect
-                // still lives in the pre-connect view.)
-                if ButtonArgs::new("↺ Reconnect")
-                    .role(PressableRole::Default)
-                    .show(ui)
-                    .clicked()
-                {
-                    backend.send(Command::Disconnect);
-                }
                 if ButtonArgs::new("Disconnect")
                     .role(PressableRole::Default)
                     .show(ui)
@@ -93,11 +70,16 @@ fn toolbar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
                 shell.voice_row(ui, state, backend);
                 sep(ui);
 
-                let _ = ButtonArgs::new("+ Channel").role(PressableRole::Default).show(ui);
-                let _ = ButtonArgs::new("Comment").role(PressableRole::Default).show(ui);
+                if ButtonArgs::new("+ Channel")
+                    .role(PressableRole::Default)
+                    .show(ui)
+                    .clicked()
+                {
+                    let (parent, parent_name) = current_room_parent(state);
+                    shell.open_create_room(parent, parent_name);
+                }
                 sep(ui);
 
-                let _ = ButtonArgs::new("Audio Wizard").role(PressableRole::Default).show(ui);
                 if ButtonArgs::new("⚙ Settings")
                     .role(PressableRole::Default)
                     .active(shell.settings_open)
@@ -148,7 +130,7 @@ fn side_header(ui: &mut Ui) {
 fn center_column<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
     let rect = ui.available_rect_before_wrap();
     let composer_h = 56.0;
-    let header_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 44.0));
+    let header_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 64.0));
     let chat_rect = egui::Rect::from_min_max(
         egui::pos2(rect.min.x, header_rect.max.y),
         egui::pos2(rect.max.x, rect.max.y - composer_h),
@@ -168,6 +150,19 @@ fn center_column<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &
         shell.composer(&mut kui, state, backend);
     }
     ui.advance_cursor_after_rect(rect);
+}
+
+/// Pick the parent for a "create room" action launched from a generic
+/// toolbar button: the user's current room if they're in one, else the
+/// root. The display name is used purely for the modal header.
+fn current_room_parent(state: &State) -> (Option<uuid::Uuid>, String) {
+    match state
+        .my_room_id
+        .and_then(|id| state.room_tree.get(id).map(|n| (id, n.name.clone())))
+    {
+        Some((id, name)) => (Some(id), name),
+        None => (None, "(root)".to_string()),
+    }
 }
 
 fn statusbar(ui: &mut Ui, state: &State) {

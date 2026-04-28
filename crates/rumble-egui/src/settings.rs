@@ -345,11 +345,6 @@ impl PersistentSettings {
         }
     }
 
-    /// Get the settings file path.
-    fn settings_path(&self) -> Option<PathBuf> {
-        self.config_dir().map(|dir| dir.join("settings.json"))
-    }
-
     /// Load settings from disk, or return defaults if not found.
     ///
     /// If `config_dir_override` is provided, settings are loaded from that

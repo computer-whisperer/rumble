@@ -2,17 +2,19 @@
 //! paradigm choice, and connect form. Installs the right theme and
 //! dispatches to either the connect view or the active paradigm.
 
-use std::sync::Arc;
-
-use eframe::egui::{self, CentralPanel, Context, Layout, RichText, TopBottomPanel};
-use rumble_client::{ConnectConfig, ProcessorRegistry, handle::BackendHandle, register_builtin_processors};
+use eframe::egui::{self, CentralPanel, Context, Layout, Modal, RichText, TopBottomPanel};
+use rumble_client::{
+    AudioSettings, ConnectConfig, ProcessorRegistry, VoiceMode, build_default_tx_pipeline, handle::BackendHandle,
+    merge_with_default_tx_pipeline, register_builtin_processors,
+};
 use rumble_protocol::Command;
 use rumble_widgets::{ButtonArgs, PressableRole, SurfaceFrame, SurfaceKind, UiExt, install_theme};
 
 pub use crate::paradigm::Paradigm;
 use rumble_desktop_shell::{
-    SettingsStore, ToastManager,
+    KeyInfo, SettingsStore, ToastManager,
     hotkeys::{HotkeyEvent, HotkeyManager},
+    identity::key_manager::{PendingAgentOp, SshAgentClient, connect_and_list_keys, generate_and_add_to_agent},
 };
 
 use crate::{
@@ -33,7 +35,7 @@ pub struct App {
     installed: Option<(Paradigm, bool)>,
     pub shell: Shell,
     pub form: ConnectForm,
-    pub identity: Arc<Identity>,
+    pub identity: Identity,
     pub backend: NativeBackend,
     /// Dispatch `Command::Connect` once, on the first frame. Set via
     /// `RUMBLE_NEXT_AUTOCONNECT=1`; lets us smoke-test connected UI
@@ -43,6 +45,21 @@ pub struct App {
     /// Tracks the previous connection state so we can emit a toast only
     /// when the state transitions (not every frame the state is stable).
     prev_connection: Option<ConnectionKind>,
+    /// Last observed `self_muted` so we can play `Mute` / `Unmute` SFX
+    /// on transitions — covers both UI button and global hotkey paths
+    /// without double-firing.
+    prev_self_muted: bool,
+    /// User IDs we last saw in our current room. Diff against the next
+    /// frame's set to detect joins/leaves and play the matching SFX.
+    /// `prev_user_ids_initialized` suppresses sfx on the very first
+    /// observation, so connecting into a populated room doesn't dump
+    /// a flurry of join sounds.
+    prev_user_ids_in_room: std::collections::HashSet<u64>,
+    prev_user_ids_initialized: bool,
+    /// Chat-message count at the previous frame. A bump means new
+    /// messages arrived; we play `Message` once if any of them are
+    /// from a remote user.
+    prev_chat_count: usize,
     /// In-memory state of the settings panel (which category is open).
     pub settings_ui: SettingsState,
     /// Persisted user settings (paradigm, dark mode, recent servers,
@@ -61,6 +78,47 @@ pub struct App {
     /// Built once at startup; the same factories the audio task uses
     /// internally, so what the UI shows matches what actually runs.
     pub processor_registry: ProcessorRegistry,
+    first_run_state: FirstRunState,
+    pending_agent_op: Option<PendingAgentOp>,
+    unlock_state: UnlockState,
+    /// Tokio runtime handle for spawning the async file picker. Cloned
+    /// from `_runtime` at construction time.
+    runtime_handle: tokio::runtime::Handle,
+    /// In-flight file-share dialog. `Some` while the OS picker is open;
+    /// the polling step in `update` consumes the result and dispatches
+    /// `Command::ShareFile`.
+    pending_file_dialog: Option<tokio::task::JoinHandle<Option<std::path::PathBuf>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+enum FirstRunState {
+    #[default]
+    NotNeeded,
+    SelectMethod,
+    GenerateLocal {
+        password: String,
+        password_confirm: String,
+        error: Option<String>,
+    },
+    ConnectingAgent,
+    SelectAgentKey {
+        keys: Vec<KeyInfo>,
+        selected: Option<usize>,
+        error: Option<String>,
+    },
+    GenerateAgentKey {
+        comment: String,
+    },
+    Error {
+        message: String,
+    },
+    Complete,
+}
+
+#[derive(Default)]
+struct UnlockState {
+    password: String,
+    error: Option<String>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -88,7 +146,12 @@ impl ConnectionKind {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> std::io::Result<Self> {
         let config_dir = default_config_dir();
-        let identity = Arc::new(Identity::load_or_create(&config_dir)?);
+        let identity = Identity::load(&config_dir)?;
+        let first_run_state = if identity.needs_setup() {
+            FirstRunState::SelectMethod
+        } else {
+            FirstRunState::NotNeeded
+        };
 
         let settings = SettingsStore::load_from_path(Some(config_dir.join("desktop-shell.json")));
         let paradigm = settings
@@ -132,6 +195,39 @@ impl App {
             config,
         );
 
+        let mut processor_registry = ProcessorRegistry::new();
+        register_builtin_processors(&mut processor_registry);
+
+        // Restore the user's audio choices on the backend before any
+        // UI runs. Mirrors `rumble-egui::App::new`: without this, every
+        // launch reverts to default encoder settings, system-default
+        // input/output devices, PTT mode, and the stock TX pipeline —
+        // even if the user changed them in a prior session.
+        let persistent_audio = &settings.settings().audio;
+        backend.send(Command::UpdateAudioSettings {
+            settings: AudioSettings::from(persistent_audio),
+        });
+        backend.send(Command::SetVoiceMode {
+            mode: VoiceMode::from(settings.settings().voice_mode),
+        });
+        let tx_pipeline_config = match &persistent_audio.tx_pipeline {
+            Some(stored) => merge_with_default_tx_pipeline(stored, &processor_registry),
+            None => build_default_tx_pipeline(&processor_registry),
+        };
+        backend.send(Command::UpdateTxPipeline {
+            config: tx_pipeline_config,
+        });
+        if settings.settings().input_device_id.is_some() {
+            backend.send(Command::SetInputDevice {
+                device_id: settings.settings().input_device_id.clone(),
+            });
+        }
+        if settings.settings().output_device_id.is_some() {
+            backend.send(Command::SetOutputDevice {
+                device_id: settings.settings().output_device_id.clone(),
+            });
+        }
+
         // Two ways to auto-connect at launch:
         //   1. The `RUMBLE_NEXT_AUTOCONNECT` env var still works for
         //      headless smoke runs (`examples/screenshot.rs`).
@@ -155,14 +251,11 @@ impl App {
         let mut hotkeys = HotkeyManager::new();
         let runtime_handle = runtime.handle().clone();
         runtime.block_on(async {
-            hotkeys.init_portal_backend(runtime_handle).await;
+            hotkeys.init_portal_backend(runtime_handle.clone()).await;
         });
         if let Err(e) = hotkeys.register_from_settings(&settings.settings().keyboard) {
             tracing::warn!("hotkey registration failed: {e}");
         }
-
-        let mut processor_registry = ProcessorRegistry::new();
-        register_builtin_processors(&mut processor_registry);
 
         Ok(Self {
             paradigm,
@@ -175,11 +268,20 @@ impl App {
             auto_connect_pending,
             toasts: ToastManager::new(),
             prev_connection: None,
+            prev_self_muted: false,
+            prev_user_ids_in_room: std::collections::HashSet::new(),
+            prev_user_ids_initialized: false,
+            prev_chat_count: 0,
             settings_ui: SettingsState::default(),
             settings,
             hotkeys,
             _runtime: runtime,
             processor_registry,
+            first_run_state,
+            pending_agent_op: None,
+            unlock_state: UnlockState::default(),
+            runtime_handle,
+            pending_file_dialog: None,
         })
     }
 }
@@ -199,6 +301,7 @@ impl eframe::App for App {
 
         self.pump_toasts(&state);
         self.pump_hotkeys(ctx, &state);
+        self.pump_file_dialog();
 
         // Refresh display preferences that the shell needs each frame.
         // Cheap copies; toggling the setting takes effect immediately.
@@ -211,7 +314,11 @@ impl eframe::App for App {
         //      and use its saved username.
         //   2. Otherwise (env-var smoke path), fall back to the form
         //      defaults (currently `[::1]:5000` / $USER).
-        if self.auto_connect_pending && matches!(state.connection, rumble_protocol::ConnectionState::Disconnected) {
+        if self.auto_connect_pending
+            && self.identity.public_key().is_some()
+            && !self.identity.needs_unlock()
+            && matches!(state.connection, rumble_protocol::ConnectionState::Disconnected)
+        {
             let target = self
                 .settings
                 .settings()
@@ -229,10 +336,14 @@ impl eframe::App for App {
             self.backend.send(Command::Connect {
                 addr: target.0,
                 name: target.1,
-                public_key: self.identity.public_key(),
+                public_key: self.identity.public_key().expect("checked above"),
                 signer: self.identity.signer(),
                 password: None,
             });
+            self.auto_connect_pending = false;
+        } else if self.auto_connect_pending && (self.identity.public_key().is_none() || self.identity.needs_unlock()) {
+            // Keep the setting intact, but do not repeatedly try to
+            // connect with an unusable signer while the modal is open.
             self.auto_connect_pending = false;
         }
 
@@ -328,16 +439,19 @@ impl eframe::App for App {
             self.shell.render_overlays(ctx, &state, &self.backend);
         }
 
-        let pub_hex = hex::encode(self.identity.public_key());
+        self.render_first_run_dialog(ctx);
+        self.render_unlock_dialog(ctx);
+
+        let pub_hex = self.identity.public_key().map(hex::encode).unwrap_or_default();
         settings_panel::render(
             ctx,
-            &mut self.shell.settings_open,
             &mut self.settings_ui,
             &mut self.settings,
             &state,
             &self.backend,
             &self.processor_registry,
             &pub_hex,
+            &mut self.shell,
         );
 
         self.toasts.render(ctx);
@@ -345,6 +459,349 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn render_first_run_dialog(&mut self, ctx: &Context) {
+        if matches!(self.first_run_state, FirstRunState::NotNeeded | FirstRunState::Complete) {
+            return;
+        }
+
+        let mut next_state = None;
+        let mut generate_key_password: Option<Option<String>> = None;
+        let mut select_agent_key: Option<KeyInfo> = None;
+        let mut generate_agent_key_comment: Option<String> = None;
+
+        Modal::new(egui::Id::new("rumble_next_first_run_modal")).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            match self.first_run_state.clone() {
+                FirstRunState::SelectMethod => {
+                    ui.heading("Set up your Rumble identity");
+                    ui.add_space(8.0);
+                    ui.label("Rumble uses an Ed25519 key as your server identity.");
+                    ui.label("Choose where this client should keep that key.");
+                    ui.add_space(14.0);
+
+                    ui.group(|ui| {
+                        ui.strong("Generate local key");
+                        ui.label("Store a new key on this computer, optionally password-protected.");
+                        ui.add_space(6.0);
+                        if ui.button("Generate local key").clicked() {
+                            next_state = Some(FirstRunState::GenerateLocal {
+                                password: String::new(),
+                                password_confirm: String::new(),
+                                error: None,
+                            });
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.group(|ui| {
+                        ui.strong("Use SSH agent");
+                        ui.label("Use an Ed25519 key already available from ssh-agent.");
+                        if !SshAgentClient::is_available() {
+                            ui.colored_label(ui.theme().tokens().accent, "SSH_AUTH_SOCK is not set.");
+                        }
+                        ui.add_enabled_ui(SshAgentClient::is_available(), |ui| {
+                            if ui.button("Choose SSH agent key").clicked() {
+                                next_state = Some(FirstRunState::ConnectingAgent);
+                            }
+                        });
+                    });
+                }
+                FirstRunState::GenerateLocal {
+                    password,
+                    password_confirm,
+                    error,
+                } => {
+                    ui.heading("Generate local key");
+                    ui.add_space(8.0);
+                    ui.label("Leave the password blank for plaintext storage.");
+                    ui.add_space(10.0);
+
+                    let mut pw = password.clone();
+                    let mut confirm = password_confirm.clone();
+                    ui.horizontal(|ui| {
+                        ui.label("Password");
+                        ui.add(egui::TextEdit::singleline(&mut pw).password(true));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Confirm");
+                        ui.add(egui::TextEdit::singleline(&mut confirm).password(true));
+                    });
+                    if pw != password || confirm != password_confirm {
+                        next_state = Some(FirstRunState::GenerateLocal {
+                            password: pw.clone(),
+                            password_confirm: confirm.clone(),
+                            error: error.clone(),
+                        });
+                    }
+                    if let Some(error) = error {
+                        ui.colored_label(ui.theme().tokens().danger, error);
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Back").clicked() {
+                            next_state = Some(FirstRunState::SelectMethod);
+                        }
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            let can_generate = pw.is_empty() || pw == confirm;
+                            if ui
+                                .add_enabled(can_generate, egui::Button::new("Generate key"))
+                                .on_disabled_hover_text("Passwords do not match")
+                                .clicked()
+                            {
+                                generate_key_password = Some((!pw.is_empty()).then_some(pw.clone()));
+                            }
+                        });
+                    });
+                }
+                FirstRunState::ConnectingAgent => {
+                    ui.heading("Connecting to SSH agent");
+                    ui.add_space(12.0);
+                    ui.spinner();
+                    ui.label("Fetching Ed25519 keys...");
+                    ui.add_space(12.0);
+                    if ui.button("Cancel").clicked() {
+                        next_state = Some(FirstRunState::SelectMethod);
+                    }
+                }
+                FirstRunState::SelectAgentKey { keys, selected, error } => {
+                    ui.heading("Select SSH agent key");
+                    ui.add_space(8.0);
+                    let mut new_selected = selected;
+                    if keys.is_empty() {
+                        ui.label("No Ed25519 keys were found in the agent.");
+                    } else {
+                        for (i, key) in keys.iter().enumerate() {
+                            let label = format!("{} ({})", key.comment, key.fingerprint);
+                            if ui.selectable_label(new_selected == Some(i), label).clicked() {
+                                new_selected = Some(i);
+                            }
+                        }
+                    }
+                    if new_selected != selected {
+                        next_state = Some(FirstRunState::SelectAgentKey {
+                            keys: keys.clone(),
+                            selected: new_selected,
+                            error: error.clone(),
+                        });
+                    }
+                    if let Some(error) = error {
+                        ui.colored_label(ui.theme().tokens().danger, error);
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Back").clicked() {
+                            next_state = Some(FirstRunState::SelectMethod);
+                        }
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Generate new agent key").clicked() {
+                                next_state = Some(FirstRunState::GenerateAgentKey {
+                                    comment: "rumble-identity".to_string(),
+                                });
+                            }
+                            if ui
+                                .add_enabled(new_selected.is_some(), egui::Button::new("Use selected key"))
+                                .clicked()
+                                && let Some(idx) = new_selected
+                                && let Some(key) = keys.get(idx)
+                            {
+                                select_agent_key = Some(key.clone());
+                            }
+                        });
+                    });
+                }
+                FirstRunState::GenerateAgentKey { comment } => {
+                    ui.heading("Generate SSH agent key");
+                    ui.add_space(8.0);
+                    let mut next_comment = comment.clone();
+                    ui.horizontal(|ui| {
+                        ui.label("Comment");
+                        ui.text_edit_singleline(&mut next_comment);
+                    });
+                    if next_comment != comment {
+                        next_state = Some(FirstRunState::GenerateAgentKey {
+                            comment: next_comment.clone(),
+                        });
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Back").clicked() {
+                            next_state = Some(FirstRunState::ConnectingAgent);
+                        }
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.pending_agent_op.is_some() {
+                                ui.spinner();
+                                ui.label("Generating...");
+                            } else if ui.button("Generate and add").clicked() {
+                                generate_agent_key_comment = Some(next_comment.clone());
+                            }
+                        });
+                    });
+                }
+                FirstRunState::Error { message } => {
+                    ui.heading("Identity setup failed");
+                    ui.colored_label(ui.theme().tokens().danger, message);
+                    ui.add_space(12.0);
+                    if ui.button("Back").clicked() {
+                        next_state = Some(FirstRunState::SelectMethod);
+                    }
+                }
+                FirstRunState::NotNeeded | FirstRunState::Complete => {}
+            }
+        });
+
+        if let Some(new_state) = next_state {
+            if matches!(new_state, FirstRunState::ConnectingAgent) && self.pending_agent_op.is_none() {
+                let handle = self._runtime.handle().spawn(connect_and_list_keys());
+                self.pending_agent_op = Some(PendingAgentOp::Connect(handle));
+            }
+            self.first_run_state = new_state;
+        }
+
+        self.poll_agent_op();
+
+        if let Some(password) = generate_key_password {
+            match self.identity.generate_local_key(password.as_deref()) {
+                Ok(info) => {
+                    self.first_run_state = FirstRunState::Complete;
+                    self.toasts
+                        .success(format!("Identity key generated: {}", info.fingerprint));
+                }
+                Err(e) => {
+                    self.first_run_state = FirstRunState::GenerateLocal {
+                        password: password.clone().unwrap_or_default(),
+                        password_confirm: password.unwrap_or_default(),
+                        error: Some(format!("Failed to generate key: {e}")),
+                    };
+                }
+            }
+        }
+
+        if let Some(key_info) = select_agent_key {
+            match self.identity.select_agent_key(&key_info) {
+                Ok(()) => {
+                    self.first_run_state = FirstRunState::Complete;
+                    self.toasts
+                        .success(format!("Using SSH agent key: {}", key_info.fingerprint));
+                }
+                Err(e) => {
+                    self.first_run_state = FirstRunState::Error {
+                        message: format!("Failed to save key config: {e}"),
+                    };
+                }
+            }
+        }
+
+        if let Some(comment) = generate_agent_key_comment
+            && self.pending_agent_op.is_none()
+        {
+            let handle = self._runtime.handle().spawn(generate_and_add_to_agent(comment));
+            self.pending_agent_op = Some(PendingAgentOp::AddKey(handle));
+        }
+    }
+
+    fn poll_agent_op(&mut self) {
+        let Some(op) = &mut self.pending_agent_op else {
+            return;
+        };
+        match op {
+            PendingAgentOp::Connect(handle) if handle.is_finished() => {
+                if let Some(PendingAgentOp::Connect(handle)) = self.pending_agent_op.take() {
+                    match self._runtime.block_on(handle) {
+                        Ok(Ok(keys)) => {
+                            self.first_run_state = FirstRunState::SelectAgentKey {
+                                keys,
+                                selected: None,
+                                error: None,
+                            };
+                        }
+                        Ok(Err(e)) => {
+                            self.first_run_state = FirstRunState::Error {
+                                message: format!("Failed to connect to SSH agent: {e}"),
+                            };
+                        }
+                        Err(e) => {
+                            self.first_run_state = FirstRunState::Error {
+                                message: format!("Agent operation failed: {e}"),
+                            };
+                        }
+                    }
+                }
+            }
+            PendingAgentOp::AddKey(handle) if handle.is_finished() => {
+                if let Some(PendingAgentOp::AddKey(handle)) = self.pending_agent_op.take() {
+                    match self._runtime.block_on(handle) {
+                        Ok(Ok(key_info)) => match self.identity.select_agent_key(&key_info) {
+                            Ok(()) => {
+                                self.first_run_state = FirstRunState::Complete;
+                                self.toasts
+                                    .success(format!("Added SSH agent key: {}", key_info.fingerprint));
+                            }
+                            Err(e) => {
+                                self.first_run_state = FirstRunState::Error {
+                                    message: format!("Failed to save key config: {e}"),
+                                };
+                            }
+                        },
+                        Ok(Err(e)) => {
+                            self.first_run_state = FirstRunState::Error {
+                                message: format!("Failed to add key to agent: {e}"),
+                            };
+                        }
+                        Err(e) => {
+                            self.first_run_state = FirstRunState::Error {
+                                message: format!("Agent operation failed: {e}"),
+                            };
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_unlock_dialog(&mut self, ctx: &Context) {
+        if !self.identity.needs_unlock() || !matches!(self.first_run_state, FirstRunState::NotNeeded) {
+            return;
+        }
+
+        let mut unlock = false;
+        Modal::new(egui::Id::new("rumble_next_unlock_identity_modal")).show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.heading("Unlock identity");
+            ui.add_space(8.0);
+            ui.label("Enter the password for your encrypted Rumble identity.");
+            ui.add_space(10.0);
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.unlock_state.password).password(true));
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                unlock = true;
+            }
+            if let Some(error) = &self.unlock_state.error {
+                ui.colored_label(ui.theme().tokens().danger, error);
+            }
+            ui.add_space(12.0);
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!self.unlock_state.password.is_empty(), egui::Button::new("Unlock"))
+                    .clicked()
+                {
+                    unlock = true;
+                }
+            });
+        });
+
+        if unlock {
+            match self.identity.unlock(&self.unlock_state.password) {
+                Ok(()) => {
+                    self.unlock_state = UnlockState::default();
+                    self.toasts.success("Identity unlocked");
+                }
+                Err(e) => {
+                    self.unlock_state.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
     /// Translate one-shot state signals into toast notifications:
     /// connection transitions, permission-denied messages, and kick
     /// reasons. `permission_denied` and `kicked` are `take()`-style
@@ -387,6 +844,108 @@ impl App {
         }
         if let Some(reason) = kicked {
             self.toasts.error(format!("You were kicked: {reason}"));
+        }
+
+        self.detect_sfx_events(state);
+    }
+
+    /// Diff the current state snapshot against the previous frame to
+    /// fire one-shot SFX events: self-mute toggle, peer join/leave in
+    /// the active room, and incoming chat messages. Mirrors the same
+    /// flow in `rumble-egui::process_state` — sourcing all triggers
+    /// from state diffs (rather than command sites) means UI buttons,
+    /// hotkeys, and server-driven changes all surface the same sound
+    /// without per-call-site instrumentation.
+    fn detect_sfx_events(&mut self, state: &rumble_protocol::State) {
+        let muted = state.audio.self_muted;
+        if muted != self.prev_self_muted {
+            self.play_sfx(if muted {
+                rumble_client::SfxKind::Mute
+            } else {
+                rumble_client::SfxKind::Unmute
+            });
+            self.prev_self_muted = muted;
+        }
+
+        if state.connection.is_connected()
+            && let Some(my_room_id) = state.my_room_id
+        {
+            let current: std::collections::HashSet<u64> = state
+                .users_in_room(my_room_id)
+                .iter()
+                .filter_map(|u| u.user_id.as_ref().map(|id| id.value))
+                .filter(|id| state.my_user_id != Some(*id))
+                .collect();
+
+            if self.prev_user_ids_initialized {
+                if current.iter().any(|id| !self.prev_user_ids_in_room.contains(id)) {
+                    self.play_sfx(rumble_client::SfxKind::UserJoin);
+                }
+                if self.prev_user_ids_in_room.iter().any(|id| !current.contains(id)) {
+                    self.play_sfx(rumble_client::SfxKind::UserLeave);
+                }
+            }
+            self.prev_user_ids_in_room = current;
+            self.prev_user_ids_initialized = true;
+        } else {
+            self.prev_user_ids_in_room.clear();
+            self.prev_user_ids_initialized = false;
+        }
+
+        let count = state.chat_messages.len();
+        if count > self.prev_chat_count
+            && self.prev_chat_count > 0
+            && state.chat_messages[self.prev_chat_count..].iter().any(|m| !m.is_local)
+        {
+            self.play_sfx(rumble_client::SfxKind::Message);
+        }
+        self.prev_chat_count = count;
+    }
+
+    /// Bridge the composer's "share file" button to the OS file picker.
+    /// Two phases:
+    ///
+    ///   1. If the shell raised `share_file_requested` and no dialog is
+    ///      already in flight, spawn `rfd::AsyncFileDialog` on our
+    ///      tokio runtime and stash the JoinHandle.
+    ///   2. If a dialog is in flight and finished, drain the result and
+    ///      dispatch `Command::ShareFile { path }` (or drop on cancel).
+    ///
+    /// The picker runs off the main thread because some platforms
+    /// (notably KDE / portal-based dialogs) can take a noticeable
+    /// fraction of a second to open, and blocking the audio render loop
+    /// while it does is unacceptable.
+    fn pump_file_dialog(&mut self) {
+        if self.shell.share_file_requested {
+            self.shell.share_file_requested = false;
+            if self.pending_file_dialog.is_none() {
+                let handle = self.runtime_handle.spawn(async {
+                    rfd::AsyncFileDialog::new()
+                        .pick_file()
+                        .await
+                        .map(|f| f.path().to_path_buf())
+                });
+                self.pending_file_dialog = Some(handle);
+            }
+        }
+
+        if let Some(handle) = &self.pending_file_dialog
+            && handle.is_finished()
+            && let Some(handle) = self.pending_file_dialog.take()
+        {
+            match self.runtime_handle.block_on(handle) {
+                Ok(Some(path)) => {
+                    self.backend.send(Command::ShareFile { path });
+                    self.toasts.success("File queued for sharing");
+                }
+                Ok(None) => {
+                    // User dismissed the picker — no action required.
+                }
+                Err(e) => {
+                    tracing::error!("file dialog task panicked: {e}");
+                    self.toasts.error("File picker failed — see logs");
+                }
+            }
         }
     }
 
@@ -442,13 +1001,12 @@ impl App {
             }
             HotkeyEvent::ToggleMute => {
                 tracing::debug!("hotkey: toggle mute");
-                let new_muted = !state.audio.self_muted;
-                self.backend.send(Command::SetMuted { muted: new_muted });
-                self.play_sfx(if new_muted {
-                    rumble_client::SfxKind::Mute
-                } else {
-                    rumble_client::SfxKind::Unmute
+                self.backend.send(Command::SetMuted {
+                    muted: !state.audio.self_muted,
                 });
+                // SFX fires from `detect_sfx_events` once the state
+                // round-trips through the backend — same path as the
+                // UI mute button.
             }
             HotkeyEvent::ToggleDeafen => {
                 tracing::debug!("hotkey: toggle deafen");
@@ -464,7 +1022,7 @@ impl App {
     /// per-event default (1.0 here — calls don't currently customise).
     fn play_sfx(&self, kind: rumble_client::SfxKind) {
         let sfx = &self.settings.settings().sfx;
-        if !sfx.enabled || sfx.volume <= 0.0 {
+        if !sfx.is_kind_enabled(kind) || sfx.volume <= 0.0 {
             return;
         }
         self.backend.send(Command::PlaySfx {

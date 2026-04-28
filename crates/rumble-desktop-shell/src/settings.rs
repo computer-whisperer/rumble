@@ -21,12 +21,13 @@
 //! rumble-egui adopts this store (see bringup doc).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
 use directories::ProjectDirs;
+use rumble_client::{AudioSettings, PipelineConfig, SfxKind, VoiceMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -76,6 +77,10 @@ impl TimestampFormat {
 pub struct SfxSettings {
     pub enabled: bool,
     pub volume: f32,
+    /// Per-event opt-out: kinds in this set are suppressed even when
+    /// `enabled` is true. Lets users keep e.g. mute clicks while
+    /// silencing noisy join/leave chimes.
+    pub disabled_sounds: HashSet<SfxKind>,
 }
 
 impl Default for SfxSettings {
@@ -83,6 +88,96 @@ impl Default for SfxSettings {
         Self {
             enabled: true,
             volume: 0.6,
+            disabled_sounds: HashSet::new(),
+        }
+    }
+}
+
+impl SfxSettings {
+    pub fn is_kind_enabled(&self, kind: SfxKind) -> bool {
+        self.enabled && !self.disabled_sounds.contains(&kind)
+    }
+}
+
+/// Persistent voice activation mode. Mirrors `rumble_client::VoiceMode`
+/// but lives here so we don't leak a serde-Deserialize requirement onto
+/// the wire type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PersistentVoiceMode {
+    #[default]
+    PushToTalk,
+    Continuous,
+}
+
+impl From<&VoiceMode> for PersistentVoiceMode {
+    fn from(m: &VoiceMode) -> Self {
+        match m {
+            VoiceMode::PushToTalk => Self::PushToTalk,
+            VoiceMode::Continuous => Self::Continuous,
+        }
+    }
+}
+
+impl From<PersistentVoiceMode> for VoiceMode {
+    fn from(m: PersistentVoiceMode) -> Self {
+        match m {
+            PersistentVoiceMode::PushToTalk => VoiceMode::PushToTalk,
+            PersistentVoiceMode::Continuous => VoiceMode::Continuous,
+        }
+    }
+}
+
+/// Persistent encoder + pipeline configuration. Field set mirrors
+/// `rumble_client::AudioSettings` so settings written by `rumble-egui`
+/// load cleanly here and vice versa. The TX pipeline is stored as a
+/// nested option — `None` means "use the default pipeline at startup".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistentAudioSettings {
+    pub bitrate: i32,
+    pub encoder_complexity: i32,
+    pub jitter_buffer_delay_packets: u32,
+    pub fec_enabled: bool,
+    pub packet_loss_percent: i32,
+    /// TX pipeline configuration (processors and their settings).
+    pub tx_pipeline: Option<PipelineConfig>,
+}
+
+impl Default for PersistentAudioSettings {
+    fn default() -> Self {
+        let defaults = AudioSettings::default();
+        Self {
+            bitrate: defaults.bitrate,
+            encoder_complexity: defaults.encoder_complexity,
+            jitter_buffer_delay_packets: defaults.jitter_buffer_delay_packets,
+            fec_enabled: defaults.fec_enabled,
+            packet_loss_percent: defaults.packet_loss_percent,
+            tx_pipeline: None,
+        }
+    }
+}
+
+impl From<&AudioSettings> for PersistentAudioSettings {
+    fn from(s: &AudioSettings) -> Self {
+        Self {
+            bitrate: s.bitrate,
+            encoder_complexity: s.encoder_complexity,
+            jitter_buffer_delay_packets: s.jitter_buffer_delay_packets,
+            fec_enabled: s.fec_enabled,
+            packet_loss_percent: s.packet_loss_percent,
+            tx_pipeline: None,
+        }
+    }
+}
+
+impl From<&PersistentAudioSettings> for AudioSettings {
+    fn from(s: &PersistentAudioSettings) -> Self {
+        Self {
+            bitrate: s.bitrate,
+            encoder_complexity: s.encoder_complexity,
+            jitter_buffer_delay_packets: s.jitter_buffer_delay_packets,
+            fec_enabled: s.fec_enabled,
+            packet_loss_percent: s.packet_loss_percent,
         }
     }
 }
@@ -97,6 +192,62 @@ pub struct ChatSettings {
     /// On joining a room, ask peers for their backlog so the user
     /// sees what was said before they arrived.
     pub auto_sync_history: bool,
+}
+
+/// One auto-download rule: files matching `mime_pattern` are pulled
+/// automatically when offered, up to `max_size_bytes`. `0` disables
+/// the rule without removing it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoDownloadRule {
+    pub mime_pattern: String,
+    pub max_size_bytes: u64,
+}
+
+/// File-transfer preferences. Field semantics match `rumble-egui`'s
+/// `FileTransferSettings` so the two clients can share a settings
+/// file once egui migrates onto this store.
+///
+/// Only `auto_sync_history` (in `ChatSettings`) is currently consumed
+/// by the backend. The other fields are persisted UI state today —
+/// they'll feed the file-transfer plugin once that surface lands.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileTransferSettings {
+    pub auto_download_enabled: bool,
+    pub auto_download_rules: Vec<AutoDownloadRule>,
+    /// Download speed limit in bytes/sec; 0 = unlimited.
+    pub download_speed_limit: u64,
+    /// Upload speed limit in bytes/sec; 0 = unlimited.
+    pub upload_speed_limit: u64,
+    pub seed_after_download: bool,
+    pub cleanup_on_exit: bool,
+}
+
+impl Default for FileTransferSettings {
+    fn default() -> Self {
+        Self {
+            auto_download_enabled: false,
+            auto_download_rules: vec![
+                AutoDownloadRule {
+                    mime_pattern: "image/*".to_string(),
+                    max_size_bytes: 10 * 1024 * 1024,
+                },
+                AutoDownloadRule {
+                    mime_pattern: "audio/*".to_string(),
+                    max_size_bytes: 50 * 1024 * 1024,
+                },
+                AutoDownloadRule {
+                    mime_pattern: "text/*".to_string(),
+                    max_size_bytes: 1024 * 1024,
+                },
+            ],
+            download_speed_limit: 0,
+            upload_speed_limit: 0,
+            seed_after_download: true,
+            cleanup_on_exit: false,
+        }
+    }
 }
 
 /// Default location for the shared shell settings file.
@@ -183,6 +334,18 @@ pub struct Settings {
     pub chat: ChatSettings,
     /// Sound effect playback preferences.
     pub sfx: SfxSettings,
+    /// Opus encoder + TX pipeline preferences. Applied at startup so
+    /// the audio system comes up exactly as the user left it.
+    pub audio: PersistentAudioSettings,
+    /// File-transfer preferences (auto-download rules, bandwidth caps,
+    /// seed-after-download). Persisted alongside chat settings.
+    pub file_transfer: FileTransferSettings,
+    /// Voice activation mode (PTT vs continuous).
+    pub voice_mode: PersistentVoiceMode,
+    /// Last selected input device ID. `None` = system default.
+    pub input_device_id: Option<String>,
+    /// Last selected output device ID. `None` = system default.
+    pub output_device_id: Option<String>,
 
     /// Catch-all for fields written by a newer client. Round-tripped
     /// on save so we don't silently delete unknown settings.
@@ -329,6 +492,42 @@ mod tests {
         let reread = SettingsStore::load_from_path(Some(path));
         assert!(reread.settings().dark);
         assert_eq!(reread.settings().paradigm.as_deref(), Some("Luna"));
+    }
+
+    #[test]
+    fn audio_settings_round_trip() {
+        // Audio settings written by one session must come back intact
+        // — the entire restore-on-startup path depends on this.
+        let dir = tempdir_for_test();
+        let path = dir.join("settings.json");
+        {
+            let mut store = SettingsStore::load_from_path(Some(path.clone()));
+            store.modify(|s| {
+                s.audio.bitrate = 32000;
+                s.audio.encoder_complexity = 5;
+                s.audio.fec_enabled = false;
+                s.audio.packet_loss_percent = 12;
+                s.voice_mode = PersistentVoiceMode::Continuous;
+                s.input_device_id = Some("usb-mic".into());
+                s.output_device_id = Some("hdmi-out".into());
+                s.sfx.disabled_sounds.insert(SfxKind::UserJoin);
+                s.sfx.disabled_sounds.insert(SfxKind::UserLeave);
+            });
+        }
+        let reread = SettingsStore::load_from_path(Some(path));
+        let s = reread.settings();
+        assert_eq!(s.audio.bitrate, 32000);
+        assert_eq!(s.audio.encoder_complexity, 5);
+        assert!(!s.audio.fec_enabled);
+        assert_eq!(s.audio.packet_loss_percent, 12);
+        assert_eq!(s.voice_mode, PersistentVoiceMode::Continuous);
+        assert_eq!(s.input_device_id.as_deref(), Some("usb-mic"));
+        assert_eq!(s.output_device_id.as_deref(), Some("hdmi-out"));
+        assert!(s.sfx.disabled_sounds.contains(&SfxKind::UserJoin));
+        assert!(s.sfx.disabled_sounds.contains(&SfxKind::UserLeave));
+        assert!(!s.sfx.disabled_sounds.contains(&SfxKind::Connect));
+        assert!(s.sfx.is_kind_enabled(SfxKind::Connect));
+        assert!(!s.sfx.is_kind_enabled(SfxKind::UserJoin));
     }
 
     fn tempdir_for_test() -> PathBuf {

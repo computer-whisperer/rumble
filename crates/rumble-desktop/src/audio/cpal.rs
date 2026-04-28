@@ -1,7 +1,8 @@
-//! Audio I/O implementation using cpal.
+//! Cpal-based audio backend.
 //!
-//! Implements the [`AudioBackend`] trait from `rumble-client-traits` using cpal for
-//! native desktop audio capture and playback.
+//! Used as the primary backend on macOS (CoreAudio) and Windows (WASAPI),
+//! and as a fallback on Linux when no PulseAudio/PipeWire server is reachable.
+//! On Linux with a sound server present, prefer [`super::pulse::PulseAudioBackend`].
 
 use std::sync::{
     Arc, Mutex,
@@ -12,30 +13,57 @@ use cpal::{
     Device, Host, SampleFormat, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use rumble_client_traits::audio::{AudioBackend, AudioCaptureStream, AudioPlaybackStream};
 use rumble_protocol::AudioDeviceInfo;
 
-/// Audio sample rate used for voice communication (48 kHz, native for Opus).
 const SAMPLE_RATE: u32 = 48000;
-
-/// Number of channels (mono).
 const CHANNELS: u16 = 1;
-
-/// Opus frame size in samples: 20 ms at 48 kHz.
 const FRAME_SIZE: usize = 960;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Get a device's display name via the cpal 0.17 `description()` API.
-fn get_device_name(device: &Device) -> Option<String> {
-    device.description().map(|desc| desc.name().to_string()).ok()
+fn get_device_id(device: &Device) -> Option<String> {
+    device.id().ok().map(|id| id.to_string())
 }
 
-/// Returns a preference score for a sample format (higher is better).
+fn make_device_info(device: &Device, default_id: Option<&str>) -> Option<AudioDeviceInfo> {
+    let id = get_device_id(device)?;
+    let description = device.description().ok();
+    let name = description
+        .as_ref()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|| id.clone());
+    let pipeline = description.and_then(|d| d.driver().map(|s| s.to_string()));
+    let is_default = default_id == Some(id.as_str());
+    Some(AudioDeviceInfo {
+        id,
+        name,
+        pipeline,
+        is_default,
+    })
+}
+
+fn list_devices(devices: Option<impl Iterator<Item = Device>>, default_id: Option<&str>) -> Vec<AudioDeviceInfo> {
+    let Some(devices) = devices else { return Vec::new() };
+    devices
+        .filter_map(|device| make_device_info(&device, default_id))
+        .collect()
+}
+
+fn find_device_or_default(
+    devices: impl Iterator<Item = Device>,
+    device_id: Option<&str>,
+    default: Option<Device>,
+) -> anyhow::Result<Device> {
+    if let Some(id) = device_id {
+        if let Some(found) = devices.into_iter().find(|d| get_device_id(d).as_deref() == Some(id)) {
+            return Ok(found);
+        }
+        warn!(requested = %id, "audio: requested device id not found, falling back to system default");
+    }
+    default.ok_or_else(|| anyhow::anyhow!("no default audio device available"))
+}
+
 fn sample_format_preference(format: SampleFormat) -> u8 {
     match format {
         SampleFormat::F32 => 5,
@@ -47,37 +75,13 @@ fn sample_format_preference(format: SampleFormat) -> u8 {
     }
 }
 
-/// Find a device by name from an iterator, or return the provided default.
-fn find_device_or_default(
-    devices: impl Iterator<Item = Device>,
-    device_id: Option<&str>,
-    default: Option<Device>,
-) -> anyhow::Result<Device> {
-    match device_id {
-        Some(id) => devices
-            .into_iter()
-            .find(|d| get_device_name(d).as_deref() == Some(id))
-            .ok_or_else(|| anyhow::anyhow!("audio device not found: {}", id)),
-        None => default.ok_or_else(|| anyhow::anyhow!("no default audio device available")),
-    }
-}
-
-/// Pick the best supported config for a device (input or output) that matches
-/// our target sample rate / channel count.  Returns `(StreamConfig, SampleFormat,
-/// actual_sample_rate, actual_channels)`.
-///
-/// If no config matches our exact rate/channels we fall back to the best
-/// available format and handle conversion in the callback.
+/// Pick the best supported config for a device that matches our target rate / channels.
 fn pick_config(
     configs: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
 ) -> Option<(StreamConfig, SampleFormat, u32, u16)> {
-    // First pass: find configs that match our exact requirements.
     let mut all: Vec<cpal::SupportedStreamConfigRange> = configs.collect();
-
-    // Sort by preference (best format first).
     all.sort_by(|a, b| sample_format_preference(b.sample_format()).cmp(&sample_format_preference(a.sample_format())));
 
-    // Ideal: exact channel + sample rate match.
     for cfg in &all {
         if cfg.channels() == CHANNELS && cfg.min_sample_rate() <= SAMPLE_RATE && cfg.max_sample_rate() >= SAMPLE_RATE {
             let sc = StreamConfig {
@@ -88,8 +92,6 @@ fn pick_config(
             return Some((sc, cfg.sample_format(), SAMPLE_RATE, CHANNELS));
         }
     }
-
-    // Fallback: accept any channel count at our sample rate.
     for cfg in &all {
         if cfg.min_sample_rate() <= SAMPLE_RATE && cfg.max_sample_rate() >= SAMPLE_RATE {
             let ch = cfg.channels();
@@ -101,10 +103,8 @@ fn pick_config(
             return Some((sc, cfg.sample_format(), SAMPLE_RATE, ch));
         }
     }
-
-    // Fallback: different sample rate, prefer mono.
     for cfg in &all {
-        let rate = cfg.max_sample_rate(); // pick highest supported rate
+        let rate = cfg.max_sample_rate();
         let ch = cfg.channels();
         let sc = StreamConfig {
             channels: ch,
@@ -113,11 +113,9 @@ fn pick_config(
         };
         return Some((sc, cfg.sample_format(), rate, ch));
     }
-
     None
 }
 
-/// Basic linear interpolation resampler.
 fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if input.is_empty() || from_rate == to_rate {
         return input.to_vec();
@@ -136,11 +134,6 @@ fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     output
 }
 
-// ---------------------------------------------------------------------------
-// InputProcessor
-// ---------------------------------------------------------------------------
-
-/// Accumulates incoming samples into fixed-size frames.
 struct InputProcessor {
     buffer: Vec<f32>,
     frame_size: usize,
@@ -165,11 +158,6 @@ impl InputProcessor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CpalAudioBackend
-// ---------------------------------------------------------------------------
-
-/// Audio backend using the cpal library for native desktop audio.
 pub struct CpalAudioBackend {
     host: Host,
 }
@@ -193,45 +181,13 @@ impl AudioBackend for CpalAudioBackend {
     type PlaybackStream = CpalPlaybackStream;
 
     fn list_input_devices(&self) -> Vec<AudioDeviceInfo> {
-        let default_name = self.host.default_input_device().and_then(|d| get_device_name(&d));
-
-        self.host
-            .input_devices()
-            .map(|devices| {
-                devices
-                    .filter_map(|device| {
-                        let name = get_device_name(&device)?;
-                        let is_default = default_name.as_ref() == Some(&name);
-                        Some(AudioDeviceInfo {
-                            id: name.clone(),
-                            name,
-                            is_default,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        let default_id = self.host.default_input_device().and_then(|d| get_device_id(&d));
+        list_devices(self.host.input_devices().ok(), default_id.as_deref())
     }
 
     fn list_output_devices(&self) -> Vec<AudioDeviceInfo> {
-        let default_name = self.host.default_output_device().and_then(|d| get_device_name(&d));
-
-        self.host
-            .output_devices()
-            .map(|devices| {
-                devices
-                    .filter_map(|device| {
-                        let name = get_device_name(&device)?;
-                        let is_default = default_name.as_ref() == Some(&name);
-                        Some(AudioDeviceInfo {
-                            id: name.clone(),
-                            name,
-                            is_default,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        let default_id = self.host.default_output_device().and_then(|d| get_device_id(&d));
+        list_devices(self.host.output_devices().ok(), default_id.as_deref())
     }
 
     fn open_input(
@@ -241,7 +197,10 @@ impl AudioBackend for CpalAudioBackend {
     ) -> anyhow::Result<CpalCaptureStream> {
         let device = find_device_or_default(self.host.input_devices()?, device_id, self.host.default_input_device())?;
 
-        let dev_name = get_device_name(&device).unwrap_or_else(|| "<unknown>".into());
+        let dev_name = device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_else(|_| "<unknown>".into());
         info!(device = %dev_name, "audio: opening input device");
 
         let supported = device.supported_input_configs()?;
@@ -256,21 +215,19 @@ impl AudioBackend for CpalAudioBackend {
         );
 
         let is_active = Arc::new(AtomicBool::new(true));
-        let is_active_clone = is_active.clone();
         let processor = Arc::new(Mutex::new(InputProcessor::new(FRAME_SIZE, on_frame)));
-
         let err_fn = move |err| error!("audio: input stream error: {}", err);
 
-        // We need different type parameters for build_input_stream based on
-        // the sample format, so we match and build accordingly.
         let stream = match sample_format {
             SampleFormat::F32 => {
                 let ch = actual_channels;
                 let rate = actual_rate;
+                let is_active = is_active.clone();
+                let processor = processor.clone();
                 device.build_input_stream(
                     &stream_config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        if !is_active_clone.load(Ordering::Relaxed) {
+                        if !is_active.load(Ordering::Relaxed) {
                             return;
                         }
                         let samples = convert_input_f32(data, ch, rate);
@@ -285,12 +242,12 @@ impl AudioBackend for CpalAudioBackend {
             SampleFormat::I16 => {
                 let ch = actual_channels;
                 let rate = actual_rate;
-                let is_active_clone = is_active.clone();
+                let is_active = is_active.clone();
                 let processor = processor.clone();
                 device.build_input_stream(
                     &stream_config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        if !is_active_clone.load(Ordering::Relaxed) {
+                        if !is_active.load(Ordering::Relaxed) {
                             return;
                         }
                         let float_data: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
@@ -306,12 +263,12 @@ impl AudioBackend for CpalAudioBackend {
             SampleFormat::U16 => {
                 let ch = actual_channels;
                 let rate = actual_rate;
-                let is_active_clone = is_active.clone();
+                let is_active = is_active.clone();
                 let processor = processor.clone();
                 device.build_input_stream(
                     &stream_config,
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                        if !is_active_clone.load(Ordering::Relaxed) {
+                        if !is_active.load(Ordering::Relaxed) {
                             return;
                         }
                         let float_data: Vec<f32> =
@@ -328,12 +285,12 @@ impl AudioBackend for CpalAudioBackend {
             SampleFormat::I32 => {
                 let ch = actual_channels;
                 let rate = actual_rate;
-                let is_active_clone = is_active.clone();
+                let is_active = is_active.clone();
                 let processor = processor.clone();
                 device.build_input_stream(
                     &stream_config,
                     move |data: &[i32], _: &cpal::InputCallbackInfo| {
-                        if !is_active_clone.load(Ordering::Relaxed) {
+                        if !is_active.load(Ordering::Relaxed) {
                             return;
                         }
                         let float_data: Vec<f32> = data.iter().map(|&s| s as f32 / i32::MAX as f32).collect();
@@ -349,12 +306,12 @@ impl AudioBackend for CpalAudioBackend {
             SampleFormat::U8 => {
                 let ch = actual_channels;
                 let rate = actual_rate;
-                let is_active_clone = is_active.clone();
+                let is_active = is_active.clone();
                 let processor = processor.clone();
                 device.build_input_stream(
                     &stream_config,
                     move |data: &[u8], _: &cpal::InputCallbackInfo| {
-                        if !is_active_clone.load(Ordering::Relaxed) {
+                        if !is_active.load(Ordering::Relaxed) {
                             return;
                         }
                         let float_data: Vec<f32> = data.iter().map(|&s| (s as f32 - 128.0) / 128.0).collect();
@@ -390,7 +347,10 @@ impl AudioBackend for CpalAudioBackend {
             self.host.default_output_device(),
         )?;
 
-        let dev_name = get_device_name(&device).unwrap_or_else(|| "<unknown>".into());
+        let dev_name = device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_else(|_| "<unknown>".into());
         info!(device = %dev_name, "audio: opening output device");
 
         let supported = device.supported_output_configs()?;
@@ -515,11 +475,6 @@ impl AudioBackend for CpalAudioBackend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Input conversion helper (already-f32 path with channel/rate conversion)
-// ---------------------------------------------------------------------------
-
-/// Down-mix multi-channel f32 data to mono and resample if needed.
 fn convert_input_f32(data: &[f32], channels: u16, device_rate: u32) -> Vec<f32> {
     let mono = if channels == 1 {
         data.to_vec()
@@ -529,7 +484,6 @@ fn convert_input_f32(data: &[f32], channels: u16, device_rate: u32) -> Vec<f32> 
             .map(|frame| frame.iter().sum::<f32>() / ch as f32)
             .collect()
     };
-
     if device_rate == SAMPLE_RATE {
         mono
     } else {
@@ -537,32 +491,21 @@ fn convert_input_f32(data: &[f32], channels: u16, device_rate: u32) -> Vec<f32> 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Output conversion helpers
-// ---------------------------------------------------------------------------
-
-/// Calculate how many mono 48 kHz samples we need from the fill callback
-/// to produce `total_device_samples` at the device's rate and channel count.
 fn output_mono_len(total_device_samples: usize, channels: u16, device_rate: u32) -> usize {
     let device_mono = total_device_samples / channels as usize;
     if device_rate == SAMPLE_RATE {
         device_mono
     } else {
-        // We need enough source samples so that after resampling we get device_mono.
         ((device_mono as f64) * (SAMPLE_RATE as f64 / device_rate as f64)).ceil() as usize
     }
 }
 
-/// Expand mono 48 kHz f32 data to the device's channel count and sample rate.
 fn expand_output(mono: &[f32], channels: u16, device_rate: u32) -> Vec<f32> {
-    // Step 1: resample from 48 kHz to device rate
     let resampled = if device_rate == SAMPLE_RATE {
         mono.to_vec()
     } else {
         resample(mono, SAMPLE_RATE, device_rate)
     };
-
-    // Step 2: duplicate mono to all channels
     if channels == 1 {
         resampled
     } else {
@@ -577,7 +520,6 @@ fn expand_output(mono: &[f32], channels: u16, device_rate: u32) -> Vec<f32> {
     }
 }
 
-/// Fill an f32 output buffer, handling channel/rate conversion.
 fn write_output_f32(
     data: &mut [f32],
     fill: &Arc<Mutex<Box<dyn FnMut(&mut [f32]) + Send>>>,
@@ -585,7 +527,6 @@ fn write_output_f32(
     device_rate: u32,
 ) {
     if channels == 1 && device_rate == SAMPLE_RATE {
-        // Fast path: no conversion needed.
         if let Ok(mut f) = fill.lock() {
             f(data);
         } else {
@@ -600,18 +541,12 @@ fn write_output_f32(
         let expanded = expand_output(&mono, channels, device_rate);
         let copy_len = data.len().min(expanded.len());
         data[..copy_len].copy_from_slice(&expanded[..copy_len]);
-        // Zero any remaining samples if expanded was shorter.
         for s in &mut data[copy_len..] {
             *s = 0.0;
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// CpalCaptureStream
-// ---------------------------------------------------------------------------
-
-/// Live audio capture stream wrapping a cpal input stream.
 pub struct CpalCaptureStream {
     _stream: cpal::Stream,
     is_active: Arc<AtomicBool>,
@@ -624,14 +559,8 @@ impl AudioCaptureStream for CpalCaptureStream {
 }
 
 // SAFETY: cpal::Stream is Send on all desktop platforms we target.
-// The Arc<AtomicBool> is inherently Send + Sync.
 unsafe impl Send for CpalCaptureStream {}
 
-// ---------------------------------------------------------------------------
-// CpalPlaybackStream
-// ---------------------------------------------------------------------------
-
-/// Live audio playback stream wrapping a cpal output stream.
 pub struct CpalPlaybackStream {
     _stream: cpal::Stream,
 }
