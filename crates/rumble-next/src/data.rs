@@ -34,6 +34,25 @@ pub enum SysTone {
 
 #[derive(Clone, Debug)]
 pub enum Media {
-    Image { name: String, size: String },
-    File { ext: String, name: String, size: String },
+    Image {
+        name: String,
+        size: String,
+    },
+    File {
+        ext: String,
+        name: String,
+        size: String,
+    },
+    /// An incoming file offer the user can accept to download.
+    /// `is_own` is true when the local user is the offerer (their own
+    /// outgoing share echoed back from the server) — UI hides the
+    /// download affordance in that case.
+    FileOffer {
+        ext: String,
+        name: String,
+        size: String,
+        transfer_id: String,
+        share_data: String,
+        is_own: bool,
+    },
 }

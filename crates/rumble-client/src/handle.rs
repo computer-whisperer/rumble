@@ -837,6 +837,7 @@ async fn run_connection_task<P: Platform>(
                                     sender: client_name.clone(),
                                     text,
                                     tree: None,
+                                    attachment: None,
                                 })),
                             };
                             if let Err(e) = send_envelope(t, &env).await {
@@ -860,6 +861,7 @@ async fn run_connection_task<P: Platform>(
                                     sender: client_name.clone(),
                                     text,
                                     tree: Some(true),
+                                    attachment: None,
                                 })),
                             };
                             if let Err(e) = send_envelope(t, &env).await {
@@ -900,6 +902,7 @@ async fn run_connection_task<P: Platform>(
                                     other_user_id: target_user_id,
                                     other_username: target_username,
                                 },
+                                attachment: None,
                             });
                             if s.chat_messages.len() > 100 {
                                 s.chat_messages.remove(0);
@@ -918,6 +921,7 @@ async fn run_connection_task<P: Platform>(
                             timestamp: std::time::SystemTime::now(),
                             is_local: true,
                             kind: Default::default(),
+                            attachment: None,
                         });
                         // Keep only recent messages
                         if s.chat_messages.len() > 100 {
@@ -1019,19 +1023,34 @@ async fn run_connection_task<P: Platform>(
                             match ft.share(path) {
                                 Ok(offer) => {
                                     info!("File shared via relay: {} ({})", offer.name, offer.id.0);
-                                    // Broadcast the share_data to the room via chat
                                     if let Some(t) = &mut transport {
+                                        let attachment = proto::ChatAttachment {
+                                            kind: Some(proto::chat_attachment::Kind::FileOffer(proto::FileOffer {
+                                                schema_version: 1,
+                                                transfer_id: offer.id.0.clone(),
+                                                name: offer.name.clone(),
+                                                size: offer.size,
+                                                mime: offer.mime.clone(),
+                                                share_data: offer.share_data,
+                                            })),
+                                        };
+                                        let summary = format!(
+                                            "shared file \"{}\" ({})",
+                                            offer.name,
+                                            format_bytes(offer.size),
+                                        );
                                         let env = proto::Envelope {
                                             state_hash: Vec::new(),
                                             payload: Some(Payload::ChatMessage(proto::ChatMessage {
                                                 id: uuid::Uuid::new_v4().into_bytes().to_vec(),
-                                                sender: String::new(),
-                                                text: format!("[file:{}]", offer.share_data),
+                                                sender: client_name.clone(),
+                                                text: summary,
                                                 timestamp_ms: std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
                                                     .unwrap_or_default()
                                                     .as_millis() as i64,
-                                                ..Default::default()
+                                                tree: None,
+                                                attachment: Some(attachment),
                                             })),
                                         };
                                         if let Err(e) = send_envelope(t, &env).await {
@@ -1047,6 +1066,21 @@ async fn run_connection_task<P: Platform>(
                         } else {
                             warn!("ShareFile: no file transfer plugin available");
                             add_local_message(&state, "File sharing is not currently available".to_string(), &repaint);
+                        }
+                    }
+
+                    Command::DownloadFile { share_data } => {
+                        if let Some(ref ft) = file_transfer {
+                            match ft.download(&share_data) {
+                                Ok(id) => info!("Download started: {}", id.0),
+                                Err(e) => {
+                                    warn!("Download failed: {}", e);
+                                    add_local_message(&state, format!("Download failed: {}", e), &repaint);
+                                }
+                            }
+                        } else {
+                            warn!("DownloadFile: no file transfer plugin available");
+                            add_local_message(&state, "File downloads are not currently available".to_string(), &repaint);
                         }
                     }
 
@@ -1068,6 +1102,7 @@ async fn run_connection_task<P: Platform>(
                                     sender: client_name.clone(),
                                     text: request.to_json(),
                                     tree: None,
+                                    attachment: None,
                                 })),
                             };
                             if let Err(e) = send_envelope(t, &env).await {
@@ -1082,6 +1117,7 @@ async fn run_connection_task<P: Platform>(
                                     timestamp: SystemTime::now(),
                                     is_local: true,
                                     kind: Default::default(),
+                                    attachment: None,
                                 });
                                 repaint();
                             }
@@ -1497,6 +1533,7 @@ fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn
         timestamp: std::time::SystemTime::now(),
         is_local: true,
         kind: Default::default(),
+        attachment: None,
     });
     // Keep only recent messages
     if s.chat_messages.len() > 100 {
@@ -1603,6 +1640,8 @@ fn handle_server_message(
                             crate::events::ChatMessageKind::Room
                         };
 
+                        let attachment = cb.attachment.and_then(rumble_protocol::chat_attachment_from_proto);
+
                         let mut s = write_state(&state);
                         s.chat_messages.push(crate::events::ChatMessage {
                             id,
@@ -1611,6 +1650,7 @@ fn handle_server_message(
                             timestamp,
                             is_local: false,
                             kind,
+                            attachment,
                         });
                         // Keep only recent messages
                         if s.chat_messages.len() > 100 {
@@ -1639,6 +1679,7 @@ fn handle_server_message(
                                 other_user_id: dm.sender_id,
                                 other_username: dm.sender_name,
                             },
+                            attachment: None,
                         });
                         if s.chat_messages.len() > 100 {
                             s.chat_messages.remove(0);
@@ -1658,6 +1699,7 @@ fn handle_server_message(
                             timestamp: std::time::SystemTime::now(),
                             is_local: true,
                             kind: Default::default(),
+                            attachment: None,
                         });
                         if s.chat_messages.len() > 100 {
                             s.chat_messages.remove(0);
@@ -2116,4 +2158,19 @@ fn build_client_room_chain(
             (room_uuid, acl_data)
         })
         .collect()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }

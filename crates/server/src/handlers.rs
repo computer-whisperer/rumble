@@ -812,6 +812,7 @@ async fn handle_chat_message(
                 sender: msg.sender,
                 text: msg.text,
                 tree: if is_tree { Some(true) } else { None },
+                attachment: msg.attachment,
             })),
         })),
     };
@@ -2711,6 +2712,7 @@ async fn handle_bridge_chat_message(
                 sender: vu.username,
                 text: bcm.text,
                 tree: None,
+                attachment: None,
             })),
         })),
     };

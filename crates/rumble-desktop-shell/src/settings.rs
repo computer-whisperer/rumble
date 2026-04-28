@@ -204,13 +204,48 @@ pub struct AutoDownloadRule {
     pub max_size_bytes: u64,
 }
 
+impl AutoDownloadRule {
+    /// True if this rule should auto-accept an offer with the given
+    /// MIME type and size. `max_size_bytes == 0` is treated as
+    /// "rule disabled" so users can keep a pattern around without it
+    /// firing.
+    pub fn matches(&self, mime: &str, size: u64) -> bool {
+        if self.max_size_bytes == 0 || size > self.max_size_bytes {
+            return false;
+        }
+        mime_pattern_matches(&self.mime_pattern, mime)
+    }
+}
+
+/// Match a glob-ish MIME pattern. Supports `*` / `*/*` (everything),
+/// `<top>/*` (top-level type prefix), and exact equality. Comparisons
+/// are case-insensitive — MIME type names are.
+fn mime_pattern_matches(pattern: &str, mime: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == "*" || pattern == "*/*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        return mime
+            .split_once('/')
+            .map(|(top, _)| top.eq_ignore_ascii_case(prefix))
+            .unwrap_or(false);
+    }
+    pattern.eq_ignore_ascii_case(mime)
+}
+
 /// File-transfer preferences. Field semantics match `rumble-egui`'s
 /// `FileTransferSettings` so the two clients can share a settings
 /// file once egui migrates onto this store.
 ///
-/// Only `auto_sync_history` (in `ChatSettings`) is currently consumed
-/// by the backend. The other fields are persisted UI state today —
-/// they'll feed the file-transfer plugin once that surface lands.
+/// `auto_download_enabled` + `auto_download_rules` are consumed by
+/// rumble-next's incoming-offer pump (see `App::pump_auto_downloads`).
+/// The bandwidth caps and seed/cleanup flags are persisted UI state
+/// today — they'll feed the file-transfer plugin once that surface
+/// lands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FileTransferSettings {
@@ -222,6 +257,14 @@ pub struct FileTransferSettings {
     pub upload_speed_limit: u64,
     pub seed_after_download: bool,
     pub cleanup_on_exit: bool,
+}
+
+impl FileTransferSettings {
+    /// True if any active rule matches and auto-download is enabled.
+    /// Convenience for the receive path: one call per incoming offer.
+    pub fn should_auto_download(&self, mime: &str, size: u64) -> bool {
+        self.auto_download_enabled && self.auto_download_rules.iter().any(|r| r.matches(mime, size))
+    }
 }
 
 impl Default for FileTransferSettings {
@@ -528,6 +571,48 @@ mod tests {
         assert!(!s.sfx.disabled_sounds.contains(&SfxKind::Connect));
         assert!(s.sfx.is_kind_enabled(SfxKind::Connect));
         assert!(!s.sfx.is_kind_enabled(SfxKind::UserJoin));
+    }
+
+    #[test]
+    fn auto_download_rule_matches_glob_and_size() {
+        let rule = AutoDownloadRule {
+            mime_pattern: "image/*".into(),
+            max_size_bytes: 1024,
+        };
+        assert!(rule.matches("image/png", 512));
+        assert!(rule.matches("IMAGE/JPEG", 1024));
+        assert!(!rule.matches("image/png", 2048), "oversize should not match");
+        assert!(!rule.matches("audio/ogg", 256), "wrong type should not match");
+
+        let exact = AutoDownloadRule {
+            mime_pattern: "application/pdf".into(),
+            max_size_bytes: 10,
+        };
+        assert!(exact.matches("application/pdf", 5));
+        assert!(!exact.matches("application/json", 5));
+
+        let zero = AutoDownloadRule {
+            mime_pattern: "*/*".into(),
+            max_size_bytes: 0,
+        };
+        assert!(!zero.matches("image/png", 1), "0 max disables the rule");
+
+        let star = AutoDownloadRule {
+            mime_pattern: "*".into(),
+            max_size_bytes: 100,
+        };
+        assert!(star.matches("anything/anything", 1));
+    }
+
+    #[test]
+    fn file_transfer_should_auto_download_respects_enable_flag() {
+        let mut s = FileTransferSettings::default();
+        // Defaults include image/* up to 10 MB.
+        assert!(!s.should_auto_download("image/png", 1024), "disabled by default");
+        s.auto_download_enabled = true;
+        assert!(s.should_auto_download("image/png", 1024));
+        assert!(!s.should_auto_download("image/png", 50 * 1024 * 1024), "exceeds cap");
+        assert!(!s.should_auto_download("video/mp4", 1024), "no rule matches");
     }
 
     fn tempdir_for_test() -> PathBuf {

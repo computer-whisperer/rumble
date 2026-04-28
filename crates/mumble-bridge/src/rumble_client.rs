@@ -133,6 +133,7 @@ pub async fn send_chat(transport: &mut QuinnTransport, sender: &str, text: &str)
             sender: sender.to_string(),
             text: text.to_string(),
             tree: None,
+            attachment: None,
         })),
     };
     send_envelope(transport, &msg).await
@@ -162,6 +163,7 @@ pub async fn send_tree_chat(transport: &mut QuinnTransport, sender: &str, text: 
             sender: sender.to_string(),
             text: text.to_string(),
             tree: Some(true),
+            attachment: None,
         })),
     };
     send_envelope(transport, &msg).await

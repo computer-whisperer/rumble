@@ -202,7 +202,7 @@ fn center_column<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &
     room_header(&mut hui, state);
 
     let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(chat_rect));
-    shell.chat_stream(&mut cui, state);
+    shell.chat_stream(&mut cui, state, backend);
 
     let mut kui = ui.new_child(egui::UiBuilder::new().max_rect(composer_rect));
     shell.composer(&mut kui, state, backend);

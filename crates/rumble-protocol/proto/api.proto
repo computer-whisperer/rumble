@@ -220,14 +220,44 @@ message RequestStateSync {
   bytes actual_hash = 2;
 }
 
+// File-transfer offer attached to a chat message. The carrying message's
+// `text` field MUST hold a human-readable summary so older clients without
+// this schema display something sensible.
+message FileOffer {
+  // Schema version for the offer payload. Currently 1.
+  uint32 schema_version = 1;
+  // Unique transfer identifier (UUID string).
+  string transfer_id = 2;
+  // Original filename.
+  string name = 3;
+  // File size in bytes.
+  uint64 size = 4;
+  // MIME type (e.g. "image/jpeg").
+  string mime = 5;
+  // Opaque payload consumed by the receiving FileTransferPlugin
+  // (e.g. relay metadata, magnet link).
+  string share_data = 6;
+}
+
+// Typed sidecar carried alongside a chat message. Older clients that
+// don't know this field fall back to the message's plain `text`.
+message ChatAttachment {
+  oneof kind {
+    FileOffer file_offer = 1;
+    // Future: ImageEmbed, VoiceMemo, Location, Poll, ...
+  }
+}
+
 // Chat message sent from client to server.
 message ChatMessage {
   bytes id = 1;           // 16-byte UUID
   int64 timestamp_ms = 2; // Unix timestamp milliseconds
   string sender = 3;
-  string text = 4;        // EasyMark or JSON for file messages
+  string text = 4;        // Human-readable body (also a fallback summary when `attachment` is set).
   // When true, broadcast to sender's room AND all descendant rooms.
   optional bool tree = 5;
+  // Optional typed payload (e.g. file offer). Forwarded by the server unchanged.
+  optional ChatAttachment attachment = 6;
 }
 
 // Direct message sent from one user to another.
@@ -325,6 +355,8 @@ message ChatBroadcast {
   string text = 4;
   // When true, this message was sent to a tree of rooms.
   optional bool tree = 5;
+  // Optional typed payload (e.g. file offer). Forwarded from ChatMessage unchanged.
+  optional ChatAttachment attachment = 6;
 }
 
 // Empty keep-alive message with optional timestamp.

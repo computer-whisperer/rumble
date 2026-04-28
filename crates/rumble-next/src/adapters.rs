@@ -5,12 +5,13 @@
 use std::collections::HashMap;
 
 use rumble_protocol::{
-    ChatMessage, ChatMessageKind, ConnectionState, RoomTree, RoomTreeNode, State, proto, uuid_from_room_id,
+    ChatAttachment, ChatMessage, ChatMessageKind, ConnectionState, FileOfferInfo, RoomTree, RoomTreeNode, State, proto,
+    uuid_from_room_id,
 };
 use rumble_widgets::{TreeNode, TreeNodeId, UserState};
 use uuid::Uuid;
 
-use crate::data::{ChatEntry, ChatMsg, SysMsg, SysTone};
+use crate::data::{ChatEntry, ChatMsg, Media, SysMsg, SysTone};
 
 /// What a visible tree row points at. The rumble-widgets tree only
 /// stores `u64` ids, so we maintain a side map here.
@@ -141,10 +142,27 @@ pub fn crumbs_for_room(state: &State, room: Uuid) -> Vec<String> {
 ///   or are blank if the caller passes `None` (the user has them
 ///   hidden).
 pub fn chat_entries(state: &State, format: Option<rumble_desktop_shell::TimestampFormat>) -> Vec<ChatEntry> {
-    state.chat_messages.iter().map(|m| render_entry(m, format)).collect()
+    let my_username = state
+        .my_user_id
+        .and_then(|id| {
+            state
+                .users
+                .iter()
+                .find(|u| u.user_id.as_ref().map(|x| x.value) == Some(id))
+        })
+        .map(|u| u.username.as_str());
+    state
+        .chat_messages
+        .iter()
+        .map(|m| render_entry(m, format, my_username))
+        .collect()
 }
 
-fn render_entry(m: &ChatMessage, format: Option<rumble_desktop_shell::TimestampFormat>) -> ChatEntry {
+fn render_entry(
+    m: &ChatMessage,
+    format: Option<rumble_desktop_shell::TimestampFormat>,
+    my_username: Option<&str>,
+) -> ChatEntry {
     let t = format.map(|f| format_timestamp(m.timestamp, f)).unwrap_or_default();
     if m.is_local {
         return ChatEntry::Sys(SysMsg {
@@ -160,12 +178,55 @@ fn render_entry(m: &ChatMessage, format: Option<rumble_desktop_shell::TimestampF
             format!("{} → {}", m.sender, other_username)
         }
     };
-    ChatEntry::Msg(ChatMsg {
-        who,
-        t,
-        body: Some(m.text.clone()),
-        media: None,
-    })
+    let media = m.attachment.as_ref().and_then(|a| match a {
+        ChatAttachment::FileOffer(fo) => Some(file_offer_media(fo, m.sender.as_str(), my_username)),
+    });
+    // When an attachment is present, the `text` field is just a
+    // human-readable summary that the file card already conveys —
+    // suppress the duplicate body line.
+    let body = if media.is_some() { None } else { Some(m.text.clone()) };
+    ChatEntry::Msg(ChatMsg { who, t, body, media })
+}
+
+fn file_offer_media(fo: &FileOfferInfo, sender: &str, my_username: Option<&str>) -> Media {
+    Media::FileOffer {
+        ext: file_extension_label(&fo.name, &fo.mime),
+        name: fo.name.clone(),
+        size: format_bytes(fo.size),
+        transfer_id: fo.transfer_id.clone(),
+        share_data: fo.share_data.clone(),
+        is_own: my_username == Some(sender),
+    }
+}
+
+fn file_extension_label(name: &str, mime: &str) -> String {
+    if let Some(ext) = name.rsplit_once('.').map(|(_, e)| e)
+        && !ext.is_empty()
+        && ext.len() <= 5
+    {
+        return ext.to_ascii_uppercase();
+    }
+    if let Some((_, sub)) = mime.rsplit_once('/')
+        && !sub.is_empty()
+    {
+        return sub.to_ascii_uppercase();
+    }
+    "FILE".to_string()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn tone_for_local(text: &str) -> SysTone {

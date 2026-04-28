@@ -677,6 +677,63 @@ pub enum ChatMessageKind {
     Tree,
 }
 
+/// File-offer payload mirrored from `proto::FileOffer` so the UI doesn't depend
+/// on prost-generated types. Populated when a chat message carries an
+/// attachment of kind `FileOffer`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FileOfferInfo {
+    pub schema_version: u32,
+    pub transfer_id: String,
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+    pub share_data: String,
+}
+
+/// Typed sidecar attached to a chat message. New variants can be added without
+/// breaking older clients — they will simply ignore the `attachment` field and
+/// render the message's `text` summary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChatAttachment {
+    FileOffer(FileOfferInfo),
+}
+
+/// Convert a wire `ChatAttachment` (prost-generated) into the client-side
+/// `ChatAttachment`. Returns `None` for empty / unknown variants so older
+/// receivers tolerate future kinds gracefully.
+pub fn chat_attachment_from_proto(att: crate::proto::ChatAttachment) -> Option<ChatAttachment> {
+    use crate::proto::chat_attachment::Kind;
+    match att.kind? {
+        Kind::FileOffer(fo) => Some(ChatAttachment::FileOffer(FileOfferInfo {
+            schema_version: fo.schema_version,
+            transfer_id: fo.transfer_id,
+            name: fo.name,
+            size: fo.size,
+            mime: fo.mime,
+            share_data: fo.share_data,
+        })),
+    }
+}
+
+/// Encode a client-side `ChatAttachment` into the wire form for outbound
+/// `ChatMessage` envelopes.
+pub fn chat_attachment_to_proto(att: &ChatAttachment) -> crate::proto::ChatAttachment {
+    use crate::proto::chat_attachment::Kind;
+    match att {
+        ChatAttachment::FileOffer(fo) => crate::proto::ChatAttachment {
+            kind: Some(Kind::FileOffer(crate::proto::FileOffer {
+                schema_version: fo.schema_version,
+                transfer_id: fo.transfer_id.clone(),
+                name: fo.name.clone(),
+                size: fo.size,
+                mime: fo.mime.clone(),
+                share_data: fo.share_data.clone(),
+            })),
+        },
+    }
+}
+
 /// A chat message.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatMessage {
@@ -693,6 +750,10 @@ pub struct ChatMessage {
     /// The kind of message (room chat, DM, or tree broadcast).
     #[serde(default)]
     pub kind: ChatMessageKind,
+    /// Optional typed attachment (e.g. file offer). Receivers that don't
+    /// understand the attachment kind fall back to displaying `text`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<ChatAttachment>,
 }
 
 // =============================================================================
@@ -832,6 +893,7 @@ impl ChatHistoryContent {
                     timestamp,
                     is_local: false,
                     kind: ChatMessageKind::default(),
+                    attachment: None,
                 })
             })
             .collect()
@@ -1207,6 +1269,11 @@ pub enum Command {
     ShareFile {
         path: std::path::PathBuf,
     },
+    /// Accept an incoming file offer and start downloading.
+    /// `share_data` is the opaque payload from the offer's attachment.
+    DownloadFile {
+        share_data: String,
+    },
 
     // Sound Effects
     /// Play a sound effect.
@@ -1366,6 +1433,10 @@ impl std::fmt::Debug for Command {
             Command::RegisterUser { user_id } => f.debug_struct("RegisterUser").field("user_id", user_id).finish(),
             Command::UnregisterUser { user_id } => f.debug_struct("UnregisterUser").field("user_id", user_id).finish(),
             Command::ShareFile { path } => f.debug_struct("ShareFile").field("path", path).finish(),
+            Command::DownloadFile { share_data } => f
+                .debug_struct("DownloadFile")
+                .field("share_data_len", &share_data.len())
+                .finish(),
             Command::PlaySfx { kind, volume } => f
                 .debug_struct("PlaySfx")
                 .field("kind", kind)

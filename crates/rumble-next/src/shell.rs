@@ -8,7 +8,7 @@
 //! converts it via `crate::adapters`, and hands `(state, tree_nodes)` to
 //! the shell's render functions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Pos2, RichText, ScrollArea, Sense, Stroke,
@@ -150,6 +150,11 @@ pub struct Shell {
     /// spawns the OS file picker on its tokio runtime — the composer
     /// itself doesn't have access to a runtime handle.
     pub share_file_requested: bool,
+    /// Transfer IDs the user has clicked "Download" on. Used to flip
+    /// the file-offer card's button to a passive "Downloading…" label
+    /// once accepted, without waiting for the (still-TODO) transfers
+    /// panel to surface live progress.
+    accepted_offers: HashSet<String>,
 }
 
 impl Shell {
@@ -171,6 +176,13 @@ impl Shell {
         self.modal = Some(PendingModal::Elevate {
             password: String::new(),
         });
+    }
+
+    /// Record that a file offer has been accepted (manually or via
+    /// auto-download), so the file-offer card flips to "Downloading…"
+    /// instead of showing a Download button.
+    pub fn mark_offer_accepted(&mut self, transfer_id: impl Into<String>) {
+        self.accepted_offers.insert(transfer_id.into());
     }
 }
 
@@ -343,7 +355,7 @@ pub fn room_header(ui: &mut Ui, state: &State) {
 const AVATAR_SIZE: f32 = 24.0;
 
 impl Shell {
-    pub fn chat_stream(&mut self, ui: &mut Ui, state: &State) {
+    pub fn chat_stream<P: Platform + 'static>(&mut self, ui: &mut Ui, state: &State, backend: &BackendHandle<P>) {
         let theme = ui.theme();
         let tokens = theme.tokens().clone();
 
@@ -366,7 +378,7 @@ impl Shell {
                 for entry in &entries {
                     match entry {
                         ChatEntry::Sys(m) => draw_sys(ui, &tokens, m),
-                        ChatEntry::Msg(m) => draw_msg(ui, &tokens, m),
+                        ChatEntry::Msg(m) => draw_msg(ui, &tokens, m, backend, &mut self.accepted_offers),
                     }
                 }
                 ui.add_space(10.0);
@@ -389,7 +401,13 @@ fn draw_sys(ui: &mut Ui, tokens: &rumble_widgets::Tokens, m: &SysMsg) {
     });
 }
 
-fn draw_msg(ui: &mut Ui, tokens: &rumble_widgets::Tokens, m: &ChatMsg) {
+fn draw_msg<P: Platform + 'static>(
+    ui: &mut Ui,
+    tokens: &rumble_widgets::Tokens,
+    m: &ChatMsg,
+    backend: &BackendHandle<P>,
+    accepted_offers: &mut HashSet<String>,
+) {
     ui.horizontal_top(|ui| {
         let (avatar_rect, _) = ui.allocate_exact_size(Vec2::splat(AVATAR_SIZE), Sense::hover());
         let initial = m
@@ -433,13 +451,19 @@ fn draw_msg(ui: &mut Ui, tokens: &rumble_widgets::Tokens, m: &ChatMsg) {
                 ui.label(RichText::new(body).color(tokens.text).font(tokens.font_body.clone()));
             }
             if let Some(media) = &m.media {
-                draw_media(ui, tokens, media);
+                draw_media(ui, tokens, media, backend, accepted_offers);
             }
         });
     });
 }
 
-fn draw_media(ui: &mut Ui, tokens: &rumble_widgets::Tokens, media: &Media) {
+fn draw_media<P: Platform + 'static>(
+    ui: &mut Ui,
+    tokens: &rumble_widgets::Tokens,
+    media: &Media,
+    backend: &BackendHandle<P>,
+    accepted_offers: &mut HashSet<String>,
+) {
     match media {
         Media::Image { name, size } => {
             ui.add_space(2.0);
@@ -471,44 +495,106 @@ fn draw_media(ui: &mut Ui, tokens: &rumble_widgets::Tokens, media: &Media) {
             );
         }
         Media::File { ext, name, size } => {
-            ui.add_space(2.0);
-            SurfaceFrame::new(SurfaceKind::Group)
-                .inner_margin(Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let (ico, _) = ui.allocate_exact_size(Vec2::new(36.0, 40.0), Sense::hover());
-                        ui.painter().add(RectShape::new(
-                            ico,
-                            CornerRadius::same(2),
-                            tokens.surface,
-                            Stroke::new(1.0, tokens.line_soft),
-                            StrokeKind::Inside,
-                        ));
-                        ui.painter().text(
-                            ico.center(),
-                            Align2::CENTER_CENTER,
-                            ext.as_str(),
-                            tokens.font_mono.clone(),
-                            tokens.text_muted,
-                        );
-                        ui.add_space(10.0);
-                        ui.vertical(|ui| {
+            draw_file_card(ui, tokens, ext, name, size, None);
+        }
+        Media::FileOffer {
+            ext,
+            name,
+            size,
+            transfer_id,
+            share_data,
+            is_own,
+        } => {
+            let action = if *is_own {
+                None
+            } else if accepted_offers.contains(transfer_id) {
+                Some(FileOfferAction::Accepted)
+            } else {
+                Some(FileOfferAction::Available)
+            };
+            let clicked = draw_file_card(ui, tokens, ext, name, size, action);
+            if clicked {
+                backend.send(Command::DownloadFile {
+                    share_data: share_data.clone(),
+                });
+                accepted_offers.insert(transfer_id.clone());
+            }
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum FileOfferAction {
+    Available,
+    Accepted,
+}
+
+fn draw_file_card(
+    ui: &mut Ui,
+    tokens: &rumble_widgets::Tokens,
+    ext: &str,
+    name: &str,
+    size: &str,
+    action: Option<FileOfferAction>,
+) -> bool {
+    let mut clicked = false;
+    ui.add_space(2.0);
+    SurfaceFrame::new(SurfaceKind::Group)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (ico, _) = ui.allocate_exact_size(Vec2::new(36.0, 40.0), Sense::hover());
+                ui.painter().add(RectShape::new(
+                    ico,
+                    CornerRadius::same(2),
+                    tokens.surface,
+                    Stroke::new(1.0, tokens.line_soft),
+                    StrokeKind::Inside,
+                ));
+                ui.painter().text(
+                    ico.center(),
+                    Align2::CENTER_CENTER,
+                    ext,
+                    tokens.font_mono.clone(),
+                    tokens.text_muted,
+                );
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(name)
+                            .color(tokens.text)
+                            .strong()
+                            .font(tokens.font_body.clone()),
+                    );
+                    ui.label(
+                        RichText::new(size)
+                            .color(tokens.text_muted)
+                            .font(tokens.font_mono.clone()),
+                    );
+                });
+                if let Some(action) = action {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| match action {
+                        FileOfferAction::Available => {
+                            if ButtonArgs::new("Download")
+                                .role(PressableRole::Default)
+                                .show(ui)
+                                .clicked()
+                            {
+                                clicked = true;
+                            }
+                        }
+                        FileOfferAction::Accepted => {
                             ui.label(
-                                RichText::new(name.as_str())
-                                    .color(tokens.text)
-                                    .strong()
-                                    .font(tokens.font_body.clone()),
-                            );
-                            ui.label(
-                                RichText::new(size.as_str())
+                                RichText::new("Downloading…")
                                     .color(tokens.text_muted)
                                     .font(tokens.font_mono.clone()),
                             );
-                        });
+                        }
                     });
-                });
-        }
-    }
+                }
+            });
+        });
+    clicked
 }
 
 // ---------- Composer ----------

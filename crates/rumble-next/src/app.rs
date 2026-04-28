@@ -299,6 +299,7 @@ impl eframe::App for App {
         // exactly when needed.
         let state = self.backend.state();
 
+        self.pump_auto_downloads(&state);
         self.pump_toasts(&state);
         self.pump_hotkeys(ctx, &state);
         self.pump_file_dialog();
@@ -900,6 +901,59 @@ impl App {
             self.play_sfx(rumble_client::SfxKind::Message);
         }
         self.prev_chat_count = count;
+    }
+
+    /// Auto-accept incoming `FileOffer` chat attachments that match the
+    /// user's `FileTransferSettings` rules. Walks the same `[prev..len]`
+    /// slice the SFX pump uses, so it benefits from the same first-
+    /// frame gate (we don't replay history when connecting to a server
+    /// that has a chat backlog).
+    ///
+    /// Skips offers we sent ourselves and offers the user has already
+    /// clicked Download on. Each accepted offer is recorded in
+    /// `Shell::accepted_offers` so the card flips to "Downloading…"
+    /// without waiting for the (still-TODO) live transfers panel.
+    fn pump_auto_downloads(&mut self, state: &rumble_protocol::State) {
+        let prev = self.prev_chat_count;
+        let count = state.chat_messages.len();
+        // First-frame gate: don't auto-accept historical offers replayed
+        // by the server when we first connect.
+        if prev == 0 || count <= prev {
+            return;
+        }
+        let settings = &self.settings.settings().file_transfer;
+        if !settings.auto_download_enabled {
+            return;
+        }
+        let my_username = state
+            .my_user_id
+            .and_then(|id| state.get_user(id))
+            .map(|u| u.username.clone());
+
+        for msg in &state.chat_messages[prev..] {
+            if msg.is_local {
+                continue;
+            }
+            let Some(rumble_protocol::ChatAttachment::FileOffer(offer)) = msg.attachment.as_ref() else {
+                continue;
+            };
+            if my_username.as_deref() == Some(msg.sender.as_str()) {
+                continue;
+            }
+            if !settings.should_auto_download(&offer.mime, offer.size) {
+                continue;
+            }
+            tracing::info!(
+                "auto-download: accepting offer {} ({} bytes, mime={})",
+                offer.name,
+                offer.size,
+                offer.mime
+            );
+            self.backend.send(Command::DownloadFile {
+                share_data: offer.share_data.clone(),
+            });
+            self.shell.mark_offer_accepted(offer.transfer_id.clone());
+        }
     }
 
     /// Bridge the composer's "share file" button to the OS file picker.
