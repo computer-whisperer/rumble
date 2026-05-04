@@ -7,15 +7,14 @@
 //! deeper UI (pipelines, ACL admin) can grow here incrementally.
 
 use eframe::egui::{self, Align, Layout, Margin, RichText, Ui};
-use rumble_client::{PipelineConfig, ProcessorRegistry, handle::BackendHandle};
-use rumble_client_traits::Platform;
+use rumble_client::{PipelineConfig, ProcessorRegistry};
 use rumble_desktop_shell::{PersistentVoiceMode, SettingsStore, TimestampFormat};
 use rumble_protocol::{AudioSettings, Command, ConnectionState, State, VoiceMode, permissions::Permissions};
 use rumble_widgets::{
     ButtonArgs, ComboBox, GroupBox, PressableRole, Radio, SurfaceFrame, SurfaceKind, TextRole, UiExt,
 };
 
-use crate::shell::Shell;
+use crate::{backend::UiBackend, shell::Shell};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SettingsCategory {
@@ -84,12 +83,12 @@ impl Default for SettingsCategory {
     }
 }
 
-pub fn render<P: Platform + 'static>(
+pub fn render<B: UiBackend>(
     ctx: &egui::Context,
     settings: &mut SettingsState,
     store: &mut SettingsStore,
     state: &State,
-    backend: &BackendHandle<P>,
+    backend: &B,
     processor_registry: &ProcessorRegistry,
     identity_public_key_hex: &str,
     shell: &mut Shell,
@@ -163,7 +162,7 @@ fn sidebar(ui: &mut Ui, settings: &mut SettingsState) {
     });
 }
 
-fn connection_page<P: Platform + 'static>(ui: &mut Ui, state: &State, backend: &BackendHandle<P>, shell: &mut Shell) {
+fn connection_page<B: UiBackend>(ui: &mut Ui, state: &State, backend: &B, shell: &mut Shell) {
     ui.label(
         RichText::new("Connection")
             .font(ui.theme().font(TextRole::Heading))
@@ -240,12 +239,7 @@ fn my_user(state: &State) -> Option<&rumble_protocol::proto::User> {
         .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(my_id))
 }
 
-fn voice_page<P: Platform + 'static>(
-    ui: &mut Ui,
-    state: &State,
-    backend: &BackendHandle<P>,
-    store: &mut SettingsStore,
-) {
+fn voice_page<B: UiBackend>(ui: &mut Ui, state: &State, backend: &B, store: &mut SettingsStore) {
     ui.label(RichText::new("Voice").font(ui.theme().font(TextRole::Heading)).strong());
     ui.add_space(6.0);
 
@@ -354,12 +348,7 @@ fn voice_page<P: Platform + 'static>(
 /// expected packet-loss percentage. Each change dispatches
 /// `Command::UpdateAudioSettings` and persists to the shell settings
 /// store so the next launch starts at the same place.
-fn encoder_group<P: Platform + 'static>(
-    ui: &mut Ui,
-    state: &State,
-    backend: &BackendHandle<P>,
-    store: &mut SettingsStore,
-) {
+fn encoder_group<B: UiBackend>(ui: &mut Ui, state: &State, backend: &B, store: &mut SettingsStore) {
     GroupBox::new("Audio quality (encoder)")
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
@@ -433,12 +422,7 @@ fn persistent_audio_from(
     }
 }
 
-fn devices_page<P: Platform + 'static>(
-    ui: &mut Ui,
-    state: &State,
-    backend: &BackendHandle<P>,
-    store: &mut SettingsStore,
-) {
+fn devices_page<B: UiBackend>(ui: &mut Ui, state: &State, backend: &B, store: &mut SettingsStore) {
     ui.label(
         RichText::new("Audio devices")
             .font(ui.theme().font(TextRole::Heading))
@@ -542,10 +526,10 @@ fn device_label(d: &rumble_protocol::AudioDeviceInfo) -> String {
 /// presence of a stage. The next frame's snapshot reflects the change,
 /// so the UI stays in lock-step with what the audio task is actually
 /// running — no "pending" buffer.
-fn processing_page<P: Platform + 'static>(
+fn processing_page<B: UiBackend>(
     ui: &mut Ui,
     state: &State,
-    backend: &BackendHandle<P>,
+    backend: &B,
     registry: &ProcessorRegistry,
     store: &mut SettingsStore,
 ) {
@@ -917,11 +901,11 @@ fn chat_page(ui: &mut Ui, store: &mut SettingsStore) {
         });
 }
 
-/// Files settings — auto-download rules, bandwidth caps, seed/cleanup
-/// flags. Most of these aren't yet consumed by the FileTransferPlugin
-/// — they're persisted today so the surface lands ahead of the
-/// plugin work, and so a settings file written by `rumble-egui`
-/// round-trips cleanly.
+/// Files settings — auto-download rules. Bandwidth caps and the
+/// seed/cleanup-on-exit flags exist in `FileTransferSettings` (so a
+/// settings file written by `rumble-egui` round-trips cleanly) but the
+/// relay plugin doesn't enforce them today, so they're not exposed
+/// here. Re-add them once the plugin actually honours the values.
 fn files_page(ui: &mut Ui, store: &mut SettingsStore) {
     ui.label(RichText::new("Files").font(ui.theme().font(TextRole::Heading)).strong());
     ui.add_space(6.0);
@@ -997,59 +981,9 @@ fn files_page(ui: &mut Ui, store: &mut SettingsStore) {
                 }
             });
         });
-
-    ui.add_space(8.0);
-    GroupBox::new("Bandwidth")
-        .inner_margin(Margin::symmetric(12, 10))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new("0 = unlimited.")
-                    .color(ui.theme().tokens().text_muted)
-                    .font(ui.theme().font(TextRole::Label)),
-            );
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Download (KB/s)");
-                let mut dl = (store.settings().file_transfer.download_speed_limit / 1024) as u32;
-                let before = dl;
-                ui.add(egui::Slider::new(&mut dl, 0..=10_000));
-                if dl != before {
-                    store.modify(|s| s.file_transfer.download_speed_limit = u64::from(dl) * 1024);
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Upload (KB/s)  ");
-                let mut up = (store.settings().file_transfer.upload_speed_limit / 1024) as u32;
-                let before = up;
-                ui.add(egui::Slider::new(&mut up, 0..=10_000));
-                if up != before {
-                    store.modify(|s| s.file_transfer.upload_speed_limit = u64::from(up) * 1024);
-                }
-            });
-        });
-
-    ui.add_space(8.0);
-    GroupBox::new("Behaviour")
-        .inner_margin(Margin::symmetric(12, 10))
-        .show(ui, |ui| {
-            let mut seed = store.settings().file_transfer.seed_after_download;
-            if ui
-                .checkbox(&mut seed, "Continue seeding after a download completes")
-                .changed()
-            {
-                store.modify(|s| s.file_transfer.seed_after_download = seed);
-            }
-            let mut cleanup = store.settings().file_transfer.cleanup_on_exit;
-            if ui
-                .checkbox(&mut cleanup, "Delete downloaded files when the app exits")
-                .changed()
-            {
-                store.modify(|s| s.file_transfer.cleanup_on_exit = cleanup);
-            }
-        });
 }
 
-fn statistics_page<P: Platform + 'static>(ui: &mut Ui, state: &State, backend: &BackendHandle<P>) {
+fn statistics_page<B: UiBackend>(ui: &mut Ui, state: &State, backend: &B) {
     ui.label(
         RichText::new("Statistics")
             .font(ui.theme().font(TextRole::Heading))
@@ -1174,12 +1108,7 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) {
 /// `SetUserGroup`. The page is always rendered (even without
 /// `MANAGE_ACL`) — the server rejects mutations without permission and
 /// the rejection toast is the right user-facing signal.
-fn admin_page<P: Platform + 'static>(
-    ui: &mut Ui,
-    state: &State,
-    backend: &BackendHandle<P>,
-    admin: &mut AdminPageState,
-) {
+fn admin_page<B: UiBackend>(ui: &mut Ui, state: &State, backend: &B, admin: &mut AdminPageState) {
     ui.label(RichText::new("Admin").font(ui.theme().font(TextRole::Heading)).strong());
     ui.add_space(6.0);
 

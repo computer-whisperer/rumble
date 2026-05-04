@@ -14,9 +14,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::backend::UiBackend;
 use eframe::egui::{self, Align, Layout, Margin, RichText, Ui};
-use rumble_client::handle::BackendHandle;
-use rumble_client_traits::Platform;
 use rumble_desktop_shell::{AcceptedCertificate, RecentServer, SettingsStore};
 use rumble_protocol::{Command, ConnectionState, State};
 use rumble_widgets::{ButtonArgs, GroupBox, PressableRole, SurfaceFrame, SurfaceKind, TextInput, TextRole, UiExt};
@@ -103,13 +102,13 @@ fn whoami_username() -> String {
         .unwrap_or_else(|_| "rumbler".to_string())
 }
 
-pub fn render<P: Platform + 'static>(
+pub fn render<B: UiBackend>(
     ui: &mut Ui,
     state: &State,
     form: &mut ConnectForm,
     settings: &mut SettingsStore,
     identity: &Identity,
-    backend: &BackendHandle<P>,
+    backend: &B,
 ) {
     form.init_if_needed(settings);
 
@@ -124,13 +123,13 @@ pub fn render<P: Platform + 'static>(
     });
 }
 
-fn connect_card<P: Platform + 'static>(
+fn connect_card<B: UiBackend>(
     ui: &mut Ui,
     state: &State,
     form: &mut ConnectForm,
     settings: &mut SettingsStore,
     identity: &Identity,
-    backend: &BackendHandle<P>,
+    backend: &B,
 ) {
     SurfaceFrame::new(SurfaceKind::Panel)
         .inner_margin(Margin::same(20))
@@ -263,13 +262,13 @@ fn or_unknown(s: &str) -> &str {
     if s.is_empty() { "—" } else { s }
 }
 
-fn server_form<P: Platform + 'static>(
+fn server_form<B: UiBackend>(
     ui: &mut Ui,
     state: &State,
     form: &mut ConnectForm,
     settings: &mut SettingsStore,
     identity: &Identity,
-    backend: &BackendHandle<P>,
+    backend: &B,
     saved_idx: Option<usize>,
 ) {
     let title = if saved_idx.is_some() {
@@ -386,11 +385,11 @@ fn server_form<P: Platform + 'static>(
         });
 }
 
-fn cert_prompt_card<P: Platform + 'static>(
+fn cert_prompt_card<B: UiBackend>(
     ui: &mut Ui,
     cert_info: &rumble_protocol::PendingCertificate,
     settings: &mut SettingsStore,
-    backend: &BackendHandle<P>,
+    backend: &B,
 ) {
     GroupBox::new("Untrusted certificate")
         .inner_margin(Margin::symmetric(14, 10))
@@ -445,11 +444,11 @@ fn persist_accepted_cert(settings: &mut SettingsStore, cert_info: &rumble_protoc
 /// `Command::Connect`. `auto_connect_addr` is set or cleared to match
 /// the form's checkbox: turning the toggle on for one server clears
 /// any previous choice.
-fn commit_and_connect<P: Platform + 'static>(
+fn commit_and_connect<B: UiBackend>(
     form: &mut ConnectForm,
     settings: &mut SettingsStore,
     identity: &Identity,
-    backend: &BackendHandle<P>,
+    backend: &B,
 ) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

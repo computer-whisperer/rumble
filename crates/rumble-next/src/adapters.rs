@@ -347,6 +347,18 @@ pub fn my_display_name(state: &State) -> Option<String> {
         .map(|u| u.username.clone())
 }
 
+/// Whether the server is muting our own user (auto on SPEAK-denied room
+/// join, or via moderator action). The audio task gates capture on this
+/// internally; the UI uses it to disable PTT and surface a "🔒" badge
+/// instead of a misleading active-PTT light.
+pub fn am_i_server_muted(state: &State) -> bool {
+    state
+        .my_user_id
+        .and_then(|id| state.get_user(id))
+        .map(|u| u.server_muted)
+        .unwrap_or(false)
+}
+
 pub fn peers_in_current_room(state: &State) -> usize {
     state.my_room_id.map(|rid| state.users_in_room(rid).len()).unwrap_or(0)
 }

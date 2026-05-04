@@ -2,9 +2,8 @@
 //! self-state controls, and an avatar pill. Two-column body: sidebar
 //! (server tree) + center (room header, chat, composer).
 
+use crate::backend::UiBackend;
 use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText, Stroke, Ui, epaint::RectShape};
-use rumble_client::handle::BackendHandle;
-use rumble_client_traits::Platform;
 use rumble_protocol::{Command, State};
 use rumble_widgets::{ButtonArgs, PressableRole, SurfaceFrame, SurfaceKind, UiExt};
 
@@ -13,7 +12,7 @@ use crate::{
     shell::{Shell, avatar_pill, room_header},
 };
 
-pub fn render<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
+pub fn render<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     top_bar(ui, shell, state, backend);
 
     let body = ui.available_rect_before_wrap();
@@ -39,7 +38,7 @@ pub fn render<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &Sta
     ui.advance_cursor_after_rect(body);
 }
 
-fn top_bar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
+fn top_bar<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     let server_name = match &state.connection {
         rumble_protocol::ConnectionState::Connected { server_name, .. } => server_name.clone(),
         _ => "disconnected".to_string(),
@@ -91,11 +90,12 @@ fn top_bar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
 
                 // Right-aligned self-state + avatar
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    avatar_pill(ui, &self_name);
+                    avatar_pill(ui, &self_name, state.audio.is_transmitting);
                     ui.add_space(6.0);
 
                     let muted = state.audio.self_muted;
                     let deafened = state.audio.self_deafened;
+                    let server_muted = adapters::am_i_server_muted(state);
                     let ptt_on = state.audio.is_transmitting;
 
                     // Disconnect / settings
@@ -124,10 +124,18 @@ fn top_bar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
                         backend.send(Command::SetDeafened { deafened: !deafened });
                     }
 
-                    if ButtonArgs::new("🎤")
+                    if ButtonArgs::new(if server_muted { "🔒" } else { "🎤" })
                         .role(PressableRole::Default)
-                        .active(muted)
+                        .active(muted || server_muted)
+                        .disabled(server_muted)
                         .show(ui)
+                        .on_hover_text(if server_muted {
+                            "Server muted — you cannot speak in this room"
+                        } else if muted {
+                            "Click to unmute"
+                        } else {
+                            "Click to mute"
+                        })
                         .clicked()
                     {
                         backend.send(Command::SetMuted { muted: !muted });
@@ -135,9 +143,11 @@ fn top_bar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
 
                     if ButtonArgs::new("PTT")
                         .role(PressableRole::Accent)
-                        .active(ptt_on)
+                        .active(ptt_on && !server_muted)
+                        .disabled(server_muted)
                         .show(ui)
                         .clicked()
+                        && !server_muted
                     {
                         backend.send(if ptt_on {
                             Command::StopTransmit
@@ -150,7 +160,7 @@ fn top_bar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
         });
 }
 
-fn sidebar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
+fn sidebar<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     ui.horizontal(|ui| {
         let tokens = ui.theme().tokens().clone();
         ui.add_space(14.0);
@@ -187,7 +197,7 @@ fn current_room_parent(state: &State) -> (Option<uuid::Uuid>, String) {
     }
 }
 
-fn center_column<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
+fn center_column<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     let rect = ui.available_rect_before_wrap();
 
     let composer_h = 56.0;

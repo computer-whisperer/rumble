@@ -4,6 +4,7 @@
 
 pub mod adapters;
 pub mod app;
+pub mod backend;
 pub mod connect_view;
 pub mod data;
 #[cfg(feature = "test-harness")]
@@ -14,6 +15,9 @@ pub mod settings_panel;
 pub mod shell;
 
 pub use app::{App, Paradigm};
+#[cfg(feature = "test-harness")]
+pub use backend::MockBackend;
+pub use backend::{NativeUiBackend, UiBackend};
 pub use rumble_desktop_shell::{ToastLevel, ToastManager};
 
 #[cfg(feature = "test-harness")]

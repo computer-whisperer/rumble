@@ -1,25 +1,31 @@
 # rumble-next: what's left
 
 Punch list for getting `rumble-next` to release-ready parity with
-`rumble-egui`. Ordered by user-visible impact. None of these are
-blocked; pick the topmost item and go. after checking an item off delete it if it is truely finished and will not need more attention.
+`rumble-egui`. After checking an item off, delete it if it is truly
+finished and will not need more attention.
 
-1. **Active transfers panel.** A toggleable window listing in-flight
-   uploads/downloads with per-transfer progress, cancel, and a "show
-   in folder" affordance once complete. Not yet built in either
-   client. Backend exposes transfer state via `state.transfers`
-   (verify on touch); UI needs a fresh design.
-2. **Incoming file prompt UI.** Offers that don't auto-download still
-   only render as an inline "Download" button on the chat card — no
-   modal/notification. Add an accept/deny prompt for offers that miss
-   every auto-download rule (and ideally a toast for ones that match,
-   once the transfers panel from §1 isn't carrying that load).
-3. **RPC server.** Unix-socket remote control, mirroring
+1. **RPC server.** Unix-socket remote control, mirroring
    `rumble-egui::rpc_client`. Lights up `harness-cli` automation
    against rumble-next.
-4. **Auto-download history-replay guard.** `App::pump_auto_downloads`
-   skips the very first batch (cold connect) via `prev_chat_count == 0`,
-   but a mid-session reconnect that replays history will re-trigger
-   downloads because `prev_chat_count` is already non-zero. Reset it on
-   disconnect, or track per-`transfer_id` "already auto-handled" so
-   replays are idempotent.
+2. **Harness parity.** `rumble-next` exposes an in-process
+   mock-backend `TestHarness` that can arrange backend `State`, open
+   settings pages, step frames, render screenshots, and inspect emitted
+   commands without starting networking or the audio pipeline. It still
+   lacks the fuller `rumble-egui` harness surface such as input
+   injection, query-by-label, click-widget helpers, and "run until
+   settled" helpers. Decide whether RPC server support makes this
+   redundant; otherwise grow the harness to parity.
+3. **Bandwidth caps / seed / cleanup-on-exit settings.** Currently
+   hidden from the Files settings page because the relay plugin
+   doesn't enforce them. Either wire them through to the plugin
+   (download/upload throttles, seed-after-completion lifetime,
+   delete-on-exit sweep) or accept that rumble-next will never
+   surface them and prune the fields from `FileTransferSettings`.
+
+# bugs
+
+- files sent in chat:
+  - no preview thumbnail on images (egui_extras image loaders aren't
+    installed yet; needs `egui_extras::install_image_loaders` plus
+    a thumb path in the file-offer card for `image/*` mimes that
+    have a downloaded `local_path`)

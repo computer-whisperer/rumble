@@ -4,18 +4,17 @@
 //! `paradigm::*`.
 //!
 //! `Shell` now reads from a live `State` snapshot and issues `Command`s
-//! via a `BackendHandle`. Per-frame flow: the app clones `State` once,
+//! via a `UiBackend`. Per-frame flow: the app clones `State` once,
 //! converts it via `crate::adapters`, and hands `(state, tree_nodes)` to
 //! the shell's render functions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::backend::UiBackend;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Pos2, RichText, ScrollArea, Sense, Stroke,
     StrokeKind, Ui, Vec2, epaint::RectShape,
 };
-use rumble_client::handle::BackendHandle;
-use rumble_client_traits::Platform;
 use rumble_protocol::{Command, State, permissions::Permissions, proto::RoomAclEntry};
 use rumble_widgets::{
     ButtonArgs, ComboBox, GroupBox, PressableRole, SurfaceFrame, SurfaceKind, TextInput, Tree, TreeNode, TreeNodeId,
@@ -118,6 +117,31 @@ pub enum PendingModal {
         /// while the user is editing.
         group_options: Vec<String>,
     },
+    /// Prompt for an incoming `FileOffer` that didn't match any
+    /// auto-download rule. Accept dispatches `Command::DownloadFile`;
+    /// Deny just closes the prompt (and marks the offer as handled
+    /// so a history replay doesn't re-prompt).
+    IncomingFileOffer {
+        transfer_id: String,
+        name: String,
+        size: u64,
+        mime: String,
+        share_data: String,
+        from: String,
+    },
+}
+
+/// Pending incoming-file prompt enqueued by `App::pump_auto_downloads`
+/// when an offer didn't match auto-download rules. Drained one-at-a-time
+/// into `Shell::modal` so the user sees them serially.
+#[derive(Clone, Debug)]
+pub struct OfferPrompt {
+    pub transfer_id: String,
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+    pub share_data: String,
+    pub from: String,
 }
 
 /// UI-local state that isn't part of the backend's `State` — caret
@@ -152,9 +176,31 @@ pub struct Shell {
     pub share_file_requested: bool,
     /// Transfer IDs the user has clicked "Download" on. Used to flip
     /// the file-offer card's button to a passive "Downloading…" label
-    /// once accepted, without waiting for the (still-TODO) transfers
-    /// panel to surface live progress.
+    /// once accepted, even before the transfer plugin has produced a
+    /// status entry for the new download.
     accepted_offers: HashSet<String>,
+    /// Visibility of the active transfers window. Toggled from the
+    /// composer's "transfers" button or auto-shown when the user
+    /// shares a file (so they immediately see progress).
+    pub transfers_open: bool,
+    /// Set when the user clicks "Open" or "Show in folder" on a
+    /// completed transfer. `App::update` drains the queue and spawns
+    /// the OS handler — `open::that` is blocking, so it runs off the
+    /// main thread.
+    pub pending_open: Vec<PendingOpen>,
+    /// Queue of incoming-file offers awaiting a manual accept/deny
+    /// decision. The shell pops one at a time into `modal` so users
+    /// see prompts serially rather than as a stack of dialogs.
+    queued_offer_prompts: VecDeque<OfferPrompt>,
+}
+
+/// What the user wants to do with a completed transfer's local file.
+#[derive(Clone, Debug)]
+pub enum PendingOpen {
+    /// Open the file with the platform's default handler.
+    File(std::path::PathBuf),
+    /// Reveal the file in the platform's file manager.
+    InFolder(std::path::PathBuf),
 }
 
 impl Shell {
@@ -184,6 +230,31 @@ impl Shell {
     pub fn mark_offer_accepted(&mut self, transfer_id: impl Into<String>) {
         self.accepted_offers.insert(transfer_id.into());
     }
+
+    /// Enqueue an incoming-file offer for a manual accept/deny prompt.
+    /// Called by `App::pump_auto_downloads` when an offer doesn't
+    /// match any auto-download rule.
+    pub fn queue_offer_prompt(&mut self, prompt: OfferPrompt) {
+        self.queued_offer_prompts.push_back(prompt);
+    }
+
+    /// Pop the next queued offer into `modal` if no other modal is
+    /// already open. Called once per frame by `render_overlays`.
+    fn drain_offer_queue(&mut self) {
+        if self.modal.is_some() {
+            return;
+        }
+        if let Some(p) = self.queued_offer_prompts.pop_front() {
+            self.modal = Some(PendingModal::IncomingFileOffer {
+                transfer_id: p.transfer_id,
+                name: p.name,
+                size: p.size,
+                mime: p.mime,
+                share_data: p.share_data,
+                from: p.from,
+            });
+        }
+    }
 }
 
 // ---------- Tree pane ----------
@@ -191,7 +262,7 @@ impl Shell {
 impl Shell {
     /// Render the nested channel/user tree. Emits `Command::JoinRoom`
     /// when a channel is double-clicked or activated via Enter.
-    pub fn tree_pane<P: Platform + 'static>(&mut self, ui: &mut Ui, state: &State, backend: &BackendHandle<P>) {
+    pub fn tree_pane<B: UiBackend>(&mut self, ui: &mut Ui, state: &State, backend: &B) {
         let (mut tree, id_map) = adapters::build_tree(state);
         if !self.tree_filter.trim().is_empty() {
             filter_tree(&mut tree, self.tree_filter.trim());
@@ -355,11 +426,17 @@ pub fn room_header(ui: &mut Ui, state: &State) {
 const AVATAR_SIZE: f32 = 24.0;
 
 impl Shell {
-    pub fn chat_stream<P: Platform + 'static>(&mut self, ui: &mut Ui, state: &State, backend: &BackendHandle<P>) {
+    pub fn chat_stream<B: UiBackend>(&mut self, ui: &mut Ui, state: &State, backend: &B) {
         let theme = ui.theme();
         let tokens = theme.tokens().clone();
 
         let entries = adapters::chat_entries(state, self.chat_timestamp_format);
+
+        // Snapshot once per frame: chat draw needs to look up live
+        // progress/local-path info per `FileOffer`, but hammering the
+        // plugin lock for every card is wasteful.
+        let transfer_index: HashMap<String, rumble_client_traits::file_transfer::TransferStatus> =
+            backend.transfers().into_iter().map(|s| (s.id.0.clone(), s)).collect();
 
         ScrollArea::vertical()
             .id_salt("rumble_next_chat")
@@ -378,7 +455,15 @@ impl Shell {
                 for entry in &entries {
                     match entry {
                         ChatEntry::Sys(m) => draw_sys(ui, &tokens, m),
-                        ChatEntry::Msg(m) => draw_msg(ui, &tokens, m, backend, &mut self.accepted_offers),
+                        ChatEntry::Msg(m) => draw_msg(
+                            ui,
+                            &tokens,
+                            m,
+                            backend,
+                            &mut self.accepted_offers,
+                            &transfer_index,
+                            &mut self.pending_open,
+                        ),
                     }
                 }
                 ui.add_space(10.0);
@@ -401,12 +486,14 @@ fn draw_sys(ui: &mut Ui, tokens: &rumble_widgets::Tokens, m: &SysMsg) {
     });
 }
 
-fn draw_msg<P: Platform + 'static>(
+fn draw_msg<B: UiBackend>(
     ui: &mut Ui,
     tokens: &rumble_widgets::Tokens,
     m: &ChatMsg,
-    backend: &BackendHandle<P>,
+    backend: &B,
     accepted_offers: &mut HashSet<String>,
+    transfer_index: &HashMap<String, rumble_client_traits::file_transfer::TransferStatus>,
+    pending_open: &mut Vec<PendingOpen>,
 ) {
     ui.horizontal_top(|ui| {
         let (avatar_rect, _) = ui.allocate_exact_size(Vec2::splat(AVATAR_SIZE), Sense::hover());
@@ -451,18 +538,28 @@ fn draw_msg<P: Platform + 'static>(
                 ui.label(RichText::new(body).color(tokens.text).font(tokens.font_body.clone()));
             }
             if let Some(media) = &m.media {
-                draw_media(ui, tokens, media, backend, accepted_offers);
+                draw_media(
+                    ui,
+                    tokens,
+                    media,
+                    backend,
+                    accepted_offers,
+                    transfer_index,
+                    pending_open,
+                );
             }
         });
     });
 }
 
-fn draw_media<P: Platform + 'static>(
+fn draw_media<B: UiBackend>(
     ui: &mut Ui,
     tokens: &rumble_widgets::Tokens,
     media: &Media,
-    backend: &BackendHandle<P>,
+    backend: &B,
     accepted_offers: &mut HashSet<String>,
+    transfer_index: &HashMap<String, rumble_client_traits::file_transfer::TransferStatus>,
+    pending_open: &mut Vec<PendingOpen>,
 ) {
     match media {
         Media::Image { name, size } => {
@@ -495,7 +592,7 @@ fn draw_media<P: Platform + 'static>(
             );
         }
         Media::File { ext, name, size } => {
-            draw_file_card(ui, tokens, ext, name, size, None);
+            let _ = draw_file_card(ui, tokens, ext, name, size, None);
         }
         Media::FileOffer {
             ext,
@@ -505,28 +602,57 @@ fn draw_media<P: Platform + 'static>(
             share_data,
             is_own,
         } => {
-            let action = if *is_own {
-                None
-            } else if accepted_offers.contains(transfer_id) {
-                Some(FileOfferAction::Accepted)
-            } else {
-                Some(FileOfferAction::Available)
+            // Choose card action based on what we know about the
+            // transfer. Priority order:
+            //   1. We have a live `TransferStatus` for this id →
+            //      surface progress / completion / error.
+            //   2. The user has clicked Download already → "Downloading…"
+            //      placeholder while the plugin spins up.
+            //   3. Default → "Download" button.
+            let status = transfer_index.get(transfer_id);
+            let action = match (is_own, status) {
+                (_, Some(s)) if s.is_finished && s.local_path.is_some() => {
+                    let path = s.local_path.clone().expect("checked above");
+                    Some(FileOfferAction::Completed { path })
+                }
+                (_, Some(s)) if s.error.is_some() => Some(FileOfferAction::Failed(s.error.clone().unwrap_or_default())),
+                (_, Some(s)) => Some(FileOfferAction::InProgress {
+                    progress: s.progress.clamp(0.0, 1.0),
+                }),
+                (true, None) => None,
+                (false, None) if accepted_offers.contains(transfer_id) => Some(FileOfferAction::Accepted),
+                (false, None) => Some(FileOfferAction::Available),
             };
-            let clicked = draw_file_card(ui, tokens, ext, name, size, action);
-            if clicked {
-                backend.send(Command::DownloadFile {
-                    share_data: share_data.clone(),
-                });
-                accepted_offers.insert(transfer_id.clone());
+            let result = draw_file_card(ui, tokens, ext, name, size, action);
+            match result {
+                FileOfferClick::Download => {
+                    backend.send(Command::DownloadFile {
+                        share_data: share_data.clone(),
+                    });
+                    accepted_offers.insert(transfer_id.clone());
+                }
+                FileOfferClick::Open(path) => pending_open.push(PendingOpen::File(path)),
+                FileOfferClick::ShowInFolder(path) => pending_open.push(PendingOpen::InFolder(path)),
+                FileOfferClick::None => {}
             }
         }
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 enum FileOfferAction {
     Available,
     Accepted,
+    InProgress { progress: f32 },
+    Completed { path: std::path::PathBuf },
+    Failed(String),
+}
+
+enum FileOfferClick {
+    None,
+    Download,
+    Open(std::path::PathBuf),
+    ShowInFolder(std::path::PathBuf),
 }
 
 fn draw_file_card(
@@ -536,8 +662,8 @@ fn draw_file_card(
     name: &str,
     size: &str,
     action: Option<FileOfferAction>,
-) -> bool {
-    let mut clicked = false;
+) -> FileOfferClick {
+    let mut click = FileOfferClick::None;
     ui.add_space(2.0);
     SurfaceFrame::new(SurfaceKind::Group)
         .inner_margin(Margin::symmetric(10, 8))
@@ -560,17 +686,30 @@ fn draw_file_card(
                 );
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
-                    ui.label(
+                    let title = ui.label(
                         RichText::new(name)
                             .color(tokens.text)
                             .strong()
                             .font(tokens.font_body.clone()),
                     );
+                    let title_resp = title.interact(Sense::click());
                     ui.label(
                         RichText::new(size)
                             .color(tokens.text_muted)
                             .font(tokens.font_mono.clone()),
                     );
+                    // If we have a path, surface it under the size and let
+                    // the user click the filename to open the file.
+                    if let Some(FileOfferAction::Completed { path }) = &action {
+                        ui.label(
+                            RichText::new(format!("Saved to {}", path.display()))
+                                .color(tokens.text_muted)
+                                .font(tokens.font_mono.clone()),
+                        );
+                        if title_resp.clicked() {
+                            click = FileOfferClick::Open(path.clone());
+                        }
+                    }
                 });
                 if let Some(action) = action {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| match action {
@@ -580,13 +719,38 @@ fn draw_file_card(
                                 .show(ui)
                                 .clicked()
                             {
-                                clicked = true;
+                                click = FileOfferClick::Download;
                             }
                         }
-                        FileOfferAction::Accepted => {
+                        FileOfferAction::Accepted | FileOfferAction::InProgress { .. } => {
+                            let label = match action {
+                                FileOfferAction::InProgress { progress } => {
+                                    format!("Downloading… {}%", (progress * 100.0).round() as u32)
+                                }
+                                _ => "Downloading…".to_string(),
+                            };
                             ui.label(
-                                RichText::new("Downloading…")
+                                RichText::new(label)
                                     .color(tokens.text_muted)
+                                    .font(tokens.font_mono.clone()),
+                            );
+                        }
+                        FileOfferAction::Completed { path } => {
+                            if ButtonArgs::new("Show in folder")
+                                .role(PressableRole::Ghost)
+                                .show(ui)
+                                .clicked()
+                            {
+                                click = FileOfferClick::ShowInFolder(path.clone());
+                            }
+                            if ButtonArgs::new("Open").role(PressableRole::Default).show(ui).clicked() {
+                                click = FileOfferClick::Open(path);
+                            }
+                        }
+                        FileOfferAction::Failed(err) => {
+                            ui.label(
+                                RichText::new(format!("Failed: {err}"))
+                                    .color(tokens.danger)
                                     .font(tokens.font_mono.clone()),
                             );
                         }
@@ -594,13 +758,13 @@ fn draw_file_card(
                 }
             });
         });
-    clicked
+    click
 }
 
 // ---------- Composer ----------
 
 impl Shell {
-    pub fn composer<P: Platform + 'static>(&mut self, ui: &mut Ui, state: &State, backend: &BackendHandle<P>) {
+    pub fn composer<B: UiBackend>(&mut self, ui: &mut Ui, state: &State, backend: &B) {
         let no_room = state.my_room_id.is_none();
         let no_text_permission = state
             .my_room_id
@@ -661,6 +825,15 @@ impl Shell {
                     {
                         self.share_file_requested = true;
                     }
+                    if ButtonArgs::new("📥 transfers")
+                        .role(PressableRole::Ghost)
+                        .active(self.transfers_open)
+                        .show(ui)
+                        .on_hover_text("Show active uploads and downloads")
+                        .clicked()
+                    {
+                        self.transfers_open = !self.transfers_open;
+                    }
 
                     let avail = ui.available_width() - 96.0;
                     let mut submitted: Option<String> = None;
@@ -713,7 +886,7 @@ impl Shell {
 /// - `/tree <text>` → `SendTreeChat` (broadcast to current room and
 ///   all descendant rooms).
 /// - `<text>` → `SendChat` to the current room.
-fn dispatch_composer<P: Platform + 'static>(state: &State, backend: &BackendHandle<P>, text: String) {
+fn dispatch_composer<B: UiBackend>(state: &State, backend: &B, text: String) {
     let trimmed = text.trim();
     if let Some(rest) = trimmed.strip_prefix("/msg ") {
         let mut parts = rest.splitn(2, char::is_whitespace);
@@ -765,15 +938,27 @@ fn find_user_by_name(state: &State, name: &str) -> Option<(u64, String)> {
 // ---------- Voice-state toggles ----------
 
 impl Shell {
-    pub fn voice_row<P: Platform + 'static>(&mut self, ui: &mut Ui, state: &State, backend: &BackendHandle<P>) {
+    pub fn voice_row<B: UiBackend>(&mut self, ui: &mut Ui, state: &State, backend: &B) {
         let muted = state.audio.self_muted;
         let deafened = state.audio.self_deafened;
+        let server_muted = adapters::am_i_server_muted(state);
+        // While server-muted the audio task suppresses capture, so
+        // `is_transmitting` correctly reads false — but we still gate
+        // the PTT button so clicks don't even attempt to start.
         let ptt_active = state.audio.is_transmitting;
 
-        if ButtonArgs::new("🎤 Mute")
+        if ButtonArgs::new(if server_muted { "🔒 Server muted" } else { "🎤 Mute" })
             .role(PressableRole::Default)
-            .active(muted)
+            .active(muted || server_muted)
+            .disabled(server_muted)
             .show(ui)
+            .on_hover_text(if server_muted {
+                "Server muted — you cannot speak in this room"
+            } else if muted {
+                "Click to unmute"
+            } else {
+                "Click to mute"
+            })
             .clicked()
         {
             backend.send(Command::SetMuted { muted: !muted });
@@ -792,9 +977,10 @@ impl Shell {
         // button is a mouse-friendly fallback.
         let ptt_resp = ButtonArgs::new("● PTT")
             .role(PressableRole::Accent)
-            .active(ptt_active)
+            .active(ptt_active && !server_muted)
+            .disabled(server_muted)
             .show(ui);
-        if ptt_resp.clicked() {
+        if ptt_resp.clicked() && !server_muted {
             if ptt_active {
                 backend.send(Command::StopTransmit);
             } else {
@@ -806,7 +992,7 @@ impl Shell {
 
 // ---------- Self / avatar pill ----------
 
-pub fn avatar_pill(ui: &mut Ui, name: &str) {
+pub fn avatar_pill(ui: &mut Ui, name: &str, talking: bool) {
     let theme = ui.theme();
     let tokens = theme.tokens().clone();
     let _ = rumble_widgets::Pressable::new(("avatar-pill", name))
@@ -837,11 +1023,175 @@ pub fn avatar_pill(ui: &mut Ui, name: &str) {
                 );
                 ui.add_space(6.0);
                 let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                ui.painter()
-                    .circle_filled(dot.center(), 4.0, Color32::from_rgb(0x2f, 0x85, 0x5a));
+                // Bright accent when transmitting, calm green otherwise —
+                // matches the PTT button so all "I'm live" indicators
+                // light up together.
+                let dot_color = if talking {
+                    tokens.accent
+                } else {
+                    Color32::from_rgb(0x2f, 0x85, 0x5a)
+                };
+                ui.painter().circle_filled(dot.center(), 4.0, dot_color);
                 ui.label(RichText::new(name).color(tokens.text).font(tokens.font_body.clone()));
             });
         });
+}
+
+// ---------- Transfers window ----------
+
+impl Shell {
+    /// Render the active transfers window if it's open. Lists
+    /// in-flight uploads and downloads with progress, byte counts,
+    /// and per-row actions. Called by `render_overlays` so it floats
+    /// above the paradigm body like other overlays.
+    pub fn render_transfers_window<B: UiBackend>(&mut self, ctx: &egui::Context, backend: &B) {
+        if !self.transfers_open {
+            return;
+        }
+        let mut open = true;
+        let transfers = backend.transfers();
+        egui::Window::new("Transfers")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(420.0)
+            .default_height(280.0)
+            .show(ctx, |ui| {
+                let tokens = ui.theme().tokens().clone();
+                if transfers.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("No active uploads or downloads.")
+                            .color(tokens.text_muted)
+                            .italics(),
+                    );
+                    return;
+                }
+                ScrollArea::vertical()
+                    .id_salt("rumble_next_transfers_list")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for status in &transfers {
+                            transfer_row(ui, &tokens, status, &mut self.pending_open, backend);
+                            ui.add_space(6.0);
+                        }
+                    });
+            });
+        // Toggle off if the user clicks the window's close ✕.
+        self.transfers_open = open;
+    }
+}
+
+fn transfer_row<B: UiBackend>(
+    ui: &mut Ui,
+    tokens: &rumble_widgets::Tokens,
+    status: &rumble_client_traits::file_transfer::TransferStatus,
+    pending_open: &mut Vec<PendingOpen>,
+    backend: &B,
+) {
+    use rumble_client_traits::file_transfer::PluginTransferState;
+    SurfaceFrame::new(SurfaceKind::Group)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&status.name)
+                            .color(tokens.text)
+                            .strong()
+                            .font(tokens.font_body.clone()),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let label = transfer_state_label(status);
+                        ui.label(
+                            RichText::new(label)
+                                .color(tokens.text_muted)
+                                .font(tokens.font_mono.clone()),
+                        );
+                    });
+                });
+                let progress = status.progress.clamp(0.0, 1.0);
+                ui.add(egui::ProgressBar::new(progress).desired_width(f32::INFINITY));
+                ui.label(
+                    RichText::new(transfer_byte_summary(status))
+                        .color(tokens.text_muted)
+                        .font(tokens.font_mono.clone()),
+                );
+                if let Some(err) = &status.error {
+                    ui.label(RichText::new(err).color(tokens.danger).font(tokens.font_mono.clone()));
+                }
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let id = &status.id;
+                    let is_active = !status.is_finished
+                        && !matches!(status.state, PluginTransferState::Error | PluginTransferState::Seeding);
+                    if ButtonArgs::new("Cancel")
+                        .role(PressableRole::Danger)
+                        .disabled(!is_active)
+                        .show(ui)
+                        .clicked()
+                    {
+                        if let Err(e) = backend.cancel_transfer(id, false) {
+                            tracing::warn!("cancel transfer {} failed: {e}", id.0);
+                        }
+                    }
+                    let path = status.local_path.clone();
+                    let can_open = status.is_finished && path.is_some();
+                    if ButtonArgs::new("Open")
+                        .role(PressableRole::Default)
+                        .disabled(!can_open)
+                        .show(ui)
+                        .on_hover_text("Open with the system default")
+                        .clicked()
+                        && let Some(p) = path.clone()
+                    {
+                        pending_open.push(PendingOpen::File(p));
+                    }
+                    if ButtonArgs::new("Show in folder")
+                        .role(PressableRole::Ghost)
+                        .disabled(!can_open)
+                        .show(ui)
+                        .clicked()
+                        && let Some(p) = path
+                    {
+                        pending_open.push(PendingOpen::InFolder(p));
+                    }
+                });
+            });
+        });
+}
+
+fn transfer_state_label(status: &rumble_client_traits::file_transfer::TransferStatus) -> String {
+    use rumble_client_traits::file_transfer::PluginTransferState;
+    let pct = (status.progress.clamp(0.0, 1.0) * 100.0).round() as u32;
+    match status.state {
+        _ if status.is_finished => "Done".into(),
+        PluginTransferState::Initializing => format!("Uploading · {pct}%"),
+        PluginTransferState::Downloading => format!("Downloading · {pct}%"),
+        PluginTransferState::Seeding => "Seeding".into(),
+        PluginTransferState::Paused => "Paused".into(),
+        PluginTransferState::Error => "Error".into(),
+    }
+}
+
+fn transfer_byte_summary(status: &rumble_client_traits::file_transfer::TransferStatus) -> String {
+    let done = (status.progress.clamp(0.0, 1.0) as f64 * status.size as f64) as u64;
+    format!("{} / {}", format_bytes(done), format_bytes(status.size))
+}
+
+fn format_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let n = n as f64;
+    if n >= GB {
+        format!("{:.1} GB", n / GB)
+    } else if n >= MB {
+        format!("{:.1} MB", n / MB)
+    } else if n >= KB {
+        format!("{:.1} KB", n / KB)
+    } else {
+        format!("{n:.0} B")
+    }
 }
 
 // ---------- Context menu + modals (overlays) ----------
@@ -850,24 +1200,19 @@ impl Shell {
     /// Render any open overlay: the right-click context menu on the
     /// tree, or a text-input modal for rename/create/ban/DM. Called by
     /// each paradigm after its main body so overlays float above it.
-    pub fn render_overlays<P: Platform + 'static>(
-        &mut self,
-        ctx: &egui::Context,
-        state: &State,
-        backend: &BackendHandle<P>,
-    ) {
+    pub fn render_overlays<B: UiBackend>(&mut self, ctx: &egui::Context, state: &State, backend: &B) {
+        // Promote queued incoming-file prompts into the modal slot
+        // before rendering, so the next pending prompt opens as soon
+        // as the previous one closes.
+        self.drain_offer_queue();
         // The context menu reads `state` to surface the live per-user
         // volume override; the modal needs `state` for username lookups.
         self.render_context_menu(ctx, state, backend);
         self.render_pending_modal(ctx, backend);
+        self.render_transfers_window(ctx, backend);
     }
 
-    fn render_context_menu<P: Platform + 'static>(
-        &mut self,
-        ctx: &egui::Context,
-        state: &State,
-        backend: &BackendHandle<P>,
-    ) {
+    fn render_context_menu<B: UiBackend>(&mut self, ctx: &egui::Context, state: &State, backend: &B) {
         let Some(menu) = self.context_menu.clone() else {
             return;
         };
@@ -1050,7 +1395,7 @@ impl Shell {
         }
     }
 
-    fn render_pending_modal<P: Platform + 'static>(&mut self, ctx: &egui::Context, backend: &BackendHandle<P>) {
+    fn render_pending_modal<B: UiBackend>(&mut self, ctx: &egui::Context, backend: &B) {
         let Some(modal) = self.modal.as_mut() else {
             return;
         };
@@ -1098,6 +1443,10 @@ impl Shell {
             PendingModal::EditAcls { .. } => {
                 title = "Edit ACLs";
                 primary_label = "Save";
+            }
+            PendingModal::IncomingFileOffer { .. } => {
+                title = "Incoming file";
+                primary_label = "Accept";
             }
         }
 
@@ -1355,27 +1704,85 @@ impl Shell {
                             .color(ui.theme().tokens().text),
                     );
                     ui.add_space(6.0);
+                    // `submit_on_enter` clears the buffer and surfaces the
+                    // typed text via `resp.submitted`; if we don't read it
+                    // here, Enter just eats the message.
+                    let mut enter_body: Option<String> = None;
                     GroupBox::new("Text")
                         .inner_margin(Margin::symmetric(10, 8))
                         .show(ui, |ui| {
-                            TextInput::new(text)
+                            let resp = TextInput::new(text)
                                 .placeholder("write a direct message…")
                                 .desired_width(320.0)
                                 .submit_on_enter(true)
                                 .show(ui);
+                            enter_body = resp.submitted.filter(|s| !s.trim().is_empty());
                         });
                     ui.add_space(8.0);
-                    let can_submit = !text.trim().is_empty();
+                    let target_id = *user_id;
                     let target_name = username.clone();
+                    if let Some(body) = enter_body {
+                        submit = Some(Command::SendDirectMessage {
+                            target_user_id: target_id,
+                            target_username: target_name.clone(),
+                            text: body.trim().to_string(),
+                        });
+                    }
+                    let trimmed = text.trim().to_string();
+                    let can_submit = !trimmed.is_empty();
                     modal_buttons(ui, primary_label, can_submit, &mut close, |go| {
                         if go {
                             submit = Some(Command::SendDirectMessage {
-                                target_user_id: *user_id,
+                                target_user_id: target_id,
                                 target_username: target_name.clone(),
-                                text: text.trim().to_string(),
+                                text: trimmed.clone(),
                             });
                         }
                     });
+                }
+                PendingModal::IncomingFileOffer {
+                    transfer_id,
+                    name,
+                    size,
+                    mime,
+                    share_data,
+                    from,
+                } => {
+                    let tokens = ui.theme().tokens().clone();
+                    ui.label(
+                        RichText::new(format!("{from} wants to send you a file"))
+                            .strong()
+                            .color(tokens.text),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(name.as_str())
+                            .color(tokens.text)
+                            .font(tokens.font_body.clone()),
+                    );
+                    ui.label(
+                        RichText::new(format!("{} · {}", format_bytes(*size), mime))
+                            .color(tokens.text_muted)
+                            .font(tokens.font_mono.clone()),
+                    );
+                    ui.add_space(8.0);
+                    let share_for_submit = share_data.clone();
+                    let id_for_accept = transfer_id.clone();
+                    modal_buttons(ui, primary_label, true, &mut close, |go| {
+                        if go {
+                            submit = Some(Command::DownloadFile {
+                                share_data: share_for_submit.clone(),
+                            });
+                        }
+                    });
+                    // Mark the offer as accepted on Accept so the chat
+                    // card flips to "Downloading…" immediately. Deny
+                    // (Cancel) is a no-op beyond closing — `App` already
+                    // tracked this id in `auto_handled_offers` so a
+                    // history replay won't re-prompt.
+                    if submit.is_some() {
+                        self.accepted_offers.insert(id_for_accept);
+                    }
                 }
             });
 
@@ -1432,9 +1839,9 @@ fn effective_perms_in_current_room(state: &State) -> Permissions {
 /// room reparents (Into → child of target; Above/Below → sibling of
 /// target). Server validates that the source is movable; we just emit
 /// the command.
-fn handle_room_drop<P: Platform + 'static>(
+fn handle_room_drop<B: UiBackend>(
     state: &State,
-    backend: &BackendHandle<P>,
+    backend: &B,
     id_map: &HashMap<TreeNodeId, NodeRef>,
     drop: rumble_widgets::DropEvent,
 ) {

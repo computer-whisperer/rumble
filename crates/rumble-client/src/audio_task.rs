@@ -78,6 +78,10 @@ pub enum AudioCommand {
     SetMuted { muted: bool },
     /// Set self-deafened state.
     SetDeafened { deafened: bool },
+    /// Set server-muted state. Tracked separately from `SetMuted` so the
+    /// user's own self-mute preference isn't clobbered when the server
+    /// flips its mute on/off (e.g. moving in/out of a SPEAK-denied room).
+    SetServerMuted { muted: bool },
     /// Mute a specific user locally.
     MuteUser { user_id: u64 },
     /// Unmute a specific user locally.
@@ -136,6 +140,7 @@ impl std::fmt::Debug for AudioCommand {
             AudioCommand::SetDeafened { deafened } => {
                 f.debug_struct("SetDeafened").field("deafened", deafened).finish()
             }
+            AudioCommand::SetServerMuted { muted } => f.debug_struct("SetServerMuted").field("muted", muted).finish(),
             AudioCommand::MuteUser { user_id } => f.debug_struct("MuteUser").field("user_id", user_id).finish(),
             AudioCommand::UnmuteUser { user_id } => f.debug_struct("UnmuteUser").field("user_id", user_id).finish(),
             AudioCommand::RefreshDevices => write!(f, "RefreshDevices"),
@@ -517,6 +522,11 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
     let mut self_muted = false;
     let mut self_deafened = false;
     let mut ptt_active = false;
+    // Server-imposed mute (SPEAK denied, or moderator action).
+    // Treated identically to `self_muted` for capture gating, but tracked
+    // separately so unmuting on the server doesn't clobber the user's
+    // chosen self-mute state.
+    let mut server_muted = false;
 
     // Per-user local mutes
     let mut muted_users: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -619,8 +629,14 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
     /// Note: VAD is a pipeline processor, not a voice mode. In Continuous mode
     /// with VAD enabled, the pipeline's suppress flag gates actual transmission.
     #[inline]
-    fn should_capture(voice_mode: VoiceMode, self_muted: bool, ptt_active: bool, connected: bool) -> bool {
-        if !connected || self_muted {
+    fn should_capture(
+        voice_mode: VoiceMode,
+        self_muted: bool,
+        server_muted: bool,
+        ptt_active: bool,
+        connected: bool,
+    ) -> bool {
+        if !connected || self_muted || server_muted {
             return false;
         }
         match voice_mode {
@@ -654,7 +670,7 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
     /// the audio input stream.
     macro_rules! sync_transmission {
         () => {{
-            let want = should_capture(voice_mode, self_muted, ptt_active, connection.is_some());
+            let want = should_capture(voice_mode, self_muted, server_muted, ptt_active, connection.is_some());
 
             if want && !capture_is_active {
                 capture_is_active = true;
@@ -766,8 +782,10 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                             *guard = None;
                         }
 
-                        // Reset PTT state on disconnect
+                        // Reset PTT and server-muted state on disconnect so
+                        // the next connection starts clean.
                         ptt_active = false;
+                        server_muted = false;
 
                         // Clear talking users
                         {
@@ -924,6 +942,39 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                             sync_transmission!();
                         } else {
                             sync_transmission!();
+                        }
+                    }
+
+                    AudioCommand::SetServerMuted { muted } => {
+                        if server_muted == muted {
+                            // No-op fast path — UserStatusChanged broadcasts hit
+                            // every frame in some flows; don't churn the stream.
+                        } else {
+                            server_muted = muted;
+                            // Stream lifecycle mirrors `SetMuted`: while server-
+                            // muted, drop the input stream so the mic isn't
+                            // captured at all.
+                            if muted {
+                                sync_transmission!();
+                                stop_transmission::<P>(&mut audio_input, &state, &repaint);
+                            } else if connection.is_some() && !self_muted && audio_input.is_none() {
+                                start_transmission::<P>(
+                                    &audio_backend,
+                                    &selected_input,
+                                    &encoded_tx,
+                                    &audio_settings,
+                                    &tx_pipeline_config,
+                                    &processor_registry,
+                                    &encoder,
+                                    &mut audio_input,
+                                    &state,
+                                    &repaint,
+                                    &audio_dumper,
+                                );
+                                sync_transmission!();
+                            } else {
+                                sync_transmission!();
+                            }
                         }
                     }
 

@@ -1,9 +1,8 @@
 //! "Luna" paradigm — Windows XP-flavoured chrome (bevelled toolbar,
 //! green Connect, amber latched buttons, red danger). Uses LunaTheme.
 
+use crate::backend::UiBackend;
 use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText, Stroke, Ui, epaint::RectShape};
-use rumble_client::handle::BackendHandle;
-use rumble_client_traits::Platform;
 use rumble_protocol::{Command, ConnectionState, State};
 use rumble_widgets::{ButtonArgs, PressableRole, SurfaceFrame, SurfaceKind, UiExt};
 
@@ -12,7 +11,7 @@ use crate::{
     shell::{Shell, room_header},
 };
 
-pub fn render<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
+pub fn render<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     toolbar(ui, shell, state, backend);
 
     let rect = ui.available_rect_before_wrap();
@@ -53,7 +52,7 @@ pub fn render<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &Sta
     ui.advance_cursor_after_rect(rect);
 }
 
-fn toolbar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
+fn toolbar<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     SurfaceFrame::new(SurfaceKind::Toolbar)
         .inner_margin(Margin::symmetric(6, 4))
         .show(ui, |ui| {
@@ -89,15 +88,9 @@ fn toolbar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
                     shell.settings_open = !shell.settings_open;
                 }
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let tokens = ui.theme().tokens().clone();
-                    let who = adapters::my_display_name(state).unwrap_or_else(|| "—".into());
-                    ui.label(
-                        RichText::new(format!("{who} · {}", adapters::connection_summary(state)))
-                            .color(tokens.text_muted)
-                            .font(tokens.font_body.clone()),
-                    );
-                });
+                // Connection state and username already live on the
+                // paradigm-picker bar above and the bottom statusbar;
+                // showing them in the toolbar too just duplicated info.
             });
         });
 }
@@ -127,7 +120,7 @@ fn side_header(ui: &mut Ui) {
         });
 }
 
-fn center_column<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
+fn center_column<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     let rect = ui.available_rect_before_wrap();
     let composer_h = 56.0;
     let header_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 64.0));

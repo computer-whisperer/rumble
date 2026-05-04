@@ -50,6 +50,7 @@ use rumble_client_traits::{
     AudioBackend, FileTransferPlugin, Platform, StreamHeader,
     auth::{send_envelope, wait_for_auth_result, wait_for_server_hello},
     cert::{CapturedCert, is_cert_error_message, new_captured_cert, take_captured_cert},
+    file_transfer::{TransferId, TransferStatus},
     transport::{BiStreamHandle, TlsConfig, Transport, TransportRecvStream},
 };
 use rumble_protocol::{
@@ -78,6 +79,12 @@ pub struct BackendHandle<P: Platform> {
     command_tx: mpsc::UnboundedSender<Command>,
     /// Handle to send commands to the audio task.
     audio_task: AudioTaskHandle,
+    /// Active file transfer plugin, when connected. The connection
+    /// task installs this when the QUIC handshake completes and
+    /// clears it on disconnect / connection loss. Read by the UI
+    /// to enumerate / cancel / locate transfers without going
+    /// through the command channel.
+    file_transfer: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
     /// Background thread running the tokio runtime for connection task.
     _runtime_thread: std::thread::JoinHandle<()>,
     /// Connection configuration (certificates, etc.). stored incase we want to inspect it later.
@@ -180,6 +187,7 @@ impl<P: Platform> BackendHandle<P> {
         };
 
         let state = Arc::new(RwLock::new(state));
+        let file_transfer: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>> = Arc::new(RwLock::new(None));
 
         // Spawn the audio task (runs on its own thread)
         let audio_task = spawn_audio_task::<P>(AudioTaskConfig {
@@ -194,6 +202,7 @@ impl<P: Platform> BackendHandle<P> {
         let config_for_task = connect_config.clone();
         let audio_task_for_connection = audio_task.clone();
         let command_tx_for_task = command_tx.clone();
+        let file_transfer_for_task = file_transfer.clone();
 
         // Spawn background thread with tokio runtime for connection task
         let runtime_thread = std::thread::spawn(move || {
@@ -206,6 +215,7 @@ impl<P: Platform> BackendHandle<P> {
                     repaint_for_task,
                     config_for_task,
                     audio_task_for_connection,
+                    file_transfer_for_task,
                 )
                 .await;
             });
@@ -215,6 +225,7 @@ impl<P: Platform> BackendHandle<P> {
             state,
             command_tx,
             audio_task,
+            file_transfer,
             _runtime_thread: runtime_thread,
             _connect_config: connect_config,
             sfx_library: crate::sfx::SfxLibrary::new(),
@@ -371,6 +382,41 @@ impl<P: Platform> BackendHandle<P> {
     pub fn my_room_id(&self) -> Option<Uuid> {
         read_state(&self.state).my_room_id
     }
+
+    /// Snapshot the current set of file transfers (uploads + downloads).
+    /// Returns an empty vec when no plugin is installed (i.e. while
+    /// disconnected). The plugin's own internal lock is held briefly.
+    pub fn transfers(&self) -> Vec<TransferStatus> {
+        let guard = match self.file_transfer.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.as_ref().map(|ft| ft.transfers()).unwrap_or_default()
+    }
+
+    /// Cancel an in-flight transfer. `delete_files=true` also removes
+    /// any partially-downloaded data from disk.
+    pub fn cancel_transfer(&self, id: &TransferId, delete_files: bool) -> anyhow::Result<()> {
+        let guard = match self.file_transfer.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match guard.as_ref() {
+            Some(ft) => ft.cancel(id, delete_files),
+            None => anyhow::bail!("file transfer plugin not available (not connected)"),
+        }
+    }
+
+    /// Local file path for a completed transfer, if known. Used by the
+    /// UI's "show in folder" / "open" affordances on the transfers
+    /// panel and the chat-card download button.
+    pub fn transfer_file_path(&self, id: &TransferId) -> Option<std::path::PathBuf> {
+        let guard = match self.file_transfer.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.as_ref().and_then(|ft| ft.get_file_path(id).ok())
+    }
 }
 
 /// Acquire a read lock on the state, recovering from lock poisoning.
@@ -410,12 +456,23 @@ async fn run_connection_task<P: Platform>(
     repaint: Arc<dyn Fn() + Send + Sync>,
     config: ConnectConfig,
     audio_task: AudioTaskHandle,
+    file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
 ) {
     // Connection state
     let mut transport: Option<P::Transport> = None;
     let mut client_name = String::new();
     let mut _session_identity: Option<SessionIdentity> = None;
     let mut file_transfer: Option<Arc<dyn FileTransferPlugin>> = None;
+    // Write the active plugin into the shared slot so the UI thread
+    // can call `transfers()` / `cancel()` / `get_file_path()` directly
+    // without going through the command channel.
+    let publish_ft = |ft: &Option<Arc<dyn FileTransferPlugin>>| {
+        let mut slot = match file_transfer_slot.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *slot = ft.clone();
+    };
 
     loop {
         tokio::select! {
@@ -503,8 +560,11 @@ async fn run_connection_task<P: Platform>(
                                     }
                                 }
 
-                                // Keep a reference for room-change updates
+                                // Keep a reference for room-change updates,
+                                // and publish to the shared slot so UI threads
+                                // can call into the plugin.
                                 file_transfer = ft_arc.clone();
+                                publish_ft(&file_transfer);
 
                                 let ft_for_dispatch: Option<Arc<dyn FileTransferPlugin>> = ft_arc.clone();
 
@@ -514,8 +574,9 @@ async fn run_connection_task<P: Platform>(
                                 let audio_task_clone = audio_task.clone();
                                 let command_tx_clone = command_tx.clone();
                                 let ft_for_recv = ft_arc;
+                                let ft_slot_for_recv = file_transfer_slot.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv).await;
+                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv, ft_slot_for_recv).await;
                                 });
 
                                 // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -662,8 +723,11 @@ async fn run_connection_task<P: Platform>(
                                         }
                                     }
 
-                                    // Keep a reference for room-change updates
+                                    // Keep a reference for room-change updates,
+                                    // and publish to the shared slot so UI threads
+                                    // can call into the plugin.
                                     file_transfer = ft_arc.clone();
+                                    publish_ft(&file_transfer);
 
                                     let ft_for_dispatch: Option<Arc<dyn FileTransferPlugin>> = ft_arc.clone();
 
@@ -673,8 +737,9 @@ async fn run_connection_task<P: Platform>(
                                     let audio_task_clone = audio_task.clone();
                                     let command_tx_clone = command_tx.clone();
                                     let ft_for_recv = ft_arc;
+                                    let ft_slot_for_recv = file_transfer_slot.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv).await;
+                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv, ft_slot_for_recv).await;
                                     });
 
                                     // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -719,6 +784,7 @@ async fn run_connection_task<P: Platform>(
                             t.close().await;
                         }
                         file_transfer = None;
+                        publish_ft(&file_transfer);
                         {
                             let mut s = write_state(&state);
                             s.connection = ConnectionState::Disconnected;
@@ -1436,6 +1502,7 @@ async fn run_receiver_task(
     audio_task: AudioTaskHandle,
     command_tx: mpsc::UnboundedSender<Command>,
     file_transfer: Option<Arc<dyn FileTransferPlugin>>,
+    file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
 ) {
     loop {
         match recv.recv().await {
@@ -1457,6 +1524,16 @@ async fn run_receiver_task(
 
     // Notify audio task
     audio_task.send(AudioCommand::ConnectionClosed);
+
+    // Clear the shared file-transfer slot so UI accessors stop returning
+    // statuses for a connection that no longer exists.
+    {
+        let mut slot = match file_transfer_slot.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *slot = None;
+    }
 
     // Update state only if not already disconnected (explicit disconnect sets Disconnected)
     {
@@ -1585,6 +1662,17 @@ fn handle_server_message(
                             }
                         }
 
+                        // Sync our own server-muted state to the audio task on
+                        // initial connect — without this, joining a SPEAK-denied
+                        // room before the first frame would leave the mic
+                        // capturing even though the server is dropping packets.
+                        let my_server_muted = s.my_user_id.and_then(|id| {
+                            ss.users
+                                .iter()
+                                .find(|u| u.user_id.as_ref().map(|x| x.value) == Some(id))
+                                .map(|u| u.server_muted)
+                        });
+
                         // Notify audio task about users in our room (for proactive decoder creation)
                         if let Some(my_room_id) = &s.my_room_id {
                             let my_user_id = s.my_user_id;
@@ -1606,6 +1694,9 @@ fn handle_server_message(
                             audio_task.send(AudioCommand::RoomChanged { user_ids_in_room });
                         } else {
                             drop(s);
+                        }
+                        if let Some(muted) = my_server_muted {
+                            audio_task.send(AudioCommand::SetServerMuted { muted });
                         }
                         // Still do client-side recalculation as fallback
                         recalculate_effective_permissions(state);
@@ -1940,15 +2031,28 @@ fn apply_state_update(
             }
             proto::state_update::Update::UserStatusChanged(usc) => {
                 if let Some(uid) = usc.user_id {
+                    let my_user_id = s.my_user_id;
                     if let Some(user) = s
                         .users
                         .iter_mut()
                         .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
                     {
+                        let prev_server_muted = user.server_muted;
                         user.is_muted = usc.is_muted;
                         user.is_deafened = usc.is_deafened;
                         user.server_muted = usc.server_muted;
                         user.is_elevated = usc.is_elevated;
+                        // Propagate our own server_muted flips to the audio
+                        // task so it stops capturing instead of just sending
+                        // packets the server will drop.
+                        if my_user_id == Some(uid.value) && prev_server_muted != usc.server_muted {
+                            drop(s);
+                            audio_task.send(AudioCommand::SetServerMuted {
+                                muted: usc.server_muted,
+                            });
+                            repaint();
+                            return;
+                        }
                     }
                 }
             }

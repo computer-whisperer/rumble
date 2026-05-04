@@ -39,6 +39,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1.0"
 arboard = "3"
 rfd = "0.16"
+open = "5"
 egui_kittest = { version = "0.33", features = ["wgpu", "eframe"], optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 

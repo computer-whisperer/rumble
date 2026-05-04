@@ -18,6 +18,7 @@ use rumble_desktop_shell::{
 };
 
 use crate::{
+    backend::{NativeUiBackend, UiBackend},
     connect_view::{self, ConnectForm},
     identity::{Identity, default_config_dir},
     paradigm,
@@ -25,9 +26,7 @@ use crate::{
     shell::Shell,
 };
 
-type NativeBackend = BackendHandle<rumble_desktop::NativePlatform>;
-
-pub struct App {
+pub struct App<B = NativeUiBackend> {
     pub paradigm: Paradigm,
     pub dark: bool,
     /// Last installed `(paradigm, dark)` pair — re-install the theme
@@ -36,7 +35,7 @@ pub struct App {
     pub shell: Shell,
     pub form: ConnectForm,
     pub identity: Identity,
-    pub backend: NativeBackend,
+    pub backend: B,
     /// Dispatch `Command::Connect` once, on the first frame. Set via
     /// `RUMBLE_NEXT_AUTOCONNECT=1`; lets us smoke-test connected UI
     /// headlessly.
@@ -88,6 +87,15 @@ pub struct App {
     /// the polling step in `update` consumes the result and dispatches
     /// `Command::ShareFile`.
     pending_file_dialog: Option<tokio::task::JoinHandle<Option<std::path::PathBuf>>>,
+    /// `transfer_id`s we have already routed through the auto-download
+    /// flow this session. Mid-session reconnects (or on-demand history
+    /// replays) re-emit the same offer; without this guard each replay
+    /// would kick off another download. Cleared on connection drop.
+    auto_handled_offers: std::collections::HashSet<String>,
+    /// Last room we observed ourselves in. Diff against `state.my_room_id`
+    /// each frame to spot room joins and (optionally) request chat
+    /// history for the new room.
+    prev_my_room_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -143,25 +151,30 @@ impl ConnectionKind {
     }
 }
 
-impl App {
+struct InitialState {
+    identity: Identity,
+    first_run_state: FirstRunState,
+    settings: SettingsStore,
+    paradigm: Paradigm,
+    dark: bool,
+}
+
+impl App<NativeUiBackend> {
     pub fn new(cc: &eframe::CreationContext<'_>) -> std::io::Result<Self> {
-        let config_dir = default_config_dir();
-        let identity = Identity::load(&config_dir)?;
-        let first_run_state = if identity.needs_setup() {
-            FirstRunState::SelectMethod
-        } else {
-            FirstRunState::NotNeeded
-        };
+        let initial = Self::load_initial_state()?;
+        let config = Self::connect_config_from_settings(&initial.settings);
 
-        let settings = SettingsStore::load_from_path(Some(config_dir.join("desktop-shell.json")));
-        let paradigm = settings
-            .settings()
-            .paradigm
-            .as_deref()
-            .and_then(Paradigm::from_persist_str)
-            .unwrap_or(Paradigm::Modern);
-        let dark = settings.settings().dark;
+        let ctx_for_repaint = cc.egui_ctx.clone();
+        let backend = BackendHandle::with_config(
+            move || {
+                ctx_for_repaint.request_repaint();
+            },
+            config,
+        );
+        Self::from_initial_state(cc, NativeUiBackend::new(backend), initial)
+    }
 
+    fn connect_config_from_settings(settings: &SettingsStore) -> ConnectConfig {
         let mut config = ConnectConfig::new();
         // Convenience: trust dev certs checked into the repo so the
         // first-connect flow doesn't require hand-approval when running
@@ -186,15 +199,48 @@ impl App {
                 ),
             }
         }
+        config
+    }
+}
 
-        let ctx_for_repaint = cc.egui_ctx.clone();
-        let backend = BackendHandle::with_config(
-            move || {
-                ctx_for_repaint.request_repaint();
-            },
-            config,
-        );
+impl<B: UiBackend> App<B> {
+    fn load_initial_state() -> std::io::Result<InitialState> {
+        let config_dir = default_config_dir();
+        let identity = Identity::load(&config_dir)?;
+        let first_run_state = if identity.needs_setup() {
+            FirstRunState::SelectMethod
+        } else {
+            FirstRunState::NotNeeded
+        };
 
+        let settings = SettingsStore::load_from_path(Some(config_dir.join("desktop-shell.json")));
+        let paradigm = settings
+            .settings()
+            .paradigm
+            .as_deref()
+            .and_then(Paradigm::from_persist_str)
+            .unwrap_or(Paradigm::Modern);
+        let dark = settings.settings().dark;
+
+        Ok(InitialState {
+            identity,
+            first_run_state,
+            settings,
+            paradigm,
+            dark,
+        })
+    }
+
+    pub fn new_with_backend(cc: &eframe::CreationContext<'_>, backend: B) -> std::io::Result<Self> {
+        let initial = Self::load_initial_state()?;
+        Self::from_initial_state(cc, backend, initial)
+    }
+
+    fn from_initial_state(
+        _cc: &eframe::CreationContext<'_>,
+        backend: B,
+        initial: InitialState,
+    ) -> std::io::Result<Self> {
         let mut processor_registry = ProcessorRegistry::new();
         register_builtin_processors(&mut processor_registry);
 
@@ -203,12 +249,12 @@ impl App {
         // launch reverts to default encoder settings, system-default
         // input/output devices, PTT mode, and the stock TX pipeline —
         // even if the user changed them in a prior session.
-        let persistent_audio = &settings.settings().audio;
+        let persistent_audio = &initial.settings.settings().audio;
         backend.send(Command::UpdateAudioSettings {
             settings: AudioSettings::from(persistent_audio),
         });
         backend.send(Command::SetVoiceMode {
-            mode: VoiceMode::from(settings.settings().voice_mode),
+            mode: VoiceMode::from(initial.settings.settings().voice_mode),
         });
         let tx_pipeline_config = match &persistent_audio.tx_pipeline {
             Some(stored) => merge_with_default_tx_pipeline(stored, &processor_registry),
@@ -217,14 +263,14 @@ impl App {
         backend.send(Command::UpdateTxPipeline {
             config: tx_pipeline_config,
         });
-        if settings.settings().input_device_id.is_some() {
+        if initial.settings.settings().input_device_id.is_some() {
             backend.send(Command::SetInputDevice {
-                device_id: settings.settings().input_device_id.clone(),
+                device_id: initial.settings.settings().input_device_id.clone(),
             });
         }
-        if settings.settings().output_device_id.is_some() {
+        if initial.settings.settings().output_device_id.is_some() {
             backend.send(Command::SetOutputDevice {
-                device_id: settings.settings().output_device_id.clone(),
+                device_id: initial.settings.settings().output_device_id.clone(),
             });
         }
 
@@ -237,7 +283,7 @@ impl App {
         let auto_connect_pending = std::env::var("RUMBLE_NEXT_AUTOCONNECT")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
-            || settings.settings().auto_connect_addr.is_some();
+            || initial.settings.settings().auto_connect_addr.is_some();
 
         // Tokio runtime for portal-backed hotkeys. A single worker is
         // enough — the portal listener spends almost all its time
@@ -253,17 +299,17 @@ impl App {
         runtime.block_on(async {
             hotkeys.init_portal_backend(runtime_handle.clone()).await;
         });
-        if let Err(e) = hotkeys.register_from_settings(&settings.settings().keyboard) {
+        if let Err(e) = hotkeys.register_from_settings(&initial.settings.settings().keyboard) {
             tracing::warn!("hotkey registration failed: {e}");
         }
 
         Ok(Self {
-            paradigm,
-            dark,
+            paradigm: initial.paradigm,
+            dark: initial.dark,
             installed: None,
             shell: Shell::default(),
             form: ConnectForm::default(),
-            identity,
+            identity: initial.identity,
             backend,
             auto_connect_pending,
             toasts: ToastManager::new(),
@@ -273,20 +319,22 @@ impl App {
             prev_user_ids_initialized: false,
             prev_chat_count: 0,
             settings_ui: SettingsState::default(),
-            settings,
+            settings: initial.settings,
             hotkeys,
             _runtime: runtime,
             processor_registry,
-            first_run_state,
+            first_run_state: initial.first_run_state,
             pending_agent_op: None,
             unlock_state: UnlockState::default(),
             runtime_handle,
             pending_file_dialog: None,
+            auto_handled_offers: std::collections::HashSet::new(),
+            prev_my_room_id: None,
         })
     }
 }
 
-impl eframe::App for App {
+impl<B: UiBackend> eframe::App for App<B> {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         let want = (self.paradigm, self.dark);
         if self.installed != Some(want) {
@@ -303,6 +351,8 @@ impl eframe::App for App {
         self.pump_toasts(&state);
         self.pump_hotkeys(ctx, &state);
         self.pump_file_dialog();
+        self.pump_pending_opens();
+        self.pump_room_join(&state);
 
         // Refresh display preferences that the shell needs each frame.
         // Cheap copies; toggling the setting takes effect immediately.
@@ -459,7 +509,7 @@ impl eframe::App for App {
     }
 }
 
-impl App {
+impl<B: UiBackend> App<B> {
     fn render_first_run_dialog(&mut self, ctx: &Context) {
         if matches!(self.first_run_state, FirstRunState::NotNeeded | FirstRunState::Complete) {
             return;
@@ -831,15 +881,23 @@ impl App {
                     _ => {}
                 }
             }
+            // On any disconnect transition, drop the per-session caches
+            // that don't survive a server change: auto-handled offer ids
+            // (so reconnecting to a new server with overlapping ids still
+            // gets a fresh evaluation) and the chat-count cursor (so the
+            // cold-connect gate in `pump_auto_downloads` re-engages).
+            if matches!(kind, ConnectionKind::Disconnected | ConnectionKind::Lost) {
+                self.auto_handled_offers.clear();
+                self.prev_chat_count = 0;
+            }
             self.prev_connection = Some(kind);
         }
 
         // Drain one-shot fields. These are `Option<String>`; taking them
         // ensures we only fire the toast once.
-        let (perm, kicked) = {
-            let mut guard = self.backend.state_mut();
-            (guard.permission_denied.take(), guard.kicked.take())
-        };
+        let (perm, kicked) = self
+            .backend
+            .update_state(|state| (state.permission_denied.take(), state.kicked.take()));
         if let Some(msg) = perm {
             self.toasts.error(format!("Permission denied: {msg}"));
         }
@@ -921,10 +979,7 @@ impl App {
         if prev == 0 || count <= prev {
             return;
         }
-        let settings = &self.settings.settings().file_transfer;
-        if !settings.auto_download_enabled {
-            return;
-        }
+        let settings = self.settings.settings().file_transfer.clone();
         let my_username = state
             .my_user_id
             .and_then(|id| state.get_user(id))
@@ -940,20 +995,58 @@ impl App {
             if my_username.as_deref() == Some(msg.sender.as_str()) {
                 continue;
             }
-            if !settings.should_auto_download(&offer.mime, offer.size) {
+            // Idempotency guard for history replay: a mid-session
+            // reconnect (or `RequestChatHistory`) re-pushes the same
+            // offers, but `prev_chat_count` is non-zero so the cold-
+            // connect gate above doesn't catch them. Keying on the
+            // offer's `transfer_id` makes replays no-ops.
+            if !self.auto_handled_offers.insert(offer.transfer_id.clone()) {
                 continue;
             }
-            tracing::info!(
-                "auto-download: accepting offer {} ({} bytes, mime={})",
-                offer.name,
-                offer.size,
-                offer.mime
-            );
-            self.backend.send(Command::DownloadFile {
-                share_data: offer.share_data.clone(),
-            });
-            self.shell.mark_offer_accepted(offer.transfer_id.clone());
+            if settings.auto_download_enabled && settings.should_auto_download(&offer.mime, offer.size) {
+                tracing::info!(
+                    "auto-download: accepting offer {} ({} bytes, mime={})",
+                    offer.name,
+                    offer.size,
+                    offer.mime
+                );
+                self.backend.send(Command::DownloadFile {
+                    share_data: offer.share_data.clone(),
+                });
+                self.shell.mark_offer_accepted(offer.transfer_id.clone());
+            } else {
+                // No rule matched — surface a manual accept/deny
+                // prompt. `auto_handled_offers` already contains the
+                // id, so a history replay won't re-prompt even if the
+                // user dismisses with Deny.
+                self.shell.queue_offer_prompt(crate::shell::OfferPrompt {
+                    transfer_id: offer.transfer_id.clone(),
+                    name: offer.name.clone(),
+                    size: offer.size,
+                    mime: offer.mime.clone(),
+                    share_data: offer.share_data.clone(),
+                    from: msg.sender.clone(),
+                });
+            }
         }
+    }
+
+    /// Watch for `my_room_id` transitions and, when the user has opted
+    /// into history sync, ask the room for its backlog. Triggers on
+    /// every change (cold connect, manual room hop, server-driven move)
+    /// because the user's intent — "always show me what was said
+    /// before I arrived" — applies uniformly.
+    fn pump_room_join(&mut self, state: &rumble_protocol::State) {
+        if state.my_room_id == self.prev_my_room_id {
+            return;
+        }
+        if state.my_room_id.is_some()
+            && state.connection.is_connected()
+            && self.settings.settings().chat.auto_sync_history
+        {
+            self.backend.send(Command::RequestChatHistory);
+        }
+        self.prev_my_room_id = state.my_room_id;
     }
 
     /// Bridge the composer's "share file" button to the OS file picker.
@@ -991,6 +1084,9 @@ impl App {
                 Ok(Some(path)) => {
                     self.backend.send(Command::ShareFile { path });
                     self.toasts.success("File queued for sharing");
+                    // Pop open the transfers window so the user
+                    // immediately sees upload progress.
+                    self.shell.transfers_open = true;
                 }
                 Ok(None) => {
                     // User dismissed the picker — no action required.
@@ -1000,6 +1096,29 @@ impl App {
                     self.toasts.error("File picker failed — see logs");
                 }
             }
+        }
+    }
+
+    /// Drain "Open" / "Show in folder" actions queued by the
+    /// transfers window. `open` shells out to the platform handler
+    /// (xdg-open / Finder / explorer) and can take a noticeable
+    /// fraction of a second on cold cache, so we run it on our
+    /// tokio runtime rather than blocking the render loop.
+    fn pump_pending_opens(&mut self) {
+        for action in std::mem::take(&mut self.shell.pending_open) {
+            self.runtime_handle.spawn_blocking(move || match action {
+                crate::shell::PendingOpen::File(path) => {
+                    if let Err(e) = open::that(&path) {
+                        tracing::warn!("open file {} failed: {e}", path.display());
+                    }
+                }
+                crate::shell::PendingOpen::InFolder(path) => {
+                    let target = path.parent().unwrap_or(&path);
+                    if let Err(e) = open::that(target) {
+                        tracing::warn!("show in folder {} failed: {e}", target.display());
+                    }
+                }
+            });
         }
     }
 
@@ -1044,8 +1163,13 @@ impl App {
         if !state.connection.is_connected() {
             return;
         }
+        let server_muted = crate::adapters::am_i_server_muted(state);
         match event {
             HotkeyEvent::PttPressed => {
+                if server_muted {
+                    tracing::debug!("hotkey: PTT pressed but server-muted — ignoring");
+                    return;
+                }
                 tracing::debug!("hotkey: PTT pressed");
                 self.backend.send(Command::StartTransmit);
             }
@@ -1083,5 +1207,21 @@ impl App {
             kind,
             volume: sfx.volume.clamp(0.0, 1.0),
         });
+    }
+}
+
+#[cfg(feature = "test-harness")]
+impl<B: UiBackend> App<B> {
+    pub fn suppress_first_run_for_test(&mut self) {
+        self.first_run_state = FirstRunState::NotNeeded;
+        self.unlock_state = UnlockState::default();
+    }
+
+    pub fn set_state_for_test(&mut self, state: rumble_protocol::State) {
+        self.backend.update_state(|current| *current = state);
+    }
+
+    pub fn update_state_for_test<R>(&mut self, f: impl FnOnce(&mut rumble_protocol::State) -> R) -> R {
+        self.backend.update_state(f)
     }
 }

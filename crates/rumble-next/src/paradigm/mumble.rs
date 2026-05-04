@@ -2,9 +2,8 @@
 //! statusbar. Closest to the original Mumble/KDE Plasma idiom. Uses
 //! `MumbleLiteTheme`.
 
+use crate::backend::UiBackend;
 use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText, Stroke, Ui, epaint::RectShape};
-use rumble_client::handle::BackendHandle;
-use rumble_client_traits::Platform;
 use rumble_protocol::{Command, ConnectionState, State};
 use rumble_widgets::{ButtonArgs, PressableRole, SurfaceFrame, SurfaceKind, UiExt};
 
@@ -13,7 +12,7 @@ use crate::{
     shell::{Shell, room_header},
 };
 
-pub fn render<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
+pub fn render<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     toolbar(ui, shell, state, backend);
 
     let rect = ui.available_rect_before_wrap();
@@ -54,7 +53,7 @@ pub fn render<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &Sta
     ui.advance_cursor_after_rect(rect);
 }
 
-fn toolbar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
+fn toolbar<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     SurfaceFrame::new(SurfaceKind::Toolbar)
         .inner_margin(Margin::symmetric(6, 4))
         .show(ui, |ui| {
@@ -90,14 +89,8 @@ fn toolbar<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State,
                     shell.settings_open = !shell.settings_open;
                 }
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let tokens = ui.theme().tokens().clone();
-                    ui.label(
-                        RichText::new(adapters::connection_summary(state))
-                            .color(tokens.text_muted)
-                            .font(tokens.font_mono.clone()),
-                    );
-                });
+                // Connection state lives on the paradigm-picker bar above
+                // and on the bottom statusbar; no need to repeat it here.
             });
         });
 }
@@ -126,7 +119,7 @@ fn side_header(ui: &mut Ui) {
         });
 }
 
-fn center_column<P: Platform + 'static>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &BackendHandle<P>) {
+fn center_column<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     let rect = ui.available_rect_before_wrap();
     let composer_h = 56.0;
     let header_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 64.0));
