@@ -1,0 +1,19 @@
+//! Rumble client built on the [aetna](https://github.com/computer-whisperer/aetna)
+//! UI library.
+//!
+//! This is a fresh port of `rumble-egui` / `rumble-next` away from egui.
+//! Aetna gives us proper SVG/icon support, color emoji, and a smaller
+//! widget surface than egui.
+//!
+//! Architecture mirrors `rumble-next`: a [`UiBackend`] adapter wraps
+//! `rumble_client::handle::BackendHandle` so the renderer reads `State`
+//! snapshots and emits `Command`s. The aetna `App` impl owns local UI
+//! state (form fields, selected room, expanded tree branches) and
+//! reprojects `(state, ui_state)` into an `El` tree on every frame.
+
+pub mod app;
+pub mod backend;
+pub mod theme;
+
+pub use app::RumbleApp;
+pub use backend::{NativeUiBackend, UiBackend};

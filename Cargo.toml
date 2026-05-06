@@ -7,6 +7,8 @@ members = [
 exclude = [
     "docker/p2p-test",
     "docker/backend-p2p-test",
+    # Vendored UI library — has its own workspace.
+    "vendor/aetna",
 ]
 
 [workspace.dependencies]
