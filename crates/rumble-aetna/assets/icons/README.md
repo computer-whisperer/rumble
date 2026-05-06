@@ -5,36 +5,52 @@ SVGs lifted directly from
 (LGPL-3.0-or-later, same license as Mumble itself; redistributable
 under the GPL-2.0+ in the rumble project).
 
-These are not yet wired into the renderer. Aetna's `icon()` builder
-takes an `IconName` enum, which is closed inside `aetna-core`. To use
-custom SVG icons we need to either:
+## Wiring icons in
 
-1. **Extend the vendored aetna `IconName`.** Add new variants in
-   `vendor/aetna/crates/aetna-core/src/tree/types.rs::IconName`, parse
-   the SVG body into the matching `&[IconStroke]` plus
-   `parse_current_color_svg_asset(...)` `VectorAsset`, and add the
-   variant to `all_icon_names()` / `icon_strokes()` / `icon_path()` in
-   `aetna-core/src/icons.rs`. This is the most straightforward path —
-   every icon now flows through the same `text_color`-tinted pipeline as
-   `IconName::Folder` / `IconName::Users`.
+Aetna's `icon()` builder accepts both built-in `IconName` values and
+app-supplied SVGs through `SvgIcon`. The pattern: parse each SVG once
+into a `LazyLock<SvgIcon>` static, then `icon(MY_GLYPH.clone())` at
+the call site. Cloning is a cheap `Arc` bump, and content-hashing
+inside `aetna-core` dedups the MSDF atlas slot automatically.
 
-2. **Add an open-ended `register_icon(name, svg)` API to aetna.** The
-   internals already cache `VectorAsset`s in a `OnceLock<Vec<...>>` so
-   this is feasible but requires a real change to aetna's public
-   surface.
+```rust
+use std::sync::LazyLock;
+use aetna_core::prelude::*;
 
-Approach (1) is what we'll pursue first if `rumble-aetna` reaches
-enough parity to need them. Until then we use aetna's stock lucide-ish
-vocabulary (`Folder`, `Users`, `Activity`, `AlertCircle`, …).
+static SVG_TALKING_ON: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse(include_str!("../assets/icons/talking_on.svg"))
+        .expect("talking_on.svg parses")
+});
 
-## Index
+icon(SVG_TALKING_ON.clone()).icon_size(12.0)
+```
 
-- `talking_on.svg` / `talking_off.svg` — speaking indicators (replace stock `Activity`).
+The Mumble theme bakes its semantic colors into each SVG (red for
+self-mute, blue for talking, etc.), so we use `SvgIcon::parse` rather
+than `SvgIcon::parse_current_color` — the authored fill *is* the
+visual signal, and `.text_color(...)` would override it. Reach for
+`parse_current_color` only on monochrome lucide-style glyphs that
+need theme tinting.
+
+## What's wired today
+
+User-state mic glyphs in `app.rs::push_room_subtree`:
+
+| State | SVG |
+|---|---|
+| Talking | `talking_on.svg` |
+| Idle | `talking_off.svg` |
+| Self-muted | `muted_self.svg` |
+| Server-muted | `muted_server.svg` |
+
+## Index — wire as needed
+
+- `talking_on.svg` / `talking_off.svg` — speaking indicators (wired).
 - `muted_self.svg` / `muted_pushtomute.svg` / `muted_suppressed.svg` — mic-off variants.
-- `muted_server.svg` — server-imposed mute (red lock icon).
+- `muted_server.svg` — server-imposed mute (wired).
 - `muted_local.svg` — locally muted other user (yellow bell).
 - `deafened_self.svg` / `deafened_server.svg` / `self_undeafened.svg` — deafen states.
-- `channel.svg` / `channel_active.svg` — room/channel folder glyphs.
+- `channel.svg` / `channel_active.svg` — currently empty `<svg>` placeholders in the upstream theme. Use `IconName::Folder` for the room glyph until rumble ships its own.
 - `authenticated.svg` — registered-user indicator.
 - `priority_speaker.svg` — priority-speaker badge.
 - `filter_on.svg` / `filter_off.svg` — chat/user-list filter toggle.

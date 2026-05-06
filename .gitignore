@@ -8,3 +8,6 @@ chat_logs/
 client_configs/
 reference/
 .claude/worktrees/
+
+# Generated artifacts from `cargo run -p rumble-aetna --bin dump_bundles`
+crates/rumble-aetna/out/
