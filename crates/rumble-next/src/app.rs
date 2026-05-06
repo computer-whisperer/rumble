@@ -164,6 +164,10 @@ impl App<NativeUiBackend> {
         let initial = Self::load_initial_state()?;
         let config = Self::connect_config_from_settings(&initial.settings);
 
+        // Wire up egui_extras' image loaders so `egui::Image::new("file://…")`
+        // can decode PNG/JPEG/etc. for inline previews and the lightbox.
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+
         let ctx_for_repaint = cc.egui_ctx.clone();
         let backend = BackendHandle::with_config(
             move || {
@@ -233,6 +237,9 @@ impl<B: UiBackend> App<B> {
 
     pub fn new_with_backend(cc: &eframe::CreationContext<'_>, backend: B) -> std::io::Result<Self> {
         let initial = Self::load_initial_state()?;
+        // Install image loaders for the harness path too — kittest-driven
+        // tests render the same chat image previews / lightbox.
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         Self::from_initial_state(cc, backend, initial)
     }
 
@@ -1106,19 +1113,46 @@ impl<B: UiBackend> App<B> {
     /// tokio runtime rather than blocking the render loop.
     fn pump_pending_opens(&mut self) {
         for action in std::mem::take(&mut self.shell.pending_open) {
-            self.runtime_handle.spawn_blocking(move || match action {
+            match action {
                 crate::shell::PendingOpen::File(path) => {
-                    if let Err(e) = open::that(&path) {
-                        tracing::warn!("open file {} failed: {e}", path.display());
-                    }
+                    self.runtime_handle.spawn_blocking(move || {
+                        if let Err(e) = open::that(&path) {
+                            tracing::warn!("open file {} failed: {e}", path.display());
+                        }
+                    });
                 }
                 crate::shell::PendingOpen::InFolder(path) => {
-                    let target = path.parent().unwrap_or(&path);
-                    if let Err(e) = open::that(target) {
-                        tracing::warn!("show in folder {} failed: {e}", target.display());
-                    }
+                    self.runtime_handle.spawn_blocking(move || {
+                        let target = path.parent().unwrap_or(&path);
+                        if let Err(e) = open::that(target) {
+                            tracing::warn!("show in folder {} failed: {e}", target.display());
+                        }
+                    });
                 }
-            });
+                crate::shell::PendingOpen::SaveAs { src, suggested_name } => {
+                    // Async pick + blocking copy keeps the UI responsive
+                    // while the dialog is open, and matches how the share
+                    // picker is plumbed (`pump_file_dialog`).
+                    let handle = self.runtime_handle.spawn(async move {
+                        let dest = rfd::AsyncFileDialog::new()
+                            .set_file_name(&suggested_name)
+                            .save_file()
+                            .await
+                            .map(|f| f.path().to_path_buf());
+                        (src, dest)
+                    });
+                    let runtime = self.runtime_handle.clone();
+                    self.runtime_handle.spawn(async move {
+                        let Ok((src, dest)) = handle.await else { return };
+                        let Some(dest) = dest else { return };
+                        runtime.spawn_blocking(move || {
+                            if let Err(e) = std::fs::copy(&src, &dest) {
+                                tracing::warn!("save as: copy {} → {} failed: {e}", src.display(), dest.display());
+                            }
+                        });
+                    });
+                }
+            }
         }
     }
 

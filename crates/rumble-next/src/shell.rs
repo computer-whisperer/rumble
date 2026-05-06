@@ -192,6 +192,26 @@ pub struct Shell {
     /// decision. The shell pops one at a time into `modal` so users
     /// see prompts serially rather than as a stack of dialogs.
     queued_offer_prompts: VecDeque<OfferPrompt>,
+    /// Open image lightbox, rendered as a separate overlay (not via
+    /// `PendingModal` since it has its own dismissal flow and doesn't
+    /// dispatch a `Command` on close).
+    image_lightbox: Option<ImageLightbox>,
+    /// Rect (in screen coords) of the most recently drawn inline image
+    /// preview. Read by integration tests in `tests/` to dispatch a
+    /// synthetic click at the right coordinates. Always populated (no
+    /// feature gate) so the field works the same in dev builds where
+    /// you might want to manually inspect it via `RUST_LOG`.
+    pub last_image_preview_rect: Option<egui::Rect>,
+}
+
+/// State for the click-to-enlarge image viewer. The image is loaded
+/// from `path` via egui_extras' file:// loader; the URI is cached so
+/// we evict the texture from egui's image cache on close.
+#[derive(Clone, Debug)]
+pub struct ImageLightbox {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub uri: String,
 }
 
 /// What the user wants to do with a completed transfer's local file.
@@ -201,6 +221,12 @@ pub enum PendingOpen {
     File(std::path::PathBuf),
     /// Reveal the file in the platform's file manager.
     InFolder(std::path::PathBuf),
+    /// Prompt for a destination and copy the file there. The second
+    /// field is the suggested filename for the save dialog.
+    SaveAs {
+        src: std::path::PathBuf,
+        suggested_name: String,
+    },
 }
 
 impl Shell {
@@ -254,6 +280,22 @@ impl Shell {
                 from: p.from,
             });
         }
+    }
+
+    /// Test-only hook to open the lightbox without going through the
+    /// chat preview's click handler. Used by the kittest snapshot in
+    /// `tests/chat_image_preview.rs`.
+    #[cfg(feature = "test-harness")]
+    pub fn open_image_lightbox_for_test(&mut self, path: std::path::PathBuf, name: String) {
+        let uri = format!("file://{}", path.display());
+        self.image_lightbox = Some(ImageLightbox { path, name, uri });
+    }
+
+    /// Test-only accessor: returns the active lightbox (if any) so tests
+    /// can assert that a click on the inline preview opened it.
+    #[cfg(feature = "test-harness")]
+    pub fn image_lightbox_for_test(&self) -> Option<&ImageLightbox> {
+        self.image_lightbox.as_ref()
     }
 }
 
@@ -463,6 +505,8 @@ impl Shell {
                             &mut self.accepted_offers,
                             &transfer_index,
                             &mut self.pending_open,
+                            &mut self.image_lightbox,
+                            &mut self.last_image_preview_rect,
                         ),
                     }
                 }
@@ -486,6 +530,7 @@ fn draw_sys(ui: &mut Ui, tokens: &rumble_widgets::Tokens, m: &SysMsg) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_msg<B: UiBackend>(
     ui: &mut Ui,
     tokens: &rumble_widgets::Tokens,
@@ -494,6 +539,8 @@ fn draw_msg<B: UiBackend>(
     accepted_offers: &mut HashSet<String>,
     transfer_index: &HashMap<String, rumble_client_traits::file_transfer::TransferStatus>,
     pending_open: &mut Vec<PendingOpen>,
+    image_lightbox: &mut Option<ImageLightbox>,
+    last_image_preview_rect: &mut Option<egui::Rect>,
 ) {
     ui.horizontal_top(|ui| {
         let (avatar_rect, _) = ui.allocate_exact_size(Vec2::splat(AVATAR_SIZE), Sense::hover());
@@ -546,12 +593,15 @@ fn draw_msg<B: UiBackend>(
                     accepted_offers,
                     transfer_index,
                     pending_open,
+                    image_lightbox,
+                    last_image_preview_rect,
                 );
             }
         });
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_media<B: UiBackend>(
     ui: &mut Ui,
     tokens: &rumble_widgets::Tokens,
@@ -560,36 +610,14 @@ fn draw_media<B: UiBackend>(
     accepted_offers: &mut HashSet<String>,
     transfer_index: &HashMap<String, rumble_client_traits::file_transfer::TransferStatus>,
     pending_open: &mut Vec<PendingOpen>,
+    image_lightbox: &mut Option<ImageLightbox>,
+    last_image_preview_rect: &mut Option<egui::Rect>,
 ) {
     match media {
-        Media::Image { name, size } => {
-            ui.add_space(2.0);
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(220.0, 140.0), Sense::hover());
-            ui.painter().add(RectShape::new(
-                rect,
-                CornerRadius::same(4),
-                Color32::from_rgb(0xef, 0xef, 0xec),
-                Stroke::new(1.0, tokens.line_soft),
-                StrokeKind::Inside,
-            ));
-            let p = ui.painter();
-            let stripe = Color32::from_rgb(0xe6, 0xe6, 0xe2);
-            let step = 20.0;
-            let mut x = rect.left() - rect.height();
-            while x < rect.right() {
-                p.line_segment(
-                    [egui::pos2(x, rect.top()), egui::pos2(x + rect.height(), rect.bottom())],
-                    Stroke::new(6.0, stripe),
-                );
-                x += step;
-            }
-            p.text(
-                rect.left_bottom() + Vec2::new(8.0, -8.0),
-                Align2::LEFT_BOTTOM,
-                format!("[img] {name} · {size}"),
-                tokens.font_mono.clone(),
-                tokens.text_muted,
-            );
+        Media::Image { .. } => {
+            // Legacy variant — adapters never construct this anymore
+            // (real attachments come through `FileOffer`). Render
+            // nothing rather than a misleading placeholder.
         }
         Media::File { ext, name, size } => {
             let _ = draw_file_card(ui, tokens, ext, name, size, None);
@@ -623,8 +651,32 @@ fn draw_media<B: UiBackend>(
                 (false, None) if accepted_offers.contains(transfer_id) => Some(FileOfferAction::Accepted),
                 (false, None) => Some(FileOfferAction::Available),
             };
-            let result = draw_file_card(ui, tokens, ext, name, size, action);
-            match result {
+
+            // For completed transfers of image files, show an inline
+            // preview that opens the lightbox on click. The full file
+            // card (with Open / Show in folder buttons) is still drawn
+            // underneath for non-image actions and as a fallback if
+            // the image fails to decode.
+            let is_image = is_image_extension(ext);
+            if let Some(FileOfferAction::Completed { path }) = &action
+                && is_image
+            {
+                let preview = draw_image_preview(ui, tokens, path, name, size);
+                let preview_resp = preview.response;
+                *last_image_preview_rect = Some(preview.image_rect);
+                if preview.clicked {
+                    *image_lightbox = Some(ImageLightbox {
+                        path: path.clone(),
+                        name: name.clone(),
+                        uri: file_uri(path),
+                    });
+                }
+                attach_file_card_context_menu(&preview_resp, Some(path.clone()), name.clone(), pending_open, ui.ctx());
+                return;
+            }
+
+            let result = draw_file_card(ui, tokens, ext, name, size, action.clone());
+            match result.click {
                 FileOfferClick::Download => {
                     backend.send(Command::DownloadFile {
                         share_data: share_data.clone(),
@@ -635,8 +687,119 @@ fn draw_media<B: UiBackend>(
                 FileOfferClick::ShowInFolder(path) => pending_open.push(PendingOpen::InFolder(path)),
                 FileOfferClick::None => {}
             }
+            let path = match action {
+                Some(FileOfferAction::Completed { path }) => Some(path),
+                _ => None,
+            };
+            attach_file_card_context_menu(&result.response, path, name.clone(), pending_open, ui.ctx());
         }
     }
+}
+
+/// True if `ext` (file extension, dot stripped, any case) names an
+/// image format the egui_extras image loader can decode for us.
+fn is_image_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff"
+    )
+}
+
+/// `file://` URI for `path`, used as the cache key for egui's image
+/// loader. Same path always produces the same URI so the texture is
+/// shared between an inline thumbnail and the lightbox.
+fn file_uri(path: &std::path::Path) -> String {
+    format!("file://{}", path.display())
+}
+
+struct ImagePreview {
+    response: egui::Response,
+    clicked: bool,
+    /// Rect of the inner image widget (not the surrounding surface).
+    /// Used by tests to send a synthetic click at the image center.
+    image_rect: egui::Rect,
+}
+
+/// Inline image thumbnail shown for completed image transfers in the
+/// chat log. Draws the image inside a bordered surface with a small
+/// caption underneath ("name · size") so the user still sees what the
+/// file is.
+fn draw_image_preview(
+    ui: &mut Ui,
+    tokens: &rumble_widgets::Tokens,
+    path: &std::path::Path,
+    name: &str,
+    size: &str,
+) -> ImagePreview {
+    ui.add_space(2.0);
+    let max_w = ui.available_width().min(360.0).max(80.0);
+    let max_h = 220.0_f32;
+    let uri = file_uri(path);
+
+    // Lay out the image as a non-interactive widget, then layer a
+    // separate `Sense::click` interaction on the same rect.
+    let inner = SurfaceFrame::new(SurfaceKind::Group)
+        .inner_margin(Margin::symmetric(6, 6))
+        .show(ui, |ui| {
+            let img = egui::Image::new(&uri)
+                .max_width(max_w)
+                .max_height(max_h)
+                .corner_radius(4.0);
+            let img_rect = ui.add(img).rect;
+            let click_id = ui.id().with(("rumble_next_image_preview", uri.as_str()));
+            let click_resp = ui
+                .interact(img_rect, click_id, Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("{name} · {size}"))
+                    .color(tokens.text_muted)
+                    .font(tokens.font_mono.clone()),
+            );
+            (click_resp.clicked(), img_rect)
+        });
+    let (clicked, image_rect) = inner.inner;
+    ImagePreview {
+        response: inner.response,
+        clicked,
+        image_rect,
+    }
+}
+
+/// Attach the standard right-click context menu (Open / Show in folder
+/// / Save as / Copy path) to `response`. When `path` is `None` the
+/// transfer hasn't completed yet and we suppress the menu — all the
+/// actions need a local file to act on.
+fn attach_file_card_context_menu(
+    response: &egui::Response,
+    path: Option<std::path::PathBuf>,
+    name: String,
+    pending_open: &mut Vec<PendingOpen>,
+    ctx: &egui::Context,
+) {
+    let Some(path) = path else { return };
+    response.clone().context_menu(|ui| {
+        ui.set_min_width(160.0);
+        if ui.button("Open").clicked() {
+            pending_open.push(PendingOpen::File(path.clone()));
+            ui.close();
+        }
+        if ui.button("Show in folder").clicked() {
+            pending_open.push(PendingOpen::InFolder(path.clone()));
+            ui.close();
+        }
+        if ui.button("Save as…").clicked() {
+            pending_open.push(PendingOpen::SaveAs {
+                src: path.clone(),
+                suggested_name: name.clone(),
+            });
+            ui.close();
+        }
+        if ui.button("Copy path").clicked() {
+            ctx.copy_text(path.display().to_string());
+            ui.close();
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -655,6 +818,11 @@ enum FileOfferClick {
     ShowInFolder(std::path::PathBuf),
 }
 
+struct FileCardResult {
+    click: FileOfferClick,
+    response: egui::Response,
+}
+
 fn draw_file_card(
     ui: &mut Ui,
     tokens: &rumble_widgets::Tokens,
@@ -662,10 +830,10 @@ fn draw_file_card(
     name: &str,
     size: &str,
     action: Option<FileOfferAction>,
-) -> FileOfferClick {
+) -> FileCardResult {
     let mut click = FileOfferClick::None;
     ui.add_space(2.0);
-    SurfaceFrame::new(SurfaceKind::Group)
+    let response = SurfaceFrame::new(SurfaceKind::Group)
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -757,8 +925,9 @@ fn draw_file_card(
                     });
                 }
             });
-        });
-    click
+        })
+        .response;
+    FileCardResult { click, response }
 }
 
 // ---------- Composer ----------
@@ -1210,6 +1379,47 @@ impl Shell {
         self.render_context_menu(ctx, state, backend);
         self.render_pending_modal(ctx, backend);
         self.render_transfers_window(ctx, backend);
+        self.render_image_lightbox(ctx);
+    }
+
+    /// Click-to-enlarge image viewer. Shown when a chat image preview
+    /// is clicked. ESC, the close button, and clicking outside the
+    /// modal frame all dismiss it; on close we evict the texture to
+    /// free GPU memory.
+    fn render_image_lightbox(&mut self, ctx: &egui::Context) {
+        let Some(lightbox) = self.image_lightbox.clone() else {
+            return;
+        };
+
+        // Use 90% of the modal-content rect as a soft max so really
+        // tall or wide images still leave room for the title bar /
+        // close button.
+        let content = ctx.content_rect();
+        let max_w = (content.width() * 0.9).max(120.0);
+        let max_h = (content.height() * 0.9 - 60.0).max(120.0);
+
+        let modal = egui::Modal::new(egui::Id::new("rumble_next_image_lightbox")).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(&lightbox.name);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ButtonArgs::new("Close").role(PressableRole::Default).show(ui).clicked() {
+                        ui.close();
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.add(
+                egui::Image::new(&lightbox.uri)
+                    .max_width(max_w)
+                    .max_height(max_h)
+                    .corner_radius(6.0),
+            );
+        });
+
+        if modal.should_close() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ctx.forget_image(&lightbox.uri);
+            self.image_lightbox = None;
+        }
     }
 
     fn render_context_menu<B: UiBackend>(&mut self, ctx: &egui::Context, state: &State, backend: &B) {

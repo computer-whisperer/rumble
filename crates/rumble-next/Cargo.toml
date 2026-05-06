@@ -11,7 +11,7 @@ path = "src/lib.rs"
 default = []
 # Pulls in egui_kittest so library consumers can drive the GUI
 # headlessly. Off by default — production builds don't need it.
-test-harness = ["dep:egui_kittest", "dep:image"]
+test-harness = ["dep:egui_kittest"]
 
 [[bin]]
 name = "rumble-next"
@@ -19,6 +19,8 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.33.3"
+egui_extras = { version = "0.33.3", features = ["image", "file"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 rumble-widgets = { path = "../rumble-widgets" }
 rumble-client = { path = "../rumble-client" }
 rumble-client-traits = { path = "../rumble-client-traits" }
@@ -41,7 +43,6 @@ arboard = "3"
 rfd = "0.16"
 open = "5"
 egui_kittest = { version = "0.33", features = ["wgpu", "eframe"], optional = true }
-image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 [[example]]
 name = "screenshot"

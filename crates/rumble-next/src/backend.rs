@@ -84,6 +84,7 @@ impl UiBackend for NativeUiBackend {
 pub struct MockBackend {
     state: Arc<RwLock<State>>,
     commands: Arc<Mutex<Vec<Command>>>,
+    transfers: Arc<RwLock<Vec<TransferStatus>>>,
 }
 
 #[cfg(feature = "test-harness")]
@@ -92,6 +93,7 @@ impl MockBackend {
         Self {
             state: Arc::new(RwLock::new(state)),
             commands: Arc::new(Mutex::new(Vec::new())),
+            transfers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -101,6 +103,13 @@ impl MockBackend {
 
     pub fn take_commands(&self) -> Vec<Command> {
         std::mem::take(&mut *self.commands.lock().expect("mock commands poisoned"))
+    }
+
+    /// Replace the canned transfer list returned by `transfers()`. Used
+    /// by tests that need the chat to show a "completed" file offer
+    /// without standing up a real plugin.
+    pub fn set_transfers(&self, transfers: Vec<TransferStatus>) {
+        *self.transfers.write().expect("mock transfers poisoned") = transfers;
     }
 }
 
@@ -117,5 +126,9 @@ impl UiBackend for MockBackend {
     fn update_state<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let mut state = self.state.write().expect("mock state poisoned");
         f(&mut state)
+    }
+
+    fn transfers(&self) -> Vec<TransferStatus> {
+        self.transfers.read().expect("mock transfers poisoned").clone()
     }
 }
