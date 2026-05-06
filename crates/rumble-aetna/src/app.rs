@@ -3,6 +3,8 @@
 //! Owns local UI state (connect form fields, modal flags, selected
 //! room) and projects `(state, ui_state) -> El` on every frame.
 
+use std::sync::LazyLock;
+
 use aetna_core::prelude::*;
 
 use rumble_desktop_shell::{AcceptedCertificate, SettingsStore};
@@ -12,6 +14,31 @@ use crate::{
     backend::UiBackend,
     theme::{self as palette},
 };
+
+// ---- Bundled Mumble SVG glyphs ----
+//
+// Parsed once at first use (Arc-bumped on every `icon(...)` call) and
+// shared across frames. We use `SvgIcon::parse` (not
+// `parse_current_color`) because the Mumble theme bakes its semantic
+// colors into the SVG paint — red for self-mute, blue for talking, etc.
+// — and those colors are exactly the visual signal we want to keep.
+
+static SVG_TALKING_ON: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse(include_str!("../assets/icons/talking_on.svg"))
+        .expect("talking_on.svg parses")
+});
+static SVG_TALKING_OFF: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse(include_str!("../assets/icons/talking_off.svg"))
+        .expect("talking_off.svg parses")
+});
+static SVG_MUTED_SELF: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse(include_str!("../assets/icons/muted_self.svg"))
+        .expect("muted_self.svg parses")
+});
+static SVG_MUTED_SERVER: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse(include_str!("../assets/icons/muted_server.svg"))
+        .expect("muted_server.svg parses")
+});
 
 /// Local-only first-run identity wrapper.
 ///
@@ -64,6 +91,14 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
 
     chat_input: String,
     chat_sel: TextSelection,
+
+    /// Chat sidebar width in logical pixels — adjusted by dragging
+    /// the divider on its right edge. Initialized from
+    /// [`tokens::SIDEBAR_WIDTH`] (the conventional ~256px starting
+    /// point) and clamped to [`tokens::SIDEBAR_WIDTH_MIN`] /
+    /// `_MAX` by the resize handler.
+    chat_sidebar_w: f32,
+    chat_sidebar_drag: ResizeDrag,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -79,6 +114,8 @@ impl<B: UiBackend> RumbleApp<B> {
             username_sel: TextSelection::default(),
             chat_input: String::new(),
             chat_sel: TextSelection::default(),
+            chat_sidebar_w: tokens::SIDEBAR_WIDTH,
+            chat_sidebar_drag: ResizeDrag::default(),
         }
     }
 }
@@ -96,17 +133,15 @@ impl<B: UiBackend> App for RumbleApp<B> {
         let main = column([
             top_toolbar(&state),
             row([
-                chat_sidebar(&state, &self.chat_input, self.chat_sel),
+                chat_sidebar(&state, &self.chat_input, self.chat_sel, self.chat_sidebar_w),
+                resize_handle(Axis::Row).key(CHAT_SIDEBAR_HANDLE),
                 center_area(&state, self.connect_modal_open),
             ])
-            .gap(0.0)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
             .align(Align::Stretch),
         ])
-        .gap(0.0)
         .fill_size()
-        .fill(tokens::BG_APP)
         .align(Align::Stretch);
 
         let cert_layer = if let ConnectionState::CertificatePending { cert_info } = &state.connection {
@@ -136,6 +171,21 @@ impl<B: UiBackend> App for RumbleApp<B> {
     }
 
     fn on_event(&mut self, event: UiEvent) {
+        // Chat sidebar resize. Routed events return early so the
+        // handle's drag stream doesn't fall through to other matchers.
+        if event.route() == Some(CHAT_SIDEBAR_HANDLE) {
+            resize_handle::apply_event_fixed(
+                &mut self.chat_sidebar_w,
+                &mut self.chat_sidebar_drag,
+                &event,
+                CHAT_SIDEBAR_HANDLE,
+                Axis::Row,
+                tokens::SIDEBAR_WIDTH_MIN,
+                tokens::SIDEBAR_WIDTH_MAX,
+            );
+            return;
+        }
+
         // Connect modal lifecycle.
         if event.is_click_or_activate("connect:open") {
             self.connect_modal_open = true;
@@ -294,20 +344,22 @@ impl<B: UiBackend> RumbleApp<B> {
 
 // ---------- view helpers ----------
 
+const CHAT_SIDEBAR_HANDLE: &str = "chat-sidebar:resize";
+
 fn top_toolbar(state: &State) -> El {
     let connected = matches!(state.connection, ConnectionState::Connected { .. });
 
     let status = match &state.connection {
-        ConnectionState::Disconnected => text("● Disconnected").muted(),
+        ConnectionState::Disconnected => badge("Disconnected").muted(),
         ConnectionState::Connecting { server_addr } => {
-            text(format!("● Connecting to {server_addr}...")).text_color(tokens::WARNING)
+            badge(format!("Connecting to {server_addr}…")).warning()
         }
-        ConnectionState::Connected { server_name, .. } => text(format!("● {server_name}")).text_color(tokens::SUCCESS),
+        ConnectionState::Connected { server_name, .. } => badge(server_name.clone()).success(),
         ConnectionState::ConnectionLost { error } => {
-            text(format!("● Connection lost: {error}")).text_color(tokens::DESTRUCTIVE)
+            badge(format!("Connection lost: {error}")).destructive()
         }
         ConnectionState::CertificatePending { cert_info } => {
-            text(format!("⚠ Cert pending: {}", cert_info.server_name)).text_color(tokens::WARNING)
+            badge(format!("Cert pending: {}", cert_info.server_name)).warning()
         }
     };
 
@@ -319,14 +371,7 @@ fn top_toolbar(state: &State) -> El {
         VoiceMode::Continuous => "Continuous",
     };
 
-    let mut children: Vec<El> = vec![
-        text("Rumble")
-            .font_size(tokens::FONT_LG)
-            .font_weight(FontWeight::Bold)
-            .text_color(tokens::TEXT_FOREGROUND),
-        status,
-        spacer(),
-    ];
+    let mut children: Vec<El> = vec![text("Rumble").title(), status, spacer()];
 
     if connected {
         let mute_btn = button(mute_label).key("toolbar:mute");
@@ -360,7 +405,7 @@ fn top_toolbar(state: &State) -> El {
         .align(Align::Center)
 }
 
-fn chat_sidebar(state: &State, chat_input: &str, chat_sel: TextSelection) -> El {
+fn chat_sidebar(state: &State, chat_input: &str, chat_sel: TextSelection, width: f32) -> El {
     let messages: Vec<El> = if state.chat_messages.is_empty() {
         vec![
             text(if matches!(state.connection, ConnectionState::Connected { .. }) {
@@ -375,10 +420,7 @@ fn chat_sidebar(state: &State, chat_input: &str, chat_sel: TextSelection) -> El 
     };
 
     column([
-        text("Chat")
-            .font_size(tokens::FONT_LG)
-            .font_weight(FontWeight::Semibold)
-            .padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_SM)),
+        text("Chat").title().padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_SM)),
         divider(),
         scroll(messages)
             .padding(Sides::all(tokens::SPACE_SM))
@@ -386,12 +428,12 @@ fn chat_sidebar(state: &State, chat_input: &str, chat_sel: TextSelection) -> El 
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0)),
         divider(),
-        row([text_input(chat_input, chat_sel).key("chat:input")])
+        text_input(chat_input, chat_sel)
+            .key("chat:input")
             .padding(Sides::all(tokens::SPACE_SM))
             .width(Size::Fill(1.0)),
     ])
-    .gap(0.0)
-    .width(Size::Fixed(320.0))
+    .width(Size::Fixed(width))
     .height(Size::Fill(1.0))
     .fill(tokens::BG_CARD)
 }
@@ -470,10 +512,7 @@ fn rooms_view(state: &State) -> El {
     }
 
     column([
-        text("Rooms")
-            .font_size(tokens::FONT_LG)
-            .font_weight(FontWeight::Semibold)
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
+        text("Rooms").title().padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
         divider(),
         scroll(entries)
             .padding(Sides::all(tokens::SPACE_MD))
@@ -481,7 +520,6 @@ fn rooms_view(state: &State) -> El {
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0)),
     ])
-    .gap(0.0)
     .width(Size::Fill(1.0))
     .height(Size::Fill(1.0))
 }
@@ -543,14 +581,17 @@ fn push_room_subtree(state: &State, room_id: uuid::Uuid, depth: usize, out: &mut
             .is_some_and(|id| id == room_id)
     }) {
         let user_id = user.user_id.as_ref().map(|u| u.value).unwrap_or(0);
-        let (mic_color, mic_icon) = if user.server_muted {
-            (palette::MUTED_SERVER, IconName::AlertCircle)
+        // Mic-state glyph picks up its color from the bundled Mumble
+        // SVG itself (red self-mute, blue server-mute, blue talking,
+        // green idle), so no `.text_color(...)` override here.
+        let mic_icon: SvgIcon = if user.server_muted {
+            SVG_MUTED_SERVER.clone()
         } else if user.is_muted {
-            (palette::MUTED_SELF, IconName::AlertCircle)
+            SVG_MUTED_SELF.clone()
         } else if state.audio.talking_users.contains(&user_id) {
-            (palette::TALKING, IconName::Activity)
+            SVG_TALKING_ON.clone()
         } else {
-            (palette::DIM, IconName::Activity)
+            SVG_TALKING_OFF.clone()
         };
 
         let mut name_el = text(user.username.clone()).font_size(tokens::FONT_SM);
@@ -561,7 +602,7 @@ fn push_room_subtree(state: &State, room_id: uuid::Uuid, depth: usize, out: &mut
         out.push(
             row([
                 spacer().width(Size::Fixed(indent + tokens::SPACE_LG)),
-                icon(mic_icon).text_color(mic_color).icon_size(12.0),
+                icon(mic_icon).icon_size(12.0),
                 name_el,
             ])
             .gap(tokens::SPACE_SM)
