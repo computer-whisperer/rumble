@@ -423,14 +423,14 @@ fn chat_sidebar(state: &State, chat_input: &str, chat_sel: TextSelection, width:
         text("Chat").title().padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
         divider(),
         scroll(messages)
-            .padding(Sides::all(tokens::SPACE_SM))
+            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
             .gap(tokens::SPACE_XS)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0)),
         divider(),
         text_input(chat_input, chat_sel)
             .key("chat:input")
-            .padding(Sides::all(tokens::SPACE_SM))
+            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
             .width(Size::Fill(1.0)),
     ])
     .width(Size::Fixed(width))
@@ -515,7 +515,7 @@ fn rooms_view(state: &State) -> El {
         text("Rooms").title().padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
         divider(),
         scroll(entries)
-            .padding(Sides::all(tokens::SPACE_MD))
+            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_MD))
             .gap(tokens::SPACE_XS)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0)),
