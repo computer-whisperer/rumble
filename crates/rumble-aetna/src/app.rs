@@ -408,12 +408,17 @@ fn top_toolbar(state: &State) -> El {
 fn chat_sidebar(state: &State, chat_input: &str, chat_sel: TextSelection, width: f32) -> El {
     let messages: Vec<El> = if state.chat_messages.is_empty() {
         vec![
+            // wrap_text() so the longer placeholder fits inside narrow
+            // sidebar widths (~256 px = SIDEBAR_WIDTH minus padding) —
+            // without it, "Connect to a server to start chatting"
+            // overflows by a few pixels on the default sidebar.
             text(if matches!(state.connection, ConnectionState::Connected { .. }) {
                 "No messages yet"
             } else {
                 "Connect to a server to start chatting"
             })
-            .muted(),
+            .muted()
+            .wrap_text(),
         ]
     } else {
         state.chat_messages.iter().map(render_chat_line).collect()
@@ -643,7 +648,11 @@ fn cert_modal(cert_info: &PendingCertificate) -> El {
             .gap(tokens::SPACE_SM)
             .align(Align::Center),
             text("Fingerprint (SHA-256)").muted(),
-            mono(cert_info.fingerprint_hex()).font_size(tokens::FONT_SM),
+            // SHA-256 hex with colon separators is 79 chars wide —
+            // wrap_text() so it flows across two lines instead of
+            // overflowing the modal. The user needs to read the full
+            // hash, so .ellipsis() would be wrong here.
+            mono(cert_info.fingerprint_hex()).font_size(tokens::FONT_SM).wrap_text(),
             paragraph(
                 "Only accept if this fingerprint matches what the server administrator gave you. Once accepted, the \
                  certificate is saved for future connections.",
