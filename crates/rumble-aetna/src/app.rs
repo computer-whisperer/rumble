@@ -7,12 +7,19 @@ use std::sync::LazyLock;
 
 use aetna_core::prelude::*;
 
-use rumble_desktop_shell::{AcceptedCertificate, SettingsStore};
+use rumble_desktop_shell::{
+    AcceptedCertificate, SettingsStore,
+    identity::{connect_and_list_keys, generate_and_add_to_agent},
+};
 use rumble_protocol::{Command, ConnectionState, PendingCertificate, State, VoiceMode};
+use tokio::runtime::Runtime;
 
 use crate::{
     backend::UiBackend,
+    identity::Identity,
+    settings::{self, SettingsOutcome, SettingsState},
     theme::{self as palette},
+    wizard::{self, PendingAgentOp, UnlockState, WizardOutcome, WizardState},
 };
 
 // ---- Bundled Mumble SVG glyphs ----
@@ -23,67 +30,45 @@ use crate::{
 // colors into the SVG paint — red for self-mute, blue for talking, etc.
 // — and those colors are exactly the visual signal we want to keep.
 
-static SVG_TALKING_ON: LazyLock<SvgIcon> = LazyLock::new(|| {
-    SvgIcon::parse(include_str!("../assets/icons/talking_on.svg"))
-        .expect("talking_on.svg parses")
-});
-static SVG_TALKING_OFF: LazyLock<SvgIcon> = LazyLock::new(|| {
-    SvgIcon::parse(include_str!("../assets/icons/talking_off.svg"))
-        .expect("talking_off.svg parses")
-});
-static SVG_MUTED_SELF: LazyLock<SvgIcon> = LazyLock::new(|| {
-    SvgIcon::parse(include_str!("../assets/icons/muted_self.svg"))
-        .expect("muted_self.svg parses")
-});
+static SVG_TALKING_ON: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/talking_on.svg")).expect("talking_on.svg parses"));
+static SVG_TALKING_OFF: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/talking_off.svg")).expect("talking_off.svg parses"));
+static SVG_MUTED_SELF: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/muted_self.svg")).expect("muted_self.svg parses"));
 static SVG_MUTED_SERVER: LazyLock<SvgIcon> = LazyLock::new(|| {
-    SvgIcon::parse(include_str!("../assets/icons/muted_server.svg"))
-        .expect("muted_server.svg parses")
+    SvgIcon::parse(include_str!("../assets/icons/muted_server.svg")).expect("muted_server.svg parses")
 });
-
-/// Local-only first-run identity wrapper.
-///
-/// We share the on-disk `identity.json` with `rumble-egui` /
-/// `rumble-next` so a user with an existing key can launch this client
-/// without redoing first-run.
-pub struct Identity {
-    manager: rumble_desktop_shell::KeyManager,
-}
-
-impl Identity {
-    pub fn load(config_dir: std::path::PathBuf) -> std::io::Result<Self> {
-        std::fs::create_dir_all(&config_dir)?;
-        Ok(Self {
-            manager: rumble_desktop_shell::KeyManager::new(config_dir),
-        })
-    }
-
-    pub fn public_key(&self) -> Option<[u8; 32]> {
-        self.manager.public_key_bytes()
-    }
-
-    pub fn signer(&self) -> rumble_client::SigningCallback {
-        match self.manager.create_signer() {
-            Some(s) => s,
-            None => std::sync::Arc::new(|_payload: &[u8]| Err("identity locked or unsupported".to_string())),
-        }
-    }
-
-    pub fn needs_setup(&self) -> bool {
-        self.manager.needs_setup()
-    }
-
-    pub fn manager_mut(&mut self) -> &mut rumble_desktop_shell::KeyManager {
-        &mut self.manager
-    }
-}
 
 pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     backend: B,
     identity: Identity,
     settings: SettingsStore,
 
+    /// Tokio runtime for spawning ssh-agent ops and other async work
+    /// that needs to outlive a single event handler. The wizard polls
+    /// `pending_agent_op.is_finished()` each frame and `block_on`s the
+    /// completed handle to land the result on the same frame.
+    runtime: Runtime,
+
+    /// First-run identity wizard. `NotNeeded` when an identity is
+    /// already configured.
+    wizard: WizardState,
+    /// Encrypted-key unlock prompt state. Only shown when
+    /// `identity.needs_unlock()` is true and the wizard is hidden.
+    unlock: UnlockState,
+    /// In-flight ssh-agent op spawned on `runtime`.
+    pending_agent_op: Option<PendingAgentOp>,
+
     // ---- Local UI state ----
     connect_modal_open: bool,
+    identity_modal_open: bool,
+    settings_state: SettingsState,
+    /// Force the unlock prompt visible regardless of `needs_unlock()`.
+    /// Set by `set_unlock_state_for_test` so `dump_bundles` can render
+    /// the prompt against a fresh on-disk identity that isn't actually
+    /// encrypted.
+    force_unlock_for_test: bool,
     address: String,
     address_sel: TextSelection,
     username: String,
@@ -102,12 +87,24 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
 }
 
 impl<B: UiBackend> RumbleApp<B> {
-    pub fn new(backend: B, identity: Identity, settings: SettingsStore) -> Self {
+    pub fn new(backend: B, identity: Identity, settings: SettingsStore, runtime: Runtime) -> Self {
+        let wizard = if identity.needs_setup() {
+            WizardState::SelectMethod
+        } else {
+            WizardState::NotNeeded
+        };
         Self {
             backend,
             identity,
             settings,
+            runtime,
+            wizard,
+            unlock: UnlockState::default(),
+            pending_agent_op: None,
             connect_modal_open: false,
+            identity_modal_open: false,
+            settings_state: SettingsState::default(),
+            force_unlock_for_test: false,
             address: "127.0.0.1:5000".to_string(),
             address_sel: TextSelection::default(),
             username: default_username(),
@@ -127,6 +124,10 @@ fn default_username() -> String {
 }
 
 impl<B: UiBackend> App for RumbleApp<B> {
+    fn before_build(&mut self) {
+        self.poll_agent_op();
+    }
+
     fn build(&self) -> El {
         let state = self.backend.state();
 
@@ -144,15 +145,28 @@ impl<B: UiBackend> App for RumbleApp<B> {
         .fill_size()
         .align(Align::Stretch);
 
-        let cert_layer = if let ConnectionState::CertificatePending { cert_info } = &state.connection {
+        // Wizard takes precedence over everything else — until an identity
+        // is configured the rest of the UI is read-only.
+        let wizard_open = !matches!(self.wizard, WizardState::NotNeeded | WizardState::Complete);
+        let wizard_layer = wizard::render(&self.wizard, self.pending_agent_op.is_some());
+
+        let unlock_layer = if !wizard_open && (self.identity.needs_unlock() || self.force_unlock_for_test) {
+            Some(wizard::render_unlock(&self.unlock))
+        } else {
+            None
+        };
+
+        let cert_layer = if !wizard_open
+            && unlock_layer.is_none()
+            && let ConnectionState::CertificatePending { cert_info } = &state.connection
+        {
             Some(cert_modal(cert_info))
         } else {
             None
         };
-        // Suppress the connect modal whenever a cert prompt is up — the
-        // user can't usefully edit address/username while the backend
-        // is waiting for an approval decision on the previous attempt.
-        let connect_layer = if self.connect_modal_open && cert_layer.is_none() {
+        // Suppress the connect modal whenever a higher-priority modal is up.
+        let connect_layer = if self.connect_modal_open && !wizard_open && unlock_layer.is_none() && cert_layer.is_none()
+        {
             Some(connect_modal(
                 &self.address,
                 self.address_sel,
@@ -163,14 +177,74 @@ impl<B: UiBackend> App for RumbleApp<B> {
             None
         };
 
-        if connect_layer.is_some() || cert_layer.is_some() {
-            overlays(main, [connect_layer, cert_layer])
+        let identity_layer =
+            if self.identity_modal_open && !wizard_open && unlock_layer.is_none() && cert_layer.is_none() {
+                Some(identity_modal(&self.identity))
+            } else {
+                None
+            };
+
+        let (settings_panel, settings_popover) = if !wizard_open && unlock_layer.is_none() && cert_layer.is_none() {
+            settings::render(&self.settings_state, &state, &self.identity)
+        } else {
+            (None, None)
+        };
+
+        let any_layer = wizard_layer.is_some()
+            || unlock_layer.is_some()
+            || cert_layer.is_some()
+            || connect_layer.is_some()
+            || identity_layer.is_some()
+            || settings_panel.is_some()
+            || settings_popover.is_some();
+        if any_layer {
+            // Layer order matters: paints back-to-front. The settings
+            // popover sits above its panel; the wizard sits on top of
+            // everything because nothing else is allowed to interact
+            // while it's open.
+            overlays(
+                main,
+                [
+                    identity_layer,
+                    connect_layer,
+                    settings_panel,
+                    settings_popover,
+                    cert_layer,
+                    unlock_layer,
+                    wizard_layer,
+                ],
+            )
         } else {
             main
         }
     }
 
     fn on_event(&mut self, event: UiEvent) {
+        // Wizard / unlock layers swallow everything until they're done.
+        // The wizard scrim is intentionally a no-op (no "click outside
+        // to dismiss") so the user can't end up with a half-configured
+        // identity by hitting Escape.
+        if !matches!(self.wizard, WizardState::NotNeeded | WizardState::Complete) {
+            let outcome = wizard::handle_event(&mut self.wizard, &event);
+            self.dispatch_wizard_outcome(outcome);
+            return;
+        }
+        if self.identity.needs_unlock() {
+            let outcome = wizard::handle_unlock_event(&mut self.unlock, &event);
+            self.dispatch_wizard_outcome(outcome);
+            return;
+        }
+
+        // Settings dialog owns its own routed-key namespace; let it
+        // claim its events first so the toolbar / chat / room handlers
+        // below don't accidentally swallow them.
+        if self.settings_state.open {
+            let outcome = settings::handle_event(&mut self.settings_state, &event);
+            if self.dispatch_settings_outcome(outcome) {
+                return;
+            }
+        }
+
         // Chat sidebar resize. Routed events return early so the
         // handle's drag stream doesn't fall through to other matchers.
         if event.route() == Some(CHAT_SIDEBAR_HANDLE) {
@@ -271,6 +345,31 @@ impl<B: UiBackend> App for RumbleApp<B> {
             self.backend.send(Command::Disconnect);
             return;
         }
+        if event.is_click_or_activate("toolbar:identity") {
+            self.identity_modal_open = true;
+            return;
+        }
+        if event.is_click_or_activate("toolbar:settings") {
+            let snapshot = self.backend.state();
+            self.settings_state
+                .open_with(&snapshot.audio, self.settings.settings(), &self.username);
+            return;
+        }
+        if event.is_click_or_activate("identity:close")
+            || event.is_route("identity:dismiss") && event.kind == UiEventKind::Click
+            || (self.identity_modal_open && event.kind == UiEventKind::Escape)
+        {
+            self.identity_modal_open = false;
+            return;
+        }
+        if event.is_click_or_activate("identity:regenerate") {
+            // Drop the modal, re-enter the wizard. Existing key on disk
+            // is *not* deleted yet — only overwritten if the user
+            // actually completes a Generate / Select flow.
+            self.identity_modal_open = false;
+            self.wizard = WizardState::SelectMethod;
+            return;
+        }
 
         // Click a room row to join it.
         if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
@@ -317,12 +416,14 @@ impl<B: UiBackend> RumbleApp<B> {
 
     fn do_connect(&mut self) {
         let Some(public_key) = self.identity.public_key() else {
-            tracing::warn!("rumble-aetna: no identity key — first-run wizard not implemented yet");
-            self.backend.send(Command::LocalMessage {
-                text: "No identity key configured. Run rumble-egui or rumble-next once to generate one.".to_string(),
-            });
+            // Wizard should be open in this case — fall through silently.
+            tracing::warn!("rumble-aetna: connect attempted before identity setup");
             return;
         };
+        if self.identity.needs_unlock() {
+            // Unlock modal is up; user has to enter password first.
+            return;
+        }
         let signer = self.identity.signer();
         let addr = if self.address.trim().is_empty() {
             "127.0.0.1:5000".to_string()
@@ -340,6 +441,295 @@ impl<B: UiBackend> RumbleApp<B> {
             password: None,
         });
     }
+
+    // ---------- wizard plumbing ----------
+
+    fn dispatch_wizard_outcome(&mut self, outcome: WizardOutcome) {
+        match outcome {
+            WizardOutcome::Ignored | WizardOutcome::Handled => {}
+            WizardOutcome::SpawnConnect => {
+                self.spawn_connect_op();
+            }
+            WizardOutcome::SpawnAddKey { comment } => {
+                self.spawn_add_key_op(comment);
+            }
+            WizardOutcome::GenerateLocal { password } => {
+                if let Some(info) = wizard::apply_generate_local(&mut self.wizard, &mut self.identity, password) {
+                    self.notify_identity_ready(format!("Identity key generated: {}", info.fingerprint));
+                }
+            }
+            WizardOutcome::SelectAgentKey { key_info } => {
+                if let Some(info) = wizard::apply_select_agent_key(&mut self.wizard, &mut self.identity, &key_info) {
+                    self.notify_identity_ready(format!("Using SSH agent key: {} ({})", info.comment, info.fingerprint));
+                }
+            }
+            WizardOutcome::Unlock { password } => {
+                if wizard::apply_unlock(&mut self.unlock, &mut self.identity) {
+                    let _ = password;
+                    self.backend.send(Command::LocalMessage {
+                        text: "Identity unlocked.".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn spawn_connect_op(&mut self) {
+        if self.pending_agent_op.is_some() {
+            return;
+        }
+        let handle = self.runtime.spawn(connect_and_list_keys());
+        self.pending_agent_op = Some(PendingAgentOp::Connect(handle));
+    }
+
+    fn spawn_add_key_op(&mut self, comment: String) {
+        if self.pending_agent_op.is_some() {
+            return;
+        }
+        let handle = self.runtime.spawn(generate_and_add_to_agent(comment));
+        self.pending_agent_op = Some(PendingAgentOp::AddKey(handle));
+    }
+
+    /// Drain a finished agent op, advancing wizard state with the result.
+    /// Called from `before_build` so the new state is visible on the
+    /// next frame.
+    fn poll_agent_op(&mut self) {
+        let Some(op) = self.pending_agent_op.as_ref() else {
+            return;
+        };
+        let finished = match op {
+            PendingAgentOp::Connect(h) => h.is_finished(),
+            PendingAgentOp::AddKey(h) => h.is_finished(),
+        };
+        if !finished {
+            return;
+        }
+        match self.pending_agent_op.take().unwrap() {
+            PendingAgentOp::Connect(handle) => match self.runtime.block_on(handle) {
+                Ok(Ok(keys)) => {
+                    self.wizard = WizardState::SelectAgentKey {
+                        keys,
+                        selected: None,
+                        error: None,
+                    };
+                }
+                Ok(Err(e)) => {
+                    self.wizard = WizardState::Error {
+                        message: format!("Failed to connect to SSH agent: {e}"),
+                    };
+                }
+                Err(e) => {
+                    self.wizard = WizardState::Error {
+                        message: format!("Agent operation panicked: {e}"),
+                    };
+                }
+            },
+            PendingAgentOp::AddKey(handle) => match self.runtime.block_on(handle) {
+                Ok(Ok(key_info)) => {
+                    if let Some(info) = wizard::apply_select_agent_key(&mut self.wizard, &mut self.identity, &key_info)
+                    {
+                        self.notify_identity_ready(format!(
+                            "Added new SSH agent key: {} ({})",
+                            info.comment, info.fingerprint
+                        ));
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.wizard = WizardState::Error {
+                        message: format!("Failed to add key to agent: {e}"),
+                    };
+                }
+                Err(e) => {
+                    self.wizard = WizardState::Error {
+                        message: format!("Agent operation panicked: {e}"),
+                    };
+                }
+            },
+        }
+    }
+
+    fn notify_identity_ready(&self, msg: String) {
+        self.backend.send(Command::LocalMessage { text: msg });
+    }
+
+    /// Route a [`SettingsOutcome`] back into the App. Returns `true`
+    /// when the outcome consumed the originating event, so the parent
+    /// handler can short-circuit.
+    fn dispatch_settings_outcome(&mut self, outcome: SettingsOutcome) -> bool {
+        match outcome {
+            SettingsOutcome::Ignored => false,
+            SettingsOutcome::Handled => true,
+            SettingsOutcome::Close => {
+                self.settings_state.close();
+                true
+            }
+            SettingsOutcome::OpenIdentityWizard => {
+                self.settings_state.close();
+                self.wizard = WizardState::SelectMethod;
+                true
+            }
+            SettingsOutcome::PreviewSfx { kind, volume } => {
+                self.backend.send(Command::PlaySfx { kind, volume });
+                true
+            }
+            SettingsOutcome::RefreshDevices => {
+                self.backend.send(Command::RefreshAudioDevices);
+                true
+            }
+            SettingsOutcome::ResetStats => {
+                self.backend.send(Command::ResetAudioStats);
+                true
+            }
+            SettingsOutcome::Save(pending) => {
+                self.apply_settings(pending);
+                self.settings_state.close();
+                true
+            }
+        }
+    }
+
+    /// Persist a [`PendingSettings`] snapshot: write the shared shell
+    /// fields through `SettingsStore.modify`, dispatch backend commands
+    /// for the runtime-mutating fields (audio settings, voice mode,
+    /// device selection), and update App-owned state (username).
+    fn apply_settings(&mut self, pending: settings::PendingSettings) {
+        // App-owned: username affects the next Connect command.
+        let trimmed = pending.username.trim();
+        if !trimmed.is_empty() {
+            self.username = trimmed.to_string();
+        }
+
+        // Backend: audio + voice mode + device selection. These all
+        // hit the audio task immediately rather than going through the
+        // settings store, so we send them even when the value didn't
+        // change — they're idempotent.
+        self.backend.send(Command::UpdateAudioSettings {
+            settings: pending.audio.clone(),
+        });
+        self.backend.send(Command::SetVoiceMode {
+            mode: VoiceMode::from(pending.voice_mode),
+        });
+        self.backend.send(Command::SetInputDevice {
+            device_id: pending.input_device.clone(),
+        });
+        self.backend.send(Command::SetOutputDevice {
+            device_id: pending.output_device.clone(),
+        });
+
+        // Shared shell store. Done last so the `modify` block sees the
+        // most-recent username for the autoconnect bookkeeping.
+        let username = self.username.clone();
+        self.settings.modify(|s| {
+            // Audio + voice mode mirror what the backend will report
+            // back; persisting them here means a restart re-applies
+            // the same configuration.
+            s.audio = (&pending.audio).into();
+            s.voice_mode = pending.voice_mode;
+            s.input_device_id = pending.input_device.clone();
+            s.output_device_id = pending.output_device.clone();
+
+            // Sounds.
+            s.sfx.enabled = pending.sfx_enabled;
+            s.sfx.volume = pending.sfx_volume.clamp(0.0, 1.0);
+            s.sfx.disabled_sounds.clear();
+            for (idx, kind) in rumble_client::SfxKind::all().iter().enumerate() {
+                if !pending.sfx_kind_enabled.get(idx).copied().unwrap_or(true) {
+                    s.sfx.disabled_sounds.insert(*kind);
+                }
+            }
+
+            // Chat.
+            s.chat.show_timestamps = pending.show_timestamps;
+            s.chat.timestamp_format = pending.timestamp_format;
+            s.chat.auto_sync_history = pending.auto_sync_history;
+
+            // Files (auto-download flag + bandwidth + flags only;
+            // per-MIME rules aren't editable in this client yet).
+            s.file_transfer.auto_download_enabled = pending.auto_download_enabled;
+            s.file_transfer.download_speed_limit = (pending.download_speed_kbps as u64) * 1024;
+            s.file_transfer.upload_speed_limit = (pending.upload_speed_kbps as u64) * 1024;
+            s.file_transfer.seed_after_download = pending.seed_after_download;
+            s.file_transfer.cleanup_on_exit = pending.cleanup_on_exit;
+
+            // Autoconnect: only meaningful once we have a recent server
+            // to point at, so reuse the most-recent entry's address. If
+            // there isn't one yet we just store the flag intent by
+            // marking the username on whatever current addr we have —
+            // the actual auto-connect resolver runs at startup.
+            if pending.autoconnect {
+                let target = s
+                    .recent_servers
+                    .iter()
+                    .max_by_key(|r| r.last_used_unix)
+                    .map(|r| r.addr.clone());
+                if let Some(addr) = target {
+                    s.auto_connect_addr = Some(addr);
+                } else {
+                    // No recent server yet — clear so we don't claim
+                    // to autoconnect to nothing.
+                    s.auto_connect_addr = None;
+                }
+            } else {
+                s.auto_connect_addr = None;
+            }
+
+            // Username: keep recent_servers' username field in sync
+            // with the user's current display name on the latest entry,
+            // matching the rumble-egui behaviour.
+            if let Some(recent) = s.recent_servers.iter_mut().max_by_key(|r| r.last_used_unix) {
+                recent.username = username.clone();
+            }
+        });
+
+        self.backend.send(Command::LocalMessage {
+            text: "Settings saved.".to_string(),
+        });
+    }
+
+    /// Test/scene-dump escape hatch: pretend the identity wizard is
+    /// satisfied so callers can render scenes that aren't supposed to
+    /// be obscured by it (every scene in `dump_bundles`, every test).
+    pub fn suppress_first_run_for_test(&mut self) {
+        self.wizard = WizardState::NotNeeded;
+        self.unlock = UnlockState::default();
+    }
+
+    /// Test/scene-dump hook: drive the wizard into a specific state so
+    /// `dump_bundles` can render every wizard screen for visual review.
+    pub fn set_wizard_state_for_test(&mut self, state: WizardState) {
+        self.wizard = state;
+    }
+
+    /// Test/scene-dump hook for the encrypted-key unlock prompt. The
+    /// prompt is normally gated on `Identity::needs_unlock()`; this also
+    /// flips the test override so a fresh on-disk identity still
+    /// produces the modal.
+    pub fn set_unlock_state_for_test(&mut self, state: UnlockState) {
+        self.unlock = state;
+        self.force_unlock_for_test = true;
+    }
+
+    /// Test/scene-dump hook for the toolbar "Identity" modal.
+    pub fn set_identity_modal_open_for_test(&mut self, open: bool) {
+        self.identity_modal_open = open;
+    }
+
+    /// Test/scene-dump hook for the settings dialog. Snapshots the
+    /// current backend audio state + shared shell settings into the
+    /// settings UI state and forces the requested tab to active.
+    pub fn open_settings_for_test(&mut self, tab: settings::SettingsTab) {
+        let snapshot = self.backend.state();
+        self.settings_state
+            .open_with(&snapshot.audio, self.settings.settings(), &self.username);
+        self.settings_state.tab = Some(tab);
+    }
+
+    /// Test/scene-dump hook for the timestamp-format dropdown inside
+    /// the settings dialog. Used to render the Chat tab with its
+    /// dropdown menu open.
+    pub fn open_settings_dropdown_for_test(&mut self, which: settings::OpenSelect) {
+        self.settings_state.open_select = which;
+    }
 }
 
 // ---------- view helpers ----------
@@ -351,13 +741,9 @@ fn top_toolbar(state: &State) -> El {
 
     let status = match &state.connection {
         ConnectionState::Disconnected => badge("Disconnected").muted(),
-        ConnectionState::Connecting { server_addr } => {
-            badge(format!("Connecting to {server_addr}…")).warning()
-        }
+        ConnectionState::Connecting { server_addr } => badge(format!("Connecting to {server_addr}…")).warning(),
         ConnectionState::Connected { server_name, .. } => badge(server_name.clone()).success(),
-        ConnectionState::ConnectionLost { error } => {
-            badge(format!("Connection lost: {error}")).destructive()
-        }
+        ConnectionState::ConnectionLost { error } => badge(format!("Connection lost: {error}")).destructive(),
         ConnectionState::CertificatePending { cert_info } => {
             badge(format!("Cert pending: {}", cert_info.server_name)).warning()
         }
@@ -396,6 +782,9 @@ fn top_toolbar(state: &State) -> El {
         children.push(button("Connect…").key("connect:open").primary());
     }
 
+    children.push(button("Identity").key("toolbar:identity").ghost());
+    children.push(button("Settings").key("toolbar:settings").ghost());
+
     row(children)
         .gap(tokens::SPACE_SM)
         .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
@@ -425,7 +814,9 @@ fn chat_sidebar(state: &State, chat_input: &str, chat_sel: TextSelection, width:
     };
 
     column([
-        text("Chat").title().padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
+        text("Chat")
+            .title()
+            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
         divider(),
         scroll(messages)
             .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
@@ -517,7 +908,9 @@ fn rooms_view(state: &State) -> El {
     }
 
     column([
-        text("Rooms").title().padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
+        text("Rooms")
+            .title()
+            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
         divider(),
         scroll(entries)
             .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_MD))
@@ -663,6 +1056,67 @@ fn cert_modal(cert_info: &PendingCertificate) -> El {
                 button("Reject").key("cert:reject"),
                 spacer(),
                 button("Trust and connect").key("cert:accept").primary(),
+            ])
+            .gap(tokens::SPACE_SM)
+            .width(Size::Fill(1.0))
+            .align(Align::Center),
+        ],
+    )
+}
+
+fn identity_modal(identity: &Identity) -> El {
+    use rumble_desktop_shell::KeySource;
+
+    let fingerprint = identity.fingerprint();
+    let (source_label, detail) = match identity.manager().config().map(|c| &c.source) {
+        Some(KeySource::LocalPlaintext { .. }) => (
+            "Local key (plaintext)",
+            "Stored unencrypted at identity.json — fine for personal machines.".to_string(),
+        ),
+        Some(KeySource::LocalEncrypted { .. }) => (
+            "Local key (encrypted)",
+            "Encrypted with Argon2 + ChaCha20-Poly1305. Password required at startup.".to_string(),
+        ),
+        Some(KeySource::SshAgent {
+            fingerprint: agent_fp,
+            comment,
+        }) => {
+            let line = if comment.is_empty() {
+                format!("ssh-agent fingerprint: {agent_fp}")
+            } else {
+                format!("ssh-agent: {comment} ({agent_fp})")
+            };
+            ("SSH agent", line)
+        }
+        None => ("Not configured", "Run the identity wizard to set this up.".to_string()),
+    };
+    let path = identity.manager().config_dir().join("identity.json");
+
+    modal(
+        "identity",
+        "Rumble identity",
+        [
+            text("Fingerprint (SHA-256)").muted(),
+            mono(fingerprint).font_size(tokens::FONT_SM).wrap_text(),
+            divider(),
+            text("Storage").muted(),
+            text(source_label.to_string()).font_weight(FontWeight::Semibold),
+            paragraph(detail).muted().font_size(tokens::FONT_SM),
+            text("On disk").muted(),
+            mono(path.display().to_string()).font_size(tokens::FONT_SM).wrap_text(),
+            divider(),
+            paragraph(
+                "Generating a new identity overwrites identity.json. Servers that knew the old key won't recognise \
+                 the new one — you'll have to re-register or be re-approved.",
+            )
+            .text_color(tokens::WARNING)
+            .font_size(tokens::FONT_SM),
+            row([
+                button("Close").key("identity:close"),
+                spacer(),
+                button("Generate new identity…")
+                    .key("identity:regenerate")
+                    .destructive(),
             ])
             .gap(tokens::SPACE_SM)
             .width(Size::Fill(1.0))

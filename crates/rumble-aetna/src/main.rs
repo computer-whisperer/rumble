@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use aetna_core::Rect;
 use aetna_winit_wgpu::HostConfig;
-use rumble_aetna::{NativeUiBackend, RumbleApp, app::Identity};
+use rumble_aetna::{Identity, NativeUiBackend, RumbleApp};
 use rumble_client::{ConnectConfig, handle::BackendHandle};
 use rumble_desktop_shell::SettingsStore;
 
@@ -31,7 +31,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = BackendHandle::<rumble_desktop::NativePlatform>::with_config(|| {}, connect_config);
     let backend = NativeUiBackend::new(backend);
 
-    let app = RumbleApp::new(backend, identity, settings);
+    // Owned tokio runtime for ssh-agent ops fired from the wizard. Kept
+    // separate from the BackendHandle's internal runtime so the App can
+    // freely block_on the wizard's join handles without re-entering the
+    // backend's reactor.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()?;
+
+    let app = RumbleApp::new(backend, identity, settings, runtime);
     let viewport = Rect::new(0.0, 0.0, 1280.0, 800.0);
     let host_config = HostConfig::default().with_redraw_interval(Duration::from_millis(33));
     aetna_winit_wgpu::run_with_config("Rumble", viewport, app, host_config)?;

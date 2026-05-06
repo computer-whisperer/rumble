@@ -11,33 +11,46 @@ Rumble is a voice chat application (similar to Discord/Mumble) written in Rust. 
 ```bash
 cargo build                    # Build all crates
 cargo run --bin server         # Run the server
-cargo run -p rumble-egui       # Run the GUI client
+cargo run -p rumble-aetna      # Run the GUI client (active)
 cargo test                     # Run all tests
 cargo +nightly fmt             # Format code
-RUST_LOG=debug cargo run -p rumble-egui  # Run with debug logging
+RUST_LOG=debug cargo run -p rumble-aetna  # Run with debug logging
 ```
 
-When fixing build issues, run `cargo build -p rumble-egui` and address the **first** error (later errors are often cascading).
+When fixing build issues, run `cargo build -p rumble-aetna` and address the **first** error (later errors are often cascading).
 
 ## Crate Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│           rumble-egui (GUI Application)             │
-│              Uses egui + eframe for UI              │
-└───────────────────────┬─────────────────────────────┘
-                        │ Commands / State reads
-                        ▼
-┌─────────────────────────────────────────────────────┐
-│           rumble-client (Client Library)            │
-│   BackendHandle with Arc<RwLock<State>>             │
-│   ┌─────────────────┐  ┌────────────────────┐       │
-│   │ Connection Task │  │ Audio Task         │       │
-│   │ - QUIC streams  │  │ - QUIC datagrams   │       │
-│   │ - Protocol msgs │  │ - cpal I/O         │       │
-│   │ - State sync    │  │ - Opus encode/dec  │       │
-│   └─────────────────┘  └────────────────────┘       │
-└───────────────────────┬─────────────────────────────┘
+        Active client                   Reference-only (deprecated)
+┌─────────────────────────┐    ┌─────────────────────┬─────────────────────┐
+│   rumble-aetna (GUI)    │    │ rumble-egui (ref)   │ rumble-next (ref)   │
+│  aetna-core / winit-wgpu│    │ feature-polished    │ theming experiment  │
+└───────────┬─────────────┘    └──────────┬──────────┴──────────┬──────────┘
+            │                             │                     │
+            └──────── all consume ────────┴─────────────────────┘
+                                  │
+                                  ▼
+            ┌─────────────────────────────────────────────┐
+            │       rumble-desktop-shell                  │
+            │  settings store, identity files (Argon2 +   │
+            │  ChaCha20Poly1305), ssh-agent, global       │
+            │  hotkeys, XDG GlobalShortcuts portal        │
+            └─────────────────────┬───────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────┐
+│              rumble-client (Client Library)                 │
+│   BackendHandle with Arc<RwLock<State>>                     │
+│   ┌─────────────────┐  ┌────────────────────┐               │
+│   │ Connection Task │  │ Audio Task         │               │
+│   │ - QUIC streams  │  │ - QUIC datagrams   │               │
+│   │ - Protocol msgs │  │ - cpal I/O         │               │
+│   │ - State sync    │  │ - Opus encode/dec  │               │
+│   └─────────────────┘  └────────────────────┘               │
+│   Platform trait via rumble-client-traits                   │
+│   Desktop impl provided by rumble-desktop                   │
+└───────────────────────┬─────────────────────────────────────┘
                         │
          ┌──────────────┼──────────────┐
          ▼              ▼              ▼
@@ -55,16 +68,28 @@ When fixing build issues, run `cargo build -p rumble-egui` and address the **fir
                                └─────────────┘
 ```
 
+### Client Status
+
+- **rumble-aetna** is the active client going forward. Built on the aetna UI library (vendored at `vendor/aetna/`, uses winit + wgpu directly), giving proper SVG/icon support, color emoji, and a smaller widget surface than egui.
+- **rumble-egui** and **rumble-next** are **deprecated** but kept around as references:
+  - `rumble-egui` — most feature-polished implementation; consult it when porting functionality (settings UI, file transfer flows, hotkey config, ACL editor, etc.) to aetna.
+  - `rumble-next` — testbed for a significant theming/visual-redesign pass over the egui stack. Useful as a reference for visual design intent, less so for feature breadth.
+- New feature work belongs in `rumble-aetna`. Do not add features to `rumble-egui` or `rumble-next` unless explicitly asked.
+
 ### Crate Responsibilities
 
-- **rumble-protocol**: Protocol Buffers definitions (`proto/api.proto`), message framing, BLAKE3 state hashing
-- **rumble-client**: Client library - QUIC connection, audio I/O (cpal), Opus codec, jitter buffers
+- **rumble-protocol**: Protocol Buffers definitions (`proto/api.proto`), message framing, BLAKE3 state hashing, shared types (`State`, `Command`, `ConnectionState`, etc.)
+- **rumble-client**: Client engine — QUIC connection, audio I/O, Opus codec, jitter buffers; depends only on `rumble-client-traits` (no platform code)
 - **rumble-client-traits**: Platform-agnostic client traits (transport, audio, codec, keys, storage)
 - **rumble-desktop**: Native desktop Platform implementation (quinn, cpal, opus, ed25519)
-- **server**: Server binary - room management, user auth, message relay, persistence (sled)
+- **rumble-desktop-shell**: Shared shell-level concerns for desktop clients — persistent settings store, identity-file management (encrypted-at-rest via Argon2 + ChaCha20Poly1305), ssh-agent identity, cross-platform global hotkeys, XDG GlobalShortcuts portal. Consumed by all three desktop clients (`rumble-aetna`, `rumble-egui`, `rumble-next`).
 - **rumble-audio**: Pluggable audio processor framework (denoise, VAD, gain control)
-- **rumble-egui**: GUI client using egui with tree view for room hierarchy; also exports `TestHarness` for programmatic UI control
-- **harness-cli**: Daemon-based CLI for automated GUI testing with screenshots and input injection
+- **rumble-aetna**: Active GUI client. Built on aetna-core + aetna-winit-wgpu. `App` impl projects `(state, ui_state) → El` tree per frame; `UiBackend` adapter wraps `BackendHandle`.
+- **rumble-egui**: *(deprecated, reference)* egui-based GUI client; most feature-complete implementation. Also exports `TestHarness` for programmatic UI control.
+- **rumble-next**: *(deprecated, reference)* egui-based GUI client experimenting with a theme/visual redesign on top of `rumble-widgets`.
+- **rumble-widgets**: Custom egui widget library (radio, toggle, slider, tree, combo box, Luna theme overrides). Consumed by `rumble-next`. See pixel-snapping section below.
+- **server**: Server binary — room management, user auth, message relay, persistence (sled), ACL system
+- **harness-cli**: Daemon-based CLI for automated GUI testing with screenshots and input injection (currently targets `rumble-egui` via its `TestHarness`)
 - **mumble-bridge**: Bidirectional bridge between Mumble and Rumble servers, proxying voice and chat
 
 ## Key Architecture Patterns
@@ -130,11 +155,11 @@ Located in `vendor/`. Used primarily for reference; code links against GitHub ve
 
 ## GUI Test Harness
 
-The `rumble-egui` crate is structured as both a library and binary, enabling programmatic control of the GUI for agents and integration tests. See [docs/test-harness.md](docs/test-harness.md) for API details and code examples.
+The `rumble-egui` crate is structured as both a library and binary, enabling programmatic control of the GUI for agents and integration tests. See [docs/test-harness.md](docs/test-harness.md) for API details and code examples. **Note**: this harness drives the deprecated egui client — it has not yet been ported to `rumble-aetna`.
 
 ## Harness CLI (for agent iteration loops)
 
-Daemon-based CLI for automated GUI testing. See [crates/harness-cli/README.md](crates/harness-cli/README.md) for full documentation.
+Daemon-based CLI for automated GUI testing. Currently targets `rumble-egui` (deprecated). See [crates/harness-cli/README.md](crates/harness-cli/README.md) for full documentation.
 
 ```bash
 # Start everything (daemon + server + client) and take screenshot

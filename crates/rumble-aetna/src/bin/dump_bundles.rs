@@ -15,17 +15,17 @@
 //! draw-op stream the wgpu Runner would, so layout regressions show
 //! up faithfully without spinning up a window or device.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::{path::PathBuf, sync::Arc, time::SystemTime};
 
 use aetna_core::prelude::*;
 
-use rumble_aetna::{RumbleApp, app::Identity, backend::UiBackend};
-use rumble_desktop_shell::SettingsStore;
+use rumble_aetna::{
+    Identity, RumbleApp, SettingsOpenSelect, SettingsTab, UnlockState, WizardState, backend::UiBackend,
+};
+use rumble_desktop_shell::{KeyInfo, SettingsStore};
 use rumble_protocol::{
-    AudioState, ChatMessage, ChatMessageKind, Command, ConnectionState, PendingCertificate,
-    State, Uuid, VoiceMode,
+    AudioDeviceInfo, AudioState, AudioStats, ChatMessage, ChatMessageKind, Command, ConnectionState,
+    PendingCertificate, State, Uuid, VoiceMode,
     proto::{RoomInfo, User, UserId},
     room_id_from_uuid,
 };
@@ -68,6 +68,32 @@ enum Scene {
     ConnectionLost,
     /// Cert acceptance modal up over the disconnected backdrop.
     CertPending,
+    /// First-run wizard: choose between local key and ssh-agent.
+    WizardSelectMethod,
+    /// First-run wizard: local-key password entry.
+    WizardGenerateLocal,
+    /// First-run wizard: ssh-agent key picker.
+    WizardSelectAgentKey,
+    /// First-run wizard: terminal error screen.
+    WizardError,
+    /// Encrypted-key unlock prompt at startup.
+    UnlockPrompt,
+    /// Toolbar "Identity" modal showing the configured key + regenerate.
+    IdentityModal,
+    /// Settings dialog — Connection tab (default).
+    SettingsConnection,
+    /// Settings dialog — Devices tab with the input dropdown open.
+    SettingsDevices,
+    /// Settings dialog — Voice tab (encoder/jitter/PTT toggles).
+    SettingsVoice,
+    /// Settings dialog — Sounds tab (sfx toggles + per-event preview).
+    SettingsSounds,
+    /// Settings dialog — Chat tab with the timestamp-format dropdown open.
+    SettingsChat,
+    /// Settings dialog — Files tab (auto-download + bandwidth).
+    SettingsFiles,
+    /// Settings dialog — Stats tab (read-only audio metrics).
+    SettingsStats,
 }
 
 impl Scene {
@@ -78,6 +104,19 @@ impl Scene {
         Scene::Connected,
         Scene::ConnectionLost,
         Scene::CertPending,
+        Scene::WizardSelectMethod,
+        Scene::WizardGenerateLocal,
+        Scene::WizardSelectAgentKey,
+        Scene::WizardError,
+        Scene::UnlockPrompt,
+        Scene::IdentityModal,
+        Scene::SettingsConnection,
+        Scene::SettingsDevices,
+        Scene::SettingsVoice,
+        Scene::SettingsSounds,
+        Scene::SettingsChat,
+        Scene::SettingsFiles,
+        Scene::SettingsStats,
     ];
 
     fn slug(self) -> &'static str {
@@ -88,6 +127,19 @@ impl Scene {
             Scene::Connected => "connected",
             Scene::ConnectionLost => "connection_lost",
             Scene::CertPending => "cert_pending",
+            Scene::WizardSelectMethod => "wizard_select_method",
+            Scene::WizardGenerateLocal => "wizard_generate_local",
+            Scene::WizardSelectAgentKey => "wizard_select_agent_key",
+            Scene::WizardError => "wizard_error",
+            Scene::UnlockPrompt => "unlock_prompt",
+            Scene::IdentityModal => "identity_modal",
+            Scene::SettingsConnection => "settings_connection",
+            Scene::SettingsDevices => "settings_devices",
+            Scene::SettingsVoice => "settings_voice",
+            Scene::SettingsSounds => "settings_sounds",
+            Scene::SettingsChat => "settings_chat",
+            Scene::SettingsFiles => "settings_files",
+            Scene::SettingsStats => "settings_stats",
         }
     }
 
@@ -114,6 +166,29 @@ impl Scene {
                 },
                 ..State::default()
             },
+            Scene::WizardSelectMethod
+            | Scene::WizardGenerateLocal
+            | Scene::WizardSelectAgentKey
+            | Scene::WizardError
+            | Scene::UnlockPrompt
+            | Scene::IdentityModal
+            | Scene::SettingsConnection
+            | Scene::SettingsChat
+            | Scene::SettingsVoice
+            | Scene::SettingsSounds
+            | Scene::SettingsFiles => State::default(),
+            // The Devices scene needs realistic input/output device
+            // lists so the dropdown menu is non-trivial; the Stats
+            // scene needs non-zero counters so the read-only grid
+            // shows real numbers.
+            Scene::SettingsDevices => State {
+                audio: device_state(),
+                ..State::default()
+            },
+            Scene::SettingsStats => State {
+                audio: stats_state(),
+                ..State::default()
+            },
         }
     }
 
@@ -127,8 +202,68 @@ impl Scene {
             Scene::ConnectModalOpen => {
                 app.on_event(UiEvent::synthetic_click("connect:open"));
             }
+            Scene::WizardSelectMethod => {
+                app.set_wizard_state_for_test(WizardState::SelectMethod);
+            }
+            Scene::WizardGenerateLocal => {
+                app.set_wizard_state_for_test(WizardState::GenerateLocal {
+                    password: "hunter2".to_string(),
+                    password_sel: aetna_core::TextSelection::default(),
+                    confirm: "hunter".to_string(),
+                    confirm_sel: aetna_core::TextSelection::default(),
+                    error: None,
+                });
+            }
+            Scene::WizardSelectAgentKey => {
+                app.set_wizard_state_for_test(WizardState::SelectAgentKey {
+                    keys: demo_agent_keys(),
+                    selected: Some(1),
+                    error: None,
+                });
+            }
+            Scene::WizardError => {
+                app.set_wizard_state_for_test(WizardState::Error {
+                    message: "Failed to connect to SSH agent: SSH_AUTH_SOCK is not set".to_string(),
+                });
+            }
+            Scene::UnlockPrompt => {
+                app.set_unlock_state_for_test(UnlockState {
+                    password: "••••".to_string(),
+                    password_sel: aetna_core::TextSelection::default(),
+                    error: Some("Wrong password — try again.".to_string()),
+                });
+            }
+            Scene::IdentityModal => {
+                app.set_identity_modal_open_for_test(true);
+            }
+            Scene::SettingsConnection => app.open_settings_for_test(SettingsTab::Connection),
+            Scene::SettingsDevices => {
+                app.open_settings_for_test(SettingsTab::Devices);
+                app.open_settings_dropdown_for_test(SettingsOpenSelect::InputDevice);
+            }
+            Scene::SettingsVoice => app.open_settings_for_test(SettingsTab::Voice),
+            Scene::SettingsSounds => app.open_settings_for_test(SettingsTab::Sounds),
+            Scene::SettingsChat => {
+                app.open_settings_for_test(SettingsTab::Chat);
+                app.open_settings_dropdown_for_test(SettingsOpenSelect::TimestampFormat);
+            }
+            Scene::SettingsFiles => app.open_settings_for_test(SettingsTab::Files),
+            Scene::SettingsStats => app.open_settings_for_test(SettingsTab::Stats),
             _ => {}
         }
+    }
+
+    /// True for scenes that purposefully render the first-run / unlock
+    /// modal — those need the suppression hook left alone.
+    fn keeps_first_run(self) -> bool {
+        matches!(
+            self,
+            Scene::WizardSelectMethod
+                | Scene::WizardGenerateLocal
+                | Scene::WizardSelectAgentKey
+                | Scene::WizardError
+                | Scene::UnlockPrompt
+        )
     }
 }
 
@@ -217,15 +352,92 @@ fn connected_state() -> State {
     state
 }
 
+fn device_state() -> AudioState {
+    AudioState {
+        input_devices: vec![
+            AudioDeviceInfo {
+                id: "alsa:default".to_string(),
+                name: "Default (PulseAudio)".to_string(),
+                pipeline: None,
+                is_default: true,
+            },
+            AudioDeviceInfo {
+                id: "alsa:usb-mic".to_string(),
+                name: "Blue Yeti USB Microphone".to_string(),
+                pipeline: None,
+                is_default: false,
+            },
+            AudioDeviceInfo {
+                id: "alsa:webcam".to_string(),
+                name: "Logitech HD Pro Webcam C920".to_string(),
+                pipeline: None,
+                is_default: false,
+            },
+        ],
+        output_devices: vec![
+            AudioDeviceInfo {
+                id: "alsa:hdmi".to_string(),
+                name: "HDMI 1 (Built-in Audio)".to_string(),
+                pipeline: None,
+                is_default: false,
+            },
+            AudioDeviceInfo {
+                id: "alsa:headphones".to_string(),
+                name: "Sennheiser HD 600 (USB DAC)".to_string(),
+                pipeline: None,
+                is_default: true,
+            },
+        ],
+        selected_input: Some("alsa:usb-mic".to_string()),
+        selected_output: Some("alsa:headphones".to_string()),
+        ..AudioState::default()
+    }
+}
+
+fn stats_state() -> AudioState {
+    let mut stats = AudioStats::default();
+    stats.actual_bitrate_bps = 64_000.0;
+    stats.avg_frame_size_bytes = 159.4;
+    stats.packets_sent = 12_804;
+    stats.packets_received = 12_731;
+    stats.packets_lost = 73;
+    stats.packets_recovered_fec = 41;
+    stats.frames_concealed = 14;
+    stats.playback_buffer_packets = 3;
+    AudioState {
+        stats,
+        ..AudioState::default()
+    }
+}
+
+fn demo_agent_keys() -> Vec<KeyInfo> {
+    vec![
+        KeyInfo {
+            fingerprint: "SHA256:7gK3qPL5dEvF8sN1xR9wT2yJ4mB6cZ0aV/X+kH=".into(),
+            comment: "alice@workstation".into(),
+            public_key: [0u8; 32],
+        },
+        KeyInfo {
+            fingerprint: "SHA256:Q9mNxV3pA2dLcK7yE5sT1jR4hF6oZ8bU/W+iH==".into(),
+            comment: "rumble-identity".into(),
+            public_key: [1u8; 32],
+        },
+        KeyInfo {
+            fingerprint: "SHA256:M2tXrY5pL7vC1qA8nB3kE9oH4jD6sZ0wU/V+iK==".into(),
+            comment: "yubikey".into(),
+            public_key: [2u8; 32],
+        },
+    ]
+}
+
 fn demo_pending_cert() -> PendingCertificate {
     let no_op_signer: rumble_client::SigningCallback =
         Arc::new(|_payload: &[u8]| Err("fixture identity is not signing".to_string()));
     PendingCertificate {
         certificate_der: vec![0u8; 32],
         fingerprint: [
-            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC,
-            0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78,
-            0x9A, 0xBC, 0xDE, 0xF0,
+            0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34,
+            0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
         ],
         server_name: "rumble.example".into(),
         server_addr: "rumble.example:5000".into(),
@@ -267,7 +479,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let identity = Identity::load(scratch.clone())?;
         let settings = SettingsStore::load_from_path(Some(scratch.join("settings.json")));
-        let mut app = RumbleApp::new(backend, identity, settings);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let mut app = RumbleApp::new(backend, identity, settings, runtime);
+        // Bypass the first-run wizard for connection-state scenes — they
+        // illustrate the main shell, not the wizard. Wizard / unlock
+        // scenes drive the wizard explicitly and need the suppression
+        // *not* applied.
+        if !scene.keeps_first_run() {
+            app.suppress_first_run_for_test();
+        }
         scene.drive_setup(&mut app);
 
         let mut tree = app.build();
@@ -280,10 +500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if !bundle.lint.findings.is_empty() {
-            eprintln!(
-                "\n{basename} lint findings ({}):",
-                bundle.lint.findings.len()
-            );
+            eprintln!("\n{basename} lint findings ({}):", bundle.lint.findings.len());
             eprint!("{}", bundle.lint.text());
         }
     }
@@ -292,8 +509,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn parse_scene(raw: &str) -> Option<Scene> {
-    Scene::ALL
-        .iter()
-        .copied()
-        .find(|s| s.slug().eq_ignore_ascii_case(raw))
+    Scene::ALL.iter().copied().find(|s| s.slug().eq_ignore_ascii_case(raw))
 }

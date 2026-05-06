@@ -743,10 +743,11 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                             playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone());
                         }
 
-                        // Create connection-scoped audio input stream (unless muted).
-                        // The stream stays alive for the entire connection to avoid
-                        // ALSA device enumeration on every PTT press.
-                        if audio_input.is_none() && !self_muted {
+                        // Create connection-scoped audio input stream. It
+                        // stays alive for the whole connection regardless of
+                        // mute/server-mute/PTT — those gate via the
+                        // capture_active flag, not stream lifetime.
+                        if audio_input.is_none() {
                             start_transmission::<P>(
                                 &audio_backend,
                                 &selected_input,
@@ -810,7 +811,7 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                         if audio_input.is_some() {
                             stop_transmission::<P>(&mut audio_input, &state, &repaint);
                         }
-                        if connection.is_some() && !self_muted {
+                        if connection.is_some() {
                             start_transmission::<P>(
                                 &audio_backend,
                                 &selected_input,
@@ -871,34 +872,16 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                         }
                         repaint();
 
-                        // Manage stream lifecycle on mute changes:
-                        // Muted -> destroy stream (no point capturing)
-                        // Unmuted + connected -> create stream
-                        if muted {
-                            sync_transmission!();
-                            stop_transmission::<P>(&mut audio_input, &state, &repaint);
-                        } else if connection.is_some() && audio_input.is_none() {
-                            start_transmission::<P>(
-                                &audio_backend,
-                                &selected_input,
-                                &encoded_tx,
-                                &audio_settings,
-                                &tx_pipeline_config,
-                                &processor_registry,
-                                &encoder,
-                                &mut audio_input,
-                                &state,
-                                &repaint,
-                                &audio_dumper,
-                            );
-                            sync_transmission!();
-                        }
+                        // Stream stays connection-scoped; sync_transmission!
+                        // gates the capture callback via set_active(false) and
+                        // emits EOS, so muting is instant and unmute doesn't
+                        // pay an ALSA device-init round-trip.
+                        sync_transmission!();
                     }
 
                     AudioCommand::SetDeafened { deafened } => {
                         self_deafened = deafened;
                         // Deafen implies mute
-                        let was_muted = self_muted;
                         if deafened && !self_muted {
                             self_muted = true;
                         }
@@ -921,60 +904,20 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                             playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone());
                         }
 
-                        // Manage stream lifecycle on mute state change
-                        if self_muted && !was_muted {
-                            sync_transmission!();
-                            stop_transmission::<P>(&mut audio_input, &state, &repaint);
-                        } else if !self_muted && was_muted && connection.is_some() && audio_input.is_none() {
-                            start_transmission::<P>(
-                                &audio_backend,
-                                &selected_input,
-                                &encoded_tx,
-                                &audio_settings,
-                                &tx_pipeline_config,
-                                &processor_registry,
-                                &encoder,
-                                &mut audio_input,
-                                &state,
-                                &repaint,
-                                &audio_dumper,
-                            );
-                            sync_transmission!();
-                        } else {
-                            sync_transmission!();
-                        }
+                        // Mute is gated via set_active(false); leave the input
+                        // stream alive across deafen toggles.
+                        sync_transmission!();
                     }
 
                     AudioCommand::SetServerMuted { muted } => {
                         if server_muted == muted {
                             // No-op fast path — UserStatusChanged broadcasts hit
-                            // every frame in some flows; don't churn the stream.
+                            // every frame in some flows; don't churn state.
                         } else {
                             server_muted = muted;
-                            // Stream lifecycle mirrors `SetMuted`: while server-
-                            // muted, drop the input stream so the mic isn't
-                            // captured at all.
-                            if muted {
-                                sync_transmission!();
-                                stop_transmission::<P>(&mut audio_input, &state, &repaint);
-                            } else if connection.is_some() && !self_muted && audio_input.is_none() {
-                                start_transmission::<P>(
-                                    &audio_backend,
-                                    &selected_input,
-                                    &encoded_tx,
-                                    &audio_settings,
-                                    &tx_pipeline_config,
-                                    &processor_registry,
-                                    &encoder,
-                                    &mut audio_input,
-                                    &state,
-                                    &repaint,
-                                    &audio_dumper,
-                                );
-                                sync_transmission!();
-                            } else {
-                                sync_transmission!();
-                            }
+                            // Like SetMuted: gate via set_active, keep the
+                            // stream alive across the toggle.
+                            sync_transmission!();
                         }
                     }
 
@@ -1022,7 +965,7 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                         if audio_input.is_some() {
                             stop_transmission::<P>(&mut audio_input, &state, &repaint);
                         }
-                        if connection.is_some() && !self_muted {
+                        if connection.is_some() {
                             start_transmission::<P>(
                                 &audio_backend,
                                 &selected_input,
@@ -1074,7 +1017,7 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                         if audio_input.is_some() {
                             stop_transmission::<P>(&mut audio_input, &state, &repaint);
                         }
-                        if connection.is_some() && !self_muted {
+                        if connection.is_some() {
                             start_transmission::<P>(
                                 &audio_backend,
                                 &selected_input,
