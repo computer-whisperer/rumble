@@ -420,7 +420,7 @@ fn chat_sidebar(state: &State, chat_input: &str, chat_sel: TextSelection, width:
     };
 
     column([
-        text("Chat").title().padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_SM)),
+        text("Chat").title().padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
         divider(),
         scroll(messages)
             .padding(Sides::all(tokens::SPACE_SM))
