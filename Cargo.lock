@@ -1705,8 +1705,7 @@ dependencies = [
 [[package]]
 name = "ecolor"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71ddb8ac7643d1dba1bb02110e804406dd459a838efcb14011ced10556711a8e"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 dependencies = [
  "bytemuck",
  "emath",
@@ -1759,8 +1758,7 @@ dependencies = [
 [[package]]
 name = "eframe"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "457481173e6db5ca9fa2be93a58df8f4c7be639587aeb4853b526c6cf87db4e6"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1796,8 +1794,7 @@ dependencies = [
 [[package]]
 name = "egui"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a9b567d356674e9a5121ed3fedfb0a7c31e059fe71f6972b691bcd0bfc284e3"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 dependencies = [
  "accesskit",
  "ahash",
@@ -1814,8 +1811,7 @@ dependencies = [
 [[package]]
 name = "egui-wgpu"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e4d209971c84b2352a06174abdba701af1e552ce56b144d96f2bd50a3c91236"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1834,8 +1830,7 @@ dependencies = [
 [[package]]
 name = "egui-winit"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec6687e5bb551702f4ad10ac428bab12acf9d53047ebb1082d4a0ed8c6251a29"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 dependencies = [
  "accesskit_winit",
  "arboard",
@@ -1856,8 +1851,7 @@ dependencies = [
 [[package]]
 name = "egui_extras"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d01d34e845f01c62e3fded726961092e70417d66570c499b9817ab24674ca4ed"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 dependencies = [
  "ahash",
  "egui",
@@ -1871,8 +1865,7 @@ dependencies = [
 [[package]]
 name = "egui_glow"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6420863ea1d90e750f75075231a260030ad8a9f30a7cef82cdc966492dc4c4eb"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 dependencies = [
  "bytemuck",
  "egui",
@@ -1888,8 +1881,7 @@ dependencies = [
 [[package]]
 name = "egui_kittest"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43afb5f968dfa9e6c8f5e609ab9039e11a2c4af79a326f4cb1b99cf6875cb6a0"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 dependencies = [
  "dify",
  "eframe",
@@ -1939,8 +1931,7 @@ dependencies = [
 [[package]]
 name = "emath"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "491bdf728bf25ddd9ad60d4cf1c48588fa82c013a2440b91aa7fc43e34a07c32"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 dependencies = [
  "bytemuck",
 ]
@@ -1995,8 +1986,7 @@ dependencies = [
 [[package]]
 name = "epaint"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "009d0dd3c2163823a0abdb899451ecbc78798dec545ee91b43aff1fa790bab62"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 dependencies = [
  "ab_glyph",
  "ahash",
@@ -2013,8 +2003,7 @@ dependencies = [
 [[package]]
 name = "epaint_default_fonts"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c4fbe202b6578d3d56428fa185cdf114a05e49da05f477b3c7f0fbb221f1862"
+source = "git+https://github.com/u6bkep/egui.git?branch=rumble-fix-hit-test-nan-rect#3908b9777588ecc23ff50009d259bef13687f5ca"
 
 [[package]]
 name = "equator"
@@ -5199,6 +5188,7 @@ dependencies = [
  "directories",
  "ed25519-dalek 3.0.0-pre.6",
  "eframe",
+ "egui_extras",
  "egui_kittest",
  "hex",
  "image",
