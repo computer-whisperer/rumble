@@ -27,6 +27,7 @@ rumble-protocol = { path = "../rumble-protocol" }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 
+serde_json = "1.0"
 uuid = { version = "1.18.1", features = ["v4"] }
 directories = "6.0"
 tracing = "0.1"

@@ -3,12 +3,18 @@
 //! Owns local UI state (connect form fields, modal flags, selected
 //! room) and projects `(state, ui_state) -> El` on every frame.
 
-use std::sync::LazyLock;
+use std::{
+    sync::LazyLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use aetna_core::prelude::*;
 
+use rumble_client::{
+    ProcessorRegistry, build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
+};
 use rumble_desktop_shell::{
-    AcceptedCertificate, SettingsStore,
+    AcceptedCertificate, RecentServer, SettingsStore,
     identity::{connect_and_list_keys, generate_and_add_to_agent},
 };
 use rumble_protocol::{Command, ConnectionState, PendingCertificate, State, VoiceMode};
@@ -61,7 +67,10 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     pending_agent_op: Option<PendingAgentOp>,
 
     // ---- Local UI state ----
-    connect_modal_open: bool,
+    /// Add/edit form for a saved server. `None` when closed; `Some`
+    /// holds either a fresh add (`editing_index = None`) or an edit
+    /// pointed at a row in `SettingsStore.recent_servers`.
+    server_form: Option<ServerForm>,
     identity_modal_open: bool,
     settings_state: SettingsState,
     /// Force the unlock prompt visible regardless of `needs_unlock()`.
@@ -69,13 +78,17 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// the prompt against a fresh on-disk identity that isn't actually
     /// encrypted.
     force_unlock_for_test: bool,
-    address: String,
-    address_sel: TextSelection,
-    username: String,
-    username_sel: TextSelection,
+    /// Default username pre-filled when adding a brand-new server entry.
+    /// Sourced from `$USER` at startup; updated by the settings dialog.
+    /// Per-server usernames live on each `RecentServer` and override
+    /// this on connect.
+    default_username: String,
+    /// Global text-selection slot. Every `text_input` reads its caret /
+    /// selection band through `selection.within(key)`; `apply_event`
+    /// folds keypresses + clicks back into this single field.
+    selection: Selection,
 
     chat_input: String,
-    chat_sel: TextSelection,
 
     /// Chat sidebar width in logical pixels — adjusted by dragging
     /// the divider on its right edge. Initialized from
@@ -84,6 +97,12 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// `_MAX` by the resize handler.
     chat_sidebar_w: f32,
     chat_sidebar_drag: ResizeDrag,
+
+    /// Audio-processor factory registry. Owned by the App so the
+    /// settings dialog can read each processor's display name,
+    /// description and JSON schema when rendering the Processing tab.
+    /// Built once in [`Self::new`] from `register_builtin_processors`.
+    processor_registry: ProcessorRegistry,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -93,6 +112,24 @@ impl<B: UiBackend> RumbleApp<B> {
         } else {
             WizardState::NotNeeded
         };
+
+        // Build the audio-processor registry up front. The schema is
+        // also needed by the settings dialog at render time, so the
+        // App owns the registry for the lifetime of the process.
+        let mut processor_registry = ProcessorRegistry::new();
+        register_builtin_processors(&mut processor_registry);
+
+        // Push the initial TX pipeline at boot — either the user's
+        // persisted config (merged against the current defaults so
+        // newly-added processors slot in), or a fresh default chain.
+        let initial_pipeline = match settings.settings().audio.tx_pipeline.as_ref() {
+            Some(persisted) => merge_with_default_tx_pipeline(persisted, &processor_registry),
+            None => build_default_tx_pipeline(&processor_registry),
+        };
+        backend.send(Command::UpdateTxPipeline {
+            config: initial_pipeline,
+        });
+
         Self {
             backend,
             identity,
@@ -101,18 +138,16 @@ impl<B: UiBackend> RumbleApp<B> {
             wizard,
             unlock: UnlockState::default(),
             pending_agent_op: None,
-            connect_modal_open: false,
+            server_form: None,
             identity_modal_open: false,
             settings_state: SettingsState::default(),
             force_unlock_for_test: false,
-            address: "127.0.0.1:5000".to_string(),
-            address_sel: TextSelection::default(),
-            username: default_username(),
-            username_sel: TextSelection::default(),
+            default_username: default_username(),
+            selection: Selection::default(),
             chat_input: String::new(),
-            chat_sel: TextSelection::default(),
             chat_sidebar_w: tokens::SIDEBAR_WIDTH,
             chat_sidebar_drag: ResizeDrag::default(),
+            processor_registry,
         }
     }
 }
@@ -123,6 +158,75 @@ fn default_username() -> String {
         .unwrap_or_else(|_| "rumble-user".to_string())
 }
 
+/// Local state for the saved-server add/edit modal.
+///
+/// `editing_index` is the position in `Settings.recent_servers` when
+/// editing an existing entry, or `None` when the form is being used
+/// to add a new server. The text fields are rendered via the global
+/// [`Selection`] held on `RumbleApp`, so this struct doesn't carry
+/// per-input selection state.
+#[derive(Debug, Clone)]
+pub struct ServerForm {
+    pub editing_index: Option<usize>,
+    pub addr: String,
+    pub label: String,
+    pub username: String,
+    /// Inline validation message (e.g. "Address is required").
+    pub error: Option<String>,
+}
+
+impl ServerForm {
+    fn for_add(default_username: &str) -> Self {
+        Self {
+            editing_index: None,
+            addr: "127.0.0.1:5000".to_string(),
+            label: String::new(),
+            username: default_username.to_string(),
+            error: None,
+        }
+    }
+
+    fn for_edit(idx: usize, server: &RecentServer) -> Self {
+        Self {
+            editing_index: Some(idx),
+            addr: server.addr.clone(),
+            label: server.label.clone(),
+            username: server.username.clone(),
+            error: None,
+        }
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Coarse "n minutes ago" / "n hours ago" / "n days ago" formatter for
+/// the server-row subtitle. Returns an empty string when `then == 0`
+/// (the sentinel for "never connected to this server").
+fn relative_time(then: u64) -> String {
+    if then == 0 {
+        return String::new();
+    }
+    let now = now_unix();
+    if now <= then {
+        return "just now".to_string();
+    }
+    let secs = now - then;
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
 impl<B: UiBackend> App for RumbleApp<B> {
     fn before_build(&mut self) {
         self.poll_agent_op();
@@ -130,13 +234,14 @@ impl<B: UiBackend> App for RumbleApp<B> {
 
     fn build(&self) -> El {
         let state = self.backend.state();
+        let shell = self.settings.settings();
 
         let main = column([
             top_toolbar(&state),
             row([
-                chat_sidebar(&state, &self.chat_input, self.chat_sel, self.chat_sidebar_w),
+                chat_sidebar(&state, &self.chat_input, &self.selection, self.chat_sidebar_w),
                 resize_handle(Axis::Row).key(CHAT_SIDEBAR_HANDLE),
-                center_area(&state, self.connect_modal_open),
+                center_area(&state, &shell.recent_servers),
             ])
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
@@ -148,10 +253,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // Wizard takes precedence over everything else — until an identity
         // is configured the rest of the UI is read-only.
         let wizard_open = !matches!(self.wizard, WizardState::NotNeeded | WizardState::Complete);
-        let wizard_layer = wizard::render(&self.wizard, self.pending_agent_op.is_some());
+        let wizard_layer = wizard::render(&self.wizard, self.pending_agent_op.is_some(), &self.selection);
 
         let unlock_layer = if !wizard_open && (self.identity.needs_unlock() || self.force_unlock_for_test) {
-            Some(wizard::render_unlock(&self.unlock))
+            Some(wizard::render_unlock(&self.unlock, &self.selection))
         } else {
             None
         };
@@ -164,15 +269,13 @@ impl<B: UiBackend> App for RumbleApp<B> {
         } else {
             None
         };
-        // Suppress the connect modal whenever a higher-priority modal is up.
-        let connect_layer = if self.connect_modal_open && !wizard_open && unlock_layer.is_none() && cert_layer.is_none()
+        // Suppress the server form whenever a higher-priority modal is up.
+        let connect_layer = if !wizard_open
+            && unlock_layer.is_none()
+            && cert_layer.is_none()
+            && let Some(form) = self.server_form.as_ref()
         {
-            Some(connect_modal(
-                &self.address,
-                self.address_sel,
-                &self.username,
-                self.username_sel,
-            ))
+            Some(server_form_modal(form, &self.selection))
         } else {
             None
         };
@@ -185,7 +288,13 @@ impl<B: UiBackend> App for RumbleApp<B> {
             };
 
         let (settings_panel, settings_popover) = if !wizard_open && unlock_layer.is_none() && cert_layer.is_none() {
-            settings::render(&self.settings_state, &state, &self.identity)
+            settings::render(
+                &self.settings_state,
+                &state,
+                &self.identity,
+                &self.selection,
+                &self.processor_registry,
+            )
         } else {
             (None, None)
         };
@@ -219,18 +328,33 @@ impl<B: UiBackend> App for RumbleApp<B> {
         }
     }
 
+    fn selection(&self) -> Selection {
+        self.selection.clone()
+    }
+
     fn on_event(&mut self, event: UiEvent) {
+        // The runtime emits `SelectionChanged` when a press / focus move
+        // lands somewhere other than a text input — fold it into our
+        // single selection slot so static-text + cross-leaf selections
+        // clear correctly.
+        if event.kind == UiEventKind::SelectionChanged
+            && let Some(sel) = event.selection.as_ref()
+        {
+            self.selection = sel.clone();
+            return;
+        }
+
         // Wizard / unlock layers swallow everything until they're done.
         // The wizard scrim is intentionally a no-op (no "click outside
         // to dismiss") so the user can't end up with a half-configured
         // identity by hitting Escape.
         if !matches!(self.wizard, WizardState::NotNeeded | WizardState::Complete) {
-            let outcome = wizard::handle_event(&mut self.wizard, &event);
+            let outcome = wizard::handle_event(&mut self.wizard, &event, &mut self.selection);
             self.dispatch_wizard_outcome(outcome);
             return;
         }
         if self.identity.needs_unlock() {
-            let outcome = wizard::handle_unlock_event(&mut self.unlock, &event);
+            let outcome = wizard::handle_unlock_event(&mut self.unlock, &event, &mut self.selection);
             self.dispatch_wizard_outcome(outcome);
             return;
         }
@@ -239,7 +363,12 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // claim its events first so the toolbar / chat / room handlers
         // below don't accidentally swallow them.
         if self.settings_state.open {
-            let outcome = settings::handle_event(&mut self.settings_state, &event);
+            let outcome = settings::handle_event(
+                &mut self.settings_state,
+                &event,
+                &mut self.selection,
+                &self.processor_registry,
+            );
             if self.dispatch_settings_outcome(outcome) {
                 return;
             }
@@ -260,21 +389,73 @@ impl<B: UiBackend> App for RumbleApp<B> {
             return;
         }
 
-        // Connect modal lifecycle.
-        if event.is_click_or_activate("connect:open") {
-            self.connect_modal_open = true;
+        // Saved-server list lifecycle.
+        if event.is_click_or_activate("server:add") {
+            self.server_form = Some(ServerForm::for_add(&self.default_username));
             return;
         }
-        if event.is_click_or_activate("connect:cancel")
-            || event.is_route("connect:dismiss") && event.kind == UiEventKind::Click
-            || (self.connect_modal_open && event.kind == UiEventKind::Escape)
+        if let Some(idx) = matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            .then(|| event.route().and_then(|r| r.strip_prefix("server:connect:")))
+            .flatten()
+            .and_then(|s| s.parse::<usize>().ok())
         {
-            self.connect_modal_open = false;
+            self.connect_to_recent(idx);
             return;
         }
-        if event.is_click_or_activate("connect:submit") {
-            self.connect_modal_open = false;
-            self.do_connect();
+        if let Some(idx) = matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            .then(|| event.route().and_then(|r| r.strip_prefix("server:edit:")))
+            .flatten()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            self.open_edit_form(idx);
+            return;
+        }
+        if let Some(idx) = matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            .then(|| event.route().and_then(|r| r.strip_prefix("server:delete:")))
+            .flatten()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            self.delete_recent(idx);
+            return;
+        }
+
+        // Add/edit server form lifecycle.
+        if event.is_click_or_activate("server_form:cancel")
+            || event.is_route("server_form:dismiss") && event.kind == UiEventKind::Click
+            || (self.server_form.is_some() && event.kind == UiEventKind::Escape)
+        {
+            self.server_form = None;
+            return;
+        }
+        if event.is_click_or_activate("server_form:save") {
+            if let Some(_saved) = self.save_server_form() {
+                self.server_form = None;
+            }
+            return;
+        }
+        if event.is_click_or_activate("server_form:connect") {
+            if let Some(saved) = self.save_server_form() {
+                self.server_form = None;
+                self.connect_to_server(&saved);
+            }
+            return;
+        }
+        if event.target_key() == Some("server_form:addr") {
+            if let Some(form) = self.server_form.as_mut() {
+                text_input::apply_event(&mut form.addr, &mut self.selection, "server_form:addr", &event);
+            }
+            return;
+        }
+        if event.target_key() == Some("server_form:label") {
+            if let Some(form) = self.server_form.as_mut() {
+                text_input::apply_event(&mut form.label, &mut self.selection, "server_form:label", &event);
+            }
+            return;
+        }
+        if event.target_key() == Some("server_form:user") {
+            if let Some(form) = self.server_form.as_mut() {
+                text_input::apply_event(&mut form.username, &mut self.selection, "server_form:user", &event);
+            }
             return;
         }
 
@@ -291,16 +472,6 @@ impl<B: UiBackend> App for RumbleApp<B> {
             return;
         }
 
-        // Connect-form text inputs.
-        if event.target_key() == Some("connect:addr") {
-            text_input::apply_event(&mut self.address, &mut self.address_sel, &event);
-            return;
-        }
-        if event.target_key() == Some("connect:user") {
-            text_input::apply_event(&mut self.username, &mut self.username_sel, &event);
-            return;
-        }
-
         // Chat composer.
         if event.target_key() == Some("chat:input") {
             // Send on Enter when not Shift-held.
@@ -313,11 +484,11 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 if !trimmed.is_empty() {
                     self.backend.send(Command::SendChat { text: trimmed });
                     self.chat_input.clear();
-                    self.chat_sel = TextSelection::default();
+                    self.selection = Selection::default();
                 }
                 return;
             }
-            text_input::apply_event(&mut self.chat_input, &mut self.chat_sel, &event);
+            text_input::apply_event(&mut self.chat_input, &mut self.selection, "chat:input", &event);
             return;
         }
 
@@ -352,7 +523,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         if event.is_click_or_activate("toolbar:settings") {
             let snapshot = self.backend.state();
             self.settings_state
-                .open_with(&snapshot.audio, self.settings.settings(), &self.username);
+                .open_with(&snapshot.audio, self.settings.settings(), &self.default_username);
             return;
         }
         if event.is_click_or_activate("identity:close")
@@ -414,32 +585,148 @@ impl<B: UiBackend> RumbleApp<B> {
         self.backend.send(Command::AcceptCertificate);
     }
 
-    fn do_connect(&mut self) {
+    /// Look up `recent_servers[idx]` and dispatch a connect to it.
+    /// `idx` is the position in the unsorted Vec — that's the only stable
+    /// identifier the row keys carry, so it's safe across re-renders that
+    /// re-sort the list visually.
+    fn connect_to_recent(&mut self, idx: usize) {
+        let Some(server) = self.settings.settings().recent_servers.get(idx).cloned() else {
+            tracing::warn!("rumble-aetna: connect_to_recent({idx}) — out of bounds");
+            return;
+        };
+        self.connect_to_server(&server);
+    }
+
+    /// Open the form pre-populated with `recent_servers[idx]`. No-op if
+    /// idx is out of bounds — the row that sourced the click has gone.
+    fn open_edit_form(&mut self, idx: usize) {
+        let Some(server) = self.settings.settings().recent_servers.get(idx).cloned() else {
+            return;
+        };
+        self.server_form = Some(ServerForm::for_edit(idx, &server));
+    }
+
+    fn delete_recent(&mut self, idx: usize) {
+        self.settings.modify(|s| {
+            if idx < s.recent_servers.len() {
+                let removed = s.recent_servers.remove(idx);
+                if s.auto_connect_addr.as_deref() == Some(removed.addr.as_str()) {
+                    s.auto_connect_addr = None;
+                }
+            }
+        });
+    }
+
+    /// Run pre-flight identity checks and dispatch `Command::Connect`
+    /// for `server`. Bumps the entry's `last_used_unix` so the list
+    /// re-sorts the next frame.
+    fn connect_to_server(&mut self, server: &RecentServer) {
         let Some(public_key) = self.identity.public_key() else {
-            // Wizard should be open in this case — fall through silently.
-            tracing::warn!("rumble-aetna: connect attempted before identity setup");
+            self.backend.send(Command::LocalMessage {
+                text: "Cannot connect: No identity key configured. Please complete first-run setup.".to_string(),
+            });
             return;
         };
         if self.identity.needs_unlock() {
-            // Unlock modal is up; user has to enter password first.
+            self.backend.send(Command::LocalMessage {
+                text: "Cannot connect: Key is encrypted. Please unlock it in settings.".to_string(),
+            });
             return;
         }
         let signer = self.identity.signer();
-        let addr = if self.address.trim().is_empty() {
+
+        let addr = if server.addr.trim().is_empty() {
             "127.0.0.1:5000".to_string()
         } else {
-            self.address.trim().to_string()
+            server.addr.trim().to_string()
         };
+        let name = if server.username.trim().is_empty() {
+            self.default_username.clone()
+        } else {
+            server.username.trim().to_string()
+        };
+
+        // Mark this entry as the most-recently used so it floats to the
+        // top of the list. Done before the connect dispatch so a refused
+        // connection still updates the order — matches rumble-egui.
+        let bump_addr = addr.clone();
+        let bump_name = name.clone();
+        self.settings.modify(|s| {
+            if let Some(entry) = s.recent_servers.iter_mut().find(|r| r.addr == bump_addr) {
+                entry.last_used_unix = now_unix();
+                entry.username = bump_name;
+            }
+        });
+
         self.backend.send(Command::LocalMessage {
             text: format!("Connecting to {addr}..."),
         });
         self.backend.send(Command::Connect {
             addr,
-            name: self.username.clone(),
+            name,
             public_key,
             signer,
             password: None,
         });
+    }
+
+    /// Validate + persist the open `ServerForm`. Returns the saved
+    /// `RecentServer` on success so callers can chain a connect; returns
+    /// `None` (with `form.error` populated) on validation failure.
+    ///
+    /// Edit semantics: removes the original entry at `editing_index`
+    /// first, then writes the new fields keyed by addr. If the new addr
+    /// already exists at a different position, that row's label/username
+    /// are overwritten and the edit's `last_used_unix` carries over to
+    /// the larger of the two.
+    fn save_server_form(&mut self) -> Option<RecentServer> {
+        let Some(form) = self.server_form.as_mut() else {
+            return None;
+        };
+        let addr = form.addr.trim().to_string();
+        if addr.is_empty() {
+            form.error = Some("Address is required.".to_string());
+            return None;
+        }
+        let label = form.label.trim().to_string();
+        let username = form.username.trim().to_string();
+        let editing_index = form.editing_index;
+
+        let mut saved: Option<RecentServer> = None;
+        self.settings.modify(|s| {
+            let preserved_last_used = editing_index
+                .and_then(|idx| s.recent_servers.get(idx))
+                .map(|r| r.last_used_unix)
+                .unwrap_or(0);
+            if let Some(idx) = editing_index
+                && idx < s.recent_servers.len()
+            {
+                let original_addr = s.recent_servers[idx].addr.clone();
+                s.recent_servers.remove(idx);
+                if s.auto_connect_addr.as_deref() == Some(original_addr.as_str()) {
+                    // Keep auto-connect pointing at this entry by
+                    // updating the addr below.
+                    s.auto_connect_addr = Some(addr.clone());
+                }
+            }
+            let entry = if let Some(existing) = s.recent_servers.iter_mut().find(|r| r.addr == addr) {
+                existing.label = label.clone();
+                existing.username = username.clone();
+                existing.last_used_unix = existing.last_used_unix.max(preserved_last_used);
+                existing.clone()
+            } else {
+                let new_entry = RecentServer {
+                    addr: addr.clone(),
+                    label: label.clone(),
+                    username: username.clone(),
+                    last_used_unix: preserved_last_used,
+                };
+                s.recent_servers.push(new_entry.clone());
+                new_entry
+            };
+            saved = Some(entry);
+        });
+        saved
     }
 
     // ---------- wizard plumbing ----------
@@ -593,10 +880,12 @@ impl<B: UiBackend> RumbleApp<B> {
     /// for the runtime-mutating fields (audio settings, voice mode,
     /// device selection), and update App-owned state (username).
     fn apply_settings(&mut self, pending: settings::PendingSettings) {
-        // App-owned: username affects the next Connect command.
+        // App-owned: the global default is applied to brand-new server
+        // entries created from the add-form. Per-server usernames live
+        // on each `RecentServer` and aren't touched by this dialog.
         let trimmed = pending.username.trim();
         if !trimmed.is_empty() {
-            self.username = trimmed.to_string();
+            self.default_username = trimmed.to_string();
         }
 
         // Backend: audio + voice mode + device selection. These all
@@ -615,15 +904,20 @@ impl<B: UiBackend> RumbleApp<B> {
         self.backend.send(Command::SetOutputDevice {
             device_id: pending.output_device.clone(),
         });
+        self.backend.send(Command::UpdateTxPipeline {
+            config: pending.tx_pipeline.clone(),
+        });
 
-        // Shared shell store. Done last so the `modify` block sees the
-        // most-recent username for the autoconnect bookkeeping.
-        let username = self.username.clone();
+        // Shared shell store.
         self.settings.modify(|s| {
             // Audio + voice mode mirror what the backend will report
             // back; persisting them here means a restart re-applies
             // the same configuration.
             s.audio = (&pending.audio).into();
+            // The TX pipeline lives nested inside `PersistentAudioSettings`
+            // and the `From<&AudioSettings>` impl above stamps it back
+            // to `None`, so we re-apply it after the conversion.
+            s.audio.tx_pipeline = Some(pending.tx_pipeline.clone());
             s.voice_mode = pending.voice_mode;
             s.input_device_id = pending.input_device.clone();
             s.output_device_id = pending.output_device.clone();
@@ -672,13 +966,6 @@ impl<B: UiBackend> RumbleApp<B> {
             } else {
                 s.auto_connect_addr = None;
             }
-
-            // Username: keep recent_servers' username field in sync
-            // with the user's current display name on the latest entry,
-            // matching the rumble-egui behaviour.
-            if let Some(recent) = s.recent_servers.iter_mut().max_by_key(|r| r.last_used_unix) {
-                recent.username = username.clone();
-            }
         });
 
         self.backend.send(Command::LocalMessage {
@@ -720,8 +1007,22 @@ impl<B: UiBackend> RumbleApp<B> {
     pub fn open_settings_for_test(&mut self, tab: settings::SettingsTab) {
         let snapshot = self.backend.state();
         self.settings_state
-            .open_with(&snapshot.audio, self.settings.settings(), &self.username);
+            .open_with(&snapshot.audio, self.settings.settings(), &self.default_username);
         self.settings_state.tab = Some(tab);
+    }
+
+    /// Test/scene-dump hook to seed the saved-server list. Replaces the
+    /// shared shell's `recent_servers` so the disconnected center area
+    /// renders against a deterministic fixture.
+    pub fn set_recent_servers_for_test(&mut self, servers: Vec<RecentServer>) {
+        self.settings.modify(|s| {
+            s.recent_servers = servers;
+        });
+    }
+
+    /// Test/scene-dump hook for the saved-server add/edit modal.
+    pub fn set_server_form_for_test(&mut self, form: ServerForm) {
+        self.server_form = Some(form);
     }
 
     /// Test/scene-dump hook for the timestamp-format dropdown inside
@@ -778,9 +1079,10 @@ fn top_toolbar(state: &State) -> El {
 
         children.push(button(voice_mode_label).key("toolbar:voice-mode").ghost());
         children.push(button("Disconnect").key("toolbar:disconnect").secondary());
-    } else {
-        children.push(button("Connect…").key("connect:open").primary());
     }
+    // When disconnected, the center area renders the saved-server picker
+    // (with its own "Add server…" / Connect / Edit / Remove controls), so
+    // we don't add a redundant toolbar-level connect entry point here.
 
     children.push(button("Identity").key("toolbar:identity").ghost());
     children.push(button("Settings").key("toolbar:settings").ghost());
@@ -794,7 +1096,7 @@ fn top_toolbar(state: &State) -> El {
         .align(Align::Center)
 }
 
-fn chat_sidebar(state: &State, chat_input: &str, chat_sel: TextSelection, width: f32) -> El {
+fn chat_sidebar(state: &State, chat_input: &str, selection: &Selection, width: f32) -> El {
     let messages: Vec<El> = if state.chat_messages.is_empty() {
         vec![
             // wrap_text() so the longer placeholder fits inside narrow
@@ -824,8 +1126,7 @@ fn chat_sidebar(state: &State, chat_input: &str, chat_sel: TextSelection, width:
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0)),
         divider(),
-        text_input(chat_input, chat_sel)
-            .key("chat:input")
+        text_input(chat_input, selection, "chat:input")
             .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
             .width(Size::Fill(1.0)),
     ])
@@ -862,39 +1163,134 @@ fn render_chat_line(msg: &rumble_protocol::ChatMessage) -> El {
     line.font_size(tokens::FONT_SM)
 }
 
-fn center_area(state: &State, connect_modal_open: bool) -> El {
-    let _ = connect_modal_open;
+fn center_area(state: &State, recent_servers: &[RecentServer]) -> El {
     if matches!(state.connection, ConnectionState::Connected { .. }) {
         rooms_view(state)
     } else {
-        disconnected_view(state)
+        servers_view(state, recent_servers)
     }
 }
 
-fn disconnected_view(state: &State) -> El {
-    let body = match &state.connection {
-        ConnectionState::Disconnected => text("Not connected.").muted(),
-        ConnectionState::Connecting { server_addr } => text(format!("Connecting to {server_addr}...")).muted(),
-        ConnectionState::ConnectionLost { error } => {
-            text(format!("Connection lost: {error}")).text_color(tokens::DESTRUCTIVE)
-        }
-        ConnectionState::CertificatePending { cert_info } => {
-            text(format!("Certificate pending for {}", cert_info.server_name)).text_color(tokens::WARNING)
-        }
+fn servers_view(state: &State, recent_servers: &[RecentServer]) -> El {
+    // Connection-status banner above the list. Most disconnected
+    // states have nothing to say (Disconnected idle); Connecting /
+    // ConnectionLost / CertPending get a one-line status so the
+    // center area still communicates progress while the list keeps
+    // taking up the same space.
+    let status_banner: Option<El> = match &state.connection {
+        ConnectionState::Disconnected => None,
+        ConnectionState::Connecting { server_addr } => Some(text(format!("Connecting to {server_addr}...")).muted()),
+        ConnectionState::ConnectionLost { error } => Some(
+            text(format!("Connection lost: {error}"))
+                .text_color(tokens::DESTRUCTIVE)
+                .wrap_text(),
+        ),
+        ConnectionState::CertificatePending { cert_info } => Some(
+            text(format!("Certificate pending for {}", cert_info.server_name))
+                .text_color(tokens::WARNING)
+                .wrap_text(),
+        ),
         ConnectionState::Connected { .. } => unreachable!(),
     };
 
-    column([
-        h2("Welcome to Rumble"),
-        body,
-        button("Connect…").key("connect:open").primary(),
+    let header = row([
+        text("Servers").title(),
+        spacer(),
+        button("Add server…").key("server:add").primary(),
     ])
-    .gap(tokens::SPACE_LG)
-    .padding(tokens::SPACE_XL)
+    .gap(tokens::SPACE_SM)
+    .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
     .align(Align::Center)
-    .justify(Justify::Center)
+    .width(Size::Fill(1.0));
+
+    // Render the list sorted by last_used desc; the row's stable
+    // identifier remains the unsorted index (`server:connect:{idx}`),
+    // so settings.modify by index continues to point at the right row.
+    let body: El = if recent_servers.is_empty() {
+        column([
+            text("No saved servers yet.").muted(),
+            paragraph("Click \"Add server…\" to bookmark one.")
+                .muted()
+                .font_size(tokens::FONT_SM),
+        ])
+        .gap(tokens::SPACE_SM)
+        .align(Align::Center)
+        .justify(Justify::Center)
+        .padding(tokens::SPACE_XL)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+    } else {
+        let mut order: Vec<usize> = (0..recent_servers.len()).collect();
+        order.sort_by(|&a, &b| recent_servers[b].last_used_unix.cmp(&recent_servers[a].last_used_unix));
+        let rows: Vec<El> = order
+            .into_iter()
+            .map(|idx| server_row(idx, &recent_servers[idx]))
+            .collect();
+        scroll(rows)
+            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
+            .gap(tokens::SPACE_SM)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+    };
+
+    let mut children: Vec<El> = vec![header, divider()];
+    if let Some(banner) = status_banner {
+        children.push(
+            row([banner])
+                .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
+                .width(Size::Fill(1.0)),
+        );
+        children.push(divider());
+    }
+    children.push(body);
+
+    column(children).width(Size::Fill(1.0)).height(Size::Fill(1.0))
+}
+
+fn server_row(idx: usize, server: &RecentServer) -> El {
+    let title = if server.label.is_empty() {
+        server.addr.clone()
+    } else {
+        server.label.clone()
+    };
+
+    // Subtitle holds whichever of (addr, username, last-used) we still
+    // have something to show: addr only repeats when label was the
+    // primary title; username always shows; last-used is omitted when
+    // the bookmark has never been connected to (last_used == 0).
+    let mut subtitle_parts: Vec<String> = Vec::new();
+    if !server.label.is_empty() {
+        subtitle_parts.push(server.addr.clone());
+    }
+    if !server.username.is_empty() {
+        subtitle_parts.push(server.username.clone());
+    }
+    let rel = relative_time(server.last_used_unix);
+    if !rel.is_empty() {
+        subtitle_parts.push(rel);
+    }
+    let subtitle = subtitle_parts.join(" · ");
+
+    let info = column([
+        text(title).font_weight(FontWeight::Semibold),
+        text(subtitle).muted().font_size(tokens::FONT_SM),
+    ])
+    .gap(tokens::SPACE_XS)
+    .width(Size::Fill(1.0));
+
+    row([
+        info,
+        button("Connect").key(format!("server:connect:{idx}")).primary(),
+        button("Edit").key(format!("server:edit:{idx}")).ghost(),
+        button("Remove").key(format!("server:delete:{idx}")).ghost(),
+    ])
+    .gap(tokens::SPACE_SM)
+    .padding(Sides::all(tokens::SPACE_MD))
+    .fill(tokens::BG_RAISED)
+    .stroke(tokens::BORDER)
+    .radius(tokens::RADIUS_MD)
+    .align(Align::Center)
     .width(Size::Fill(1.0))
-    .height(Size::Fill(1.0))
 }
 
 fn rooms_view(state: &State) -> El {
@@ -1125,23 +1521,41 @@ fn identity_modal(identity: &Identity) -> El {
     )
 }
 
-fn connect_modal(address: &str, address_sel: TextSelection, username: &str, username_sel: TextSelection) -> El {
-    modal(
-        "connect",
-        "Connect to a Rumble server",
-        [
-            text("Address").muted(),
-            text_input(address, address_sel).key("connect:addr"),
-            text("Username").muted(),
-            text_input(username, username_sel).key("connect:user"),
-            row([
-                button("Cancel").key("connect:cancel"),
-                spacer(),
-                button("Connect").key("connect:submit").primary(),
-            ])
-            .gap(tokens::SPACE_SM)
-            .width(Size::Fill(1.0))
-            .align(Align::Center),
-        ],
-    )
+fn server_form_modal(form: &ServerForm, selection: &Selection) -> El {
+    let title = if form.editing_index.is_some() {
+        "Edit server"
+    } else {
+        "Add server"
+    };
+
+    let mut body: Vec<El> = vec![
+        text("Address").muted(),
+        text_input(&form.addr, selection, "server_form:addr"),
+        text("Label (optional)").muted(),
+        text_input(&form.label, selection, "server_form:label"),
+        text("Username").muted(),
+        text_input(&form.username, selection, "server_form:user"),
+    ];
+
+    if let Some(err) = &form.error {
+        body.push(
+            paragraph(err.clone())
+                .text_color(tokens::DESTRUCTIVE)
+                .font_size(tokens::FONT_SM),
+        );
+    }
+
+    body.push(
+        row([
+            button("Cancel").key("server_form:cancel"),
+            spacer(),
+            button("Save").key("server_form:save"),
+            button("Save & Connect").key("server_form:connect").primary(),
+        ])
+        .gap(tokens::SPACE_SM)
+        .width(Size::Fill(1.0))
+        .align(Align::Center),
+    );
+
+    modal("server_form", title, body)
 }

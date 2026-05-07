@@ -19,7 +19,7 @@ pub mod settings;
 pub mod theme;
 pub mod wizard;
 
-pub use app::RumbleApp;
+pub use app::{RumbleApp, ServerForm};
 pub use backend::{NativeUiBackend, UiBackend};
 pub use identity::Identity;
 pub use settings::{OpenSelect as SettingsOpenSelect, SettingsState, SettingsTab};

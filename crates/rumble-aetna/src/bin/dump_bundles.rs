@@ -22,7 +22,7 @@ use aetna_core::prelude::*;
 use rumble_aetna::{
     Identity, RumbleApp, SettingsOpenSelect, SettingsTab, UnlockState, WizardState, backend::UiBackend,
 };
-use rumble_desktop_shell::{KeyInfo, SettingsStore};
+use rumble_desktop_shell::{KeyInfo, RecentServer, SettingsStore};
 use rumble_protocol::{
     AudioDeviceInfo, AudioState, AudioStats, ChatMessage, ChatMessageKind, Command, ConnectionState,
     PendingCertificate, State, Uuid, VoiceMode,
@@ -55,11 +55,15 @@ impl UiBackend for MockBackend {
 
 #[derive(Clone, Copy, Debug)]
 enum Scene {
-    /// Idle disconnected state — toolbar shows the muted "Disconnected"
-    /// pill and the welcome panel.
+    /// Disconnected with a populated saved-server list (the typical
+    /// returning-user shell).
     Disconnected,
-    /// Connect form open over the disconnected backdrop.
-    ConnectModalOpen,
+    /// Disconnected with no saved servers — first-run empty state.
+    DisconnectedEmpty,
+    /// Add-server form open over the disconnected backdrop.
+    AddServerModal,
+    /// Edit-server form open over the disconnected backdrop.
+    EditServerModal,
     /// Connection in progress.
     Connecting,
     /// Live session: rooms, users, chat — exercises the full shell.
@@ -86,6 +90,8 @@ enum Scene {
     SettingsDevices,
     /// Settings dialog — Voice tab (encoder/jitter/PTT toggles).
     SettingsVoice,
+    /// Settings dialog — Processing tab (TX pipeline editor + level meter).
+    SettingsProcessing,
     /// Settings dialog — Sounds tab (sfx toggles + per-event preview).
     SettingsSounds,
     /// Settings dialog — Chat tab with the timestamp-format dropdown open.
@@ -99,7 +105,9 @@ enum Scene {
 impl Scene {
     const ALL: &'static [Scene] = &[
         Scene::Disconnected,
-        Scene::ConnectModalOpen,
+        Scene::DisconnectedEmpty,
+        Scene::AddServerModal,
+        Scene::EditServerModal,
         Scene::Connecting,
         Scene::Connected,
         Scene::ConnectionLost,
@@ -113,6 +121,7 @@ impl Scene {
         Scene::SettingsConnection,
         Scene::SettingsDevices,
         Scene::SettingsVoice,
+        Scene::SettingsProcessing,
         Scene::SettingsSounds,
         Scene::SettingsChat,
         Scene::SettingsFiles,
@@ -122,7 +131,9 @@ impl Scene {
     fn slug(self) -> &'static str {
         match self {
             Scene::Disconnected => "disconnected",
-            Scene::ConnectModalOpen => "connect_modal_open",
+            Scene::DisconnectedEmpty => "disconnected_empty",
+            Scene::AddServerModal => "add_server_modal",
+            Scene::EditServerModal => "edit_server_modal",
             Scene::Connecting => "connecting",
             Scene::Connected => "connected",
             Scene::ConnectionLost => "connection_lost",
@@ -136,6 +147,7 @@ impl Scene {
             Scene::SettingsConnection => "settings_connection",
             Scene::SettingsDevices => "settings_devices",
             Scene::SettingsVoice => "settings_voice",
+            Scene::SettingsProcessing => "settings_processing",
             Scene::SettingsSounds => "settings_sounds",
             Scene::SettingsChat => "settings_chat",
             Scene::SettingsFiles => "settings_files",
@@ -145,8 +157,9 @@ impl Scene {
 
     fn build_state(self) -> State {
         match self {
-            Scene::Disconnected => State::default(),
-            Scene::ConnectModalOpen => State::default(),
+            Scene::Disconnected | Scene::DisconnectedEmpty | Scene::AddServerModal | Scene::EditServerModal => {
+                State::default()
+            }
             Scene::Connecting => State {
                 connection: ConnectionState::Connecting {
                     server_addr: "rumble.example:5000".into(),
@@ -177,6 +190,14 @@ impl Scene {
             | Scene::SettingsVoice
             | Scene::SettingsSounds
             | Scene::SettingsFiles => State::default(),
+            // The Processing scene needs a populated TX pipeline so
+            // the editor isn't an empty placeholder; the MockBackend
+            // discards `UpdateTxPipeline` so we seed the state up
+            // front. A simulated -22 dB input level paints the meter.
+            Scene::SettingsProcessing => State {
+                audio: processing_state(),
+                ..State::default()
+            },
             // The Devices scene needs realistic input/output device
             // lists so the dropdown menu is non-trivial; the Stats
             // scene needs non-zero counters so the read-only grid
@@ -199,8 +220,31 @@ impl Scene {
     /// shortcut that the production code can drift away from.
     fn drive_setup(self, app: &mut RumbleApp<MockBackend>) {
         match self {
-            Scene::ConnectModalOpen => {
-                app.on_event(UiEvent::synthetic_click("connect:open"));
+            Scene::Disconnected => {
+                app.set_recent_servers_for_test(demo_recent_servers());
+            }
+            Scene::DisconnectedEmpty => {
+                app.set_recent_servers_for_test(Vec::new());
+            }
+            Scene::AddServerModal => {
+                app.set_recent_servers_for_test(demo_recent_servers());
+                app.set_server_form_for_test(rumble_aetna::ServerForm {
+                    editing_index: None,
+                    addr: "rumble.new-org.example:5000".to_string(),
+                    label: "New org".to_string(),
+                    username: "alice".to_string(),
+                    error: None,
+                });
+            }
+            Scene::EditServerModal => {
+                app.set_recent_servers_for_test(demo_recent_servers());
+                app.set_server_form_for_test(rumble_aetna::ServerForm {
+                    editing_index: Some(0),
+                    addr: "127.0.0.1:5000".to_string(),
+                    label: "Local dev".to_string(),
+                    username: "alice".to_string(),
+                    error: None,
+                });
             }
             Scene::WizardSelectMethod => {
                 app.set_wizard_state_for_test(WizardState::SelectMethod);
@@ -208,9 +252,7 @@ impl Scene {
             Scene::WizardGenerateLocal => {
                 app.set_wizard_state_for_test(WizardState::GenerateLocal {
                     password: "hunter2".to_string(),
-                    password_sel: aetna_core::TextSelection::default(),
                     confirm: "hunter".to_string(),
-                    confirm_sel: aetna_core::TextSelection::default(),
                     error: None,
                 });
             }
@@ -229,7 +271,6 @@ impl Scene {
             Scene::UnlockPrompt => {
                 app.set_unlock_state_for_test(UnlockState {
                     password: "••••".to_string(),
-                    password_sel: aetna_core::TextSelection::default(),
                     error: Some("Wrong password — try again.".to_string()),
                 });
             }
@@ -242,6 +283,7 @@ impl Scene {
                 app.open_settings_dropdown_for_test(SettingsOpenSelect::InputDevice);
             }
             Scene::SettingsVoice => app.open_settings_for_test(SettingsTab::Voice),
+            Scene::SettingsProcessing => app.open_settings_for_test(SettingsTab::Processing),
             Scene::SettingsSounds => app.open_settings_for_test(SettingsTab::Sounds),
             Scene::SettingsChat => {
                 app.open_settings_for_test(SettingsTab::Chat);
@@ -394,6 +436,23 @@ fn device_state() -> AudioState {
     }
 }
 
+fn processing_state() -> AudioState {
+    use rumble_client::{ProcessorRegistry, build_default_tx_pipeline, register_builtin_processors};
+    let mut registry = ProcessorRegistry::new();
+    register_builtin_processors(&mut registry);
+    let mut tx_pipeline = build_default_tx_pipeline(&registry);
+    // Flip VAD on so the level meter renders its threshold-break
+    // colouring; otherwise the fixture would show the no-VAD fallback.
+    if let Some(vad) = tx_pipeline.processors.iter_mut().find(|p| p.type_id == "builtin.vad") {
+        vad.enabled = true;
+    }
+    AudioState {
+        tx_pipeline,
+        input_level_db: Some(-22.0),
+        ..AudioState::default()
+    }
+}
+
 fn stats_state() -> AudioState {
     let mut stats = AudioStats::default();
     stats.actual_bitrate_bps = 64_000.0;
@@ -408,6 +467,38 @@ fn stats_state() -> AudioState {
         stats,
         ..AudioState::default()
     }
+}
+
+/// Three saved-server entries with realistic last-used spread, so the
+/// list scene exercises sort order, label vs no-label rows, and the
+/// "never connected yet" subtitle (last_used_unix == 0).
+fn demo_recent_servers() -> Vec<RecentServer> {
+    // Anchor timestamps relative to a fixed wall clock so the rendered
+    // "n minutes ago" text is reproducible across runs of the tool.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    vec![
+        RecentServer {
+            addr: "127.0.0.1:5000".into(),
+            label: "Local dev".into(),
+            username: "alice".into(),
+            last_used_unix: now.saturating_sub(120),
+        },
+        RecentServer {
+            addr: "rumble.example:5000".into(),
+            label: String::new(),
+            username: "alice".into(),
+            last_used_unix: now.saturating_sub(2 * 86_400),
+        },
+        RecentServer {
+            addr: "voice.team-blue.example:5000".into(),
+            label: "Team Blue".into(),
+            username: "alice@team-blue".into(),
+            last_used_unix: 0,
+        },
+    ]
 }
 
 fn demo_agent_keys() -> Vec<KeyInfo> {

@@ -5619,6 +5619,7 @@ dependencies = [
  "rumble-desktop",
  "rumble-desktop-shell",
  "rumble-protocol",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

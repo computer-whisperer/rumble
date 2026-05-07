@@ -13,9 +13,10 @@
 
 use aetna_core::prelude::*;
 
-use rumble_client::SfxKind;
+use rumble_client::{PipelineConfig, ProcessorRegistry, SfxKind};
 use rumble_desktop_shell::{PersistentVoiceMode, Settings, TimestampFormat};
 use rumble_protocol::{AudioSettings, AudioState, State};
+use serde_json::Value as JsonValue;
 
 use crate::identity::Identity;
 
@@ -28,6 +29,7 @@ pub enum SettingsTab {
     Connection,
     Devices,
     Voice,
+    Processing,
     Sounds,
     Chat,
     Files,
@@ -39,6 +41,7 @@ impl SettingsTab {
         SettingsTab::Connection,
         SettingsTab::Devices,
         SettingsTab::Voice,
+        SettingsTab::Processing,
         SettingsTab::Sounds,
         SettingsTab::Chat,
         SettingsTab::Files,
@@ -50,6 +53,7 @@ impl SettingsTab {
             SettingsTab::Connection => "connection",
             SettingsTab::Devices => "devices",
             SettingsTab::Voice => "voice",
+            SettingsTab::Processing => "processing",
             SettingsTab::Sounds => "sounds",
             SettingsTab::Chat => "chat",
             SettingsTab::Files => "files",
@@ -62,6 +66,7 @@ impl SettingsTab {
             SettingsTab::Connection => "Connection",
             SettingsTab::Devices => "Devices",
             SettingsTab::Voice => "Voice",
+            SettingsTab::Processing => "Processing",
             SettingsTab::Sounds => "Sounds",
             SettingsTab::Chat => "Chat",
             SettingsTab::Files => "Files",
@@ -98,7 +103,6 @@ impl Default for OpenSelect {
 pub struct PendingSettings {
     // Connection
     pub username: String,
-    pub username_sel: TextSelection,
     pub autoconnect: bool,
 
     // Devices — `None` means "system default"; the outer Option tracks
@@ -109,6 +113,10 @@ pub struct PendingSettings {
     // Voice
     pub voice_mode: PersistentVoiceMode,
     pub audio: AudioSettings,
+
+    // Processing — TX pipeline configuration. Seeded from
+    // `state.audio.tx_pipeline` when the dialog opens.
+    pub tx_pipeline: PipelineConfig,
 
     // Sounds
     pub sfx_enabled: bool,
@@ -137,12 +145,12 @@ impl PendingSettings {
             .collect();
         Self {
             username: username.to_string(),
-            username_sel: TextSelection::default(),
             autoconnect: settings.auto_connect_addr.is_some(),
             input_device: audio.selected_input.clone(),
             output_device: audio.selected_output.clone(),
             voice_mode: (&audio.voice_mode).into(),
             audio: audio.settings.clone(),
+            tx_pipeline: audio.tx_pipeline.clone(),
             sfx_enabled: settings.sfx.enabled,
             sfx_volume: settings.sfx.volume,
             sfx_kind_enabled,
@@ -245,6 +253,11 @@ const KEY_FILES_CLEANUP: &str = "settings:files:cleanup";
 
 const KEY_STATS_RESET: &str = "settings:stats:reset";
 
+/// Processing-tab routed keys are built per-processor / per-field at
+/// render time; see [`proc_enabled_key`] / [`proc_field_key`]. The
+/// shared prefix lets [`handle_event`] cheaply ignore unrelated routes.
+const PROC_PREFIX: &str = "settings:proc:";
+
 /// Limits clamp KB/s sliders. 5000 KB/s ≈ 5 MB/s — well above any
 /// realistic rumble file-transfer cap.
 const MAX_SPEED_KBPS: u32 = 5000;
@@ -256,6 +269,37 @@ fn sfx_preview_key(idx: usize) -> String {
     format!("settings:sfx:preview:{idx}")
 }
 
+/// Route key for a processor's enable switch. The slot is identified by
+/// the processor's index in the pipeline rather than its `type_id` so
+/// keys stay short and the parsing in `handle_event` is a single
+/// `parse::<usize>()`. Pipelines never reorder behind the user's back
+/// while the dialog is open, so the index is stable.
+fn proc_enabled_key(idx: usize) -> String {
+    format!("{PROC_PREFIX}{idx}:enabled")
+}
+
+/// Route key for one schema field of a processor. Layout:
+/// `settings:proc:<idx>:f:<field>`. The `:f:` separator avoids
+/// collisions with `enabled` even if a schema were ever to define a
+/// field literally named `enabled`.
+fn proc_field_key(idx: usize, field: &str) -> String {
+    format!("{PROC_PREFIX}{idx}:f:{field}")
+}
+
+/// Inverse of [`proc_enabled_key`] / [`proc_field_key`]. Returns the
+/// (processor index, optional field name) for routes under the
+/// processing namespace, or `None` for unrelated routes.
+fn parse_proc_route(route: &str) -> Option<(usize, Option<&str>)> {
+    let rest = route.strip_prefix(PROC_PREFIX)?;
+    let (idx_str, tail) = rest.split_once(':')?;
+    let idx: usize = idx_str.parse().ok()?;
+    if tail == "enabled" {
+        return Some((idx, None));
+    }
+    let field = tail.strip_prefix("f:")?;
+    Some((idx, Some(field)))
+}
+
 // ============================================================
 // Render
 // ============================================================
@@ -265,7 +309,13 @@ fn sfx_preview_key(idx: usize) -> String {
 /// independent overlay layers — popovers must paint above the modal
 /// panel they were anchored to. Returns `None` for the panel when the
 /// dialog is closed.
-pub fn render(state: &SettingsState, app_state: &State, identity: &Identity) -> (Option<El>, Option<El>) {
+pub fn render(
+    state: &SettingsState,
+    app_state: &State,
+    identity: &Identity,
+    selection: &Selection,
+    processor_registry: &ProcessorRegistry,
+) -> (Option<El>, Option<El>) {
     if !state.open {
         return (None, None);
     }
@@ -276,9 +326,10 @@ pub fn render(state: &SettingsState, app_state: &State, identity: &Identity) -> 
     let tab = state.tab.unwrap_or(SettingsTab::Connection);
 
     let body = match tab {
-        SettingsTab::Connection => render_connection(pending, identity),
+        SettingsTab::Connection => render_connection(pending, identity, selection),
         SettingsTab::Devices => render_devices(pending, &app_state.audio),
         SettingsTab::Voice => render_voice(pending),
+        SettingsTab::Processing => render_processing(pending, &app_state.audio, processor_registry, selection),
         SettingsTab::Sounds => render_sounds(pending),
         SettingsTab::Chat => render_chat(pending),
         SettingsTab::Files => render_files(pending),
@@ -382,7 +433,7 @@ where
 
 // ---- per-tab views --------------------------------------------------
 
-fn render_connection(pending: &PendingSettings, identity: &Identity) -> El {
+fn render_connection(pending: &PendingSettings, identity: &Identity, selection: &Selection) -> El {
     use rumble_desktop_shell::KeySource;
 
     let identity_lines: Vec<El> = if let Some(config) = identity.manager().config() {
@@ -417,7 +468,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity) -> El {
     );
     children.push(divider());
     children.push(section_heading("Username"));
-    children.push(text_input(&pending.username, pending.username_sel).key(KEY_USERNAME));
+    children.push(text_input(&pending.username, selection, KEY_USERNAME));
     children.push(
         paragraph("Display name shown to other users on a server.")
             .muted()
@@ -536,6 +587,261 @@ fn render_voice(pending: &PendingSettings) -> El {
     ])
     .gap(tokens::SPACE_SM)
     .width(Size::Fill(1.0))
+}
+
+fn render_processing(
+    pending: &PendingSettings,
+    audio: &AudioState,
+    registry: &ProcessorRegistry,
+    selection: &Selection,
+) -> El {
+    let mut rows: Vec<El> = Vec::new();
+    rows.push(
+        paragraph(
+            "Audio processors applied to your microphone before encoding. Order is fixed; toggle individual stages \
+             on/off.",
+        )
+        .muted()
+        .font_size(tokens::FONT_SM),
+    );
+
+    if pending.tx_pipeline.processors.is_empty() {
+        rows.push(paragraph("No processors registered.").muted());
+    }
+
+    for (idx, proc_config) in pending.tx_pipeline.processors.iter().enumerate() {
+        let display_name = registry
+            .list_available()
+            .into_iter()
+            .find(|(type_id, _, _)| *type_id == proc_config.type_id.as_str())
+            .map(|(_, name, _)| name.to_string())
+            .unwrap_or_else(|| proc_config.type_id.clone());
+        let description = registry
+            .list_available()
+            .into_iter()
+            .find(|(type_id, _, _)| *type_id == proc_config.type_id.as_str())
+            .map(|(_, _, desc)| desc.to_string())
+            .unwrap_or_default();
+
+        // Header row: processor name + enable switch. The description
+        // sits on its own row underneath rather than next to the
+        // switch, so the row's intrinsic height doesn't get clamped
+        // to the switch and clip the wrapped description.
+        rows.push(
+            row([
+                text(display_name).font_weight(FontWeight::Semibold),
+                spacer(),
+                switch(proc_config.enabled).key(proc_enabled_key(idx)),
+            ])
+            .gap(tokens::SPACE_MD)
+            .align(Align::Center)
+            .width(Size::Fill(1.0)),
+        );
+        if !description.is_empty() {
+            rows.push(paragraph(description).muted().font_size(tokens::FONT_SM));
+        }
+
+        // Per-processor schema fields (only when the processor is on).
+        if proc_config.enabled {
+            if let Some(schema) = registry.settings_schema(&proc_config.type_id) {
+                if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+                    for (key, prop_schema) in properties {
+                        rows.push(render_schema_field(
+                            idx,
+                            key,
+                            prop_schema,
+                            &proc_config.settings,
+                            selection,
+                        ));
+                    }
+                }
+            }
+        }
+        rows.push(spacer().height(Size::Fixed(tokens::SPACE_XS)));
+    }
+
+    rows.push(divider());
+    rows.push(section_heading("Input level"));
+    rows.push(input_level_meter(&pending.tx_pipeline, audio));
+
+    column(rows).gap(tokens::SPACE_SM).width(Size::Fill(1.0))
+}
+
+/// Render one schema-defined property as a labelled control. `number` /
+/// `integer` types become sliders (the only general-purpose continuous
+/// control aetna ships out of the box), `boolean` becomes a switch,
+/// everything else falls back to a text input.
+fn render_schema_field(
+    proc_idx: usize,
+    key: &str,
+    schema: &JsonValue,
+    settings: &JsonValue,
+    selection: &Selection,
+) -> El {
+    let title = schema.get("title").and_then(|t| t.as_str()).unwrap_or(key).to_string();
+    let prop_type = schema.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+    let route = proc_field_key(proc_idx, key);
+
+    match prop_type {
+        "number" => {
+            let min = schema.get("minimum").and_then(|m| m.as_f64()).unwrap_or(-100.0) as f32;
+            let max = schema.get("maximum").and_then(|m| m.as_f64()).unwrap_or(100.0) as f32;
+            let default = schema.get("default").and_then(|d| d.as_f64()).unwrap_or(0.0) as f32;
+            let value = settings
+                .get(key)
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .unwrap_or(default);
+            let normalized = if (max - min).abs() < f32::EPSILON {
+                0.0
+            } else {
+                ((value - min) / (max - min)).clamp(0.0, 1.0)
+            };
+            field_row(
+                format!("{title} ({:.2})", value),
+                slider(normalized, tokens::PRIMARY)
+                    .key(&route)
+                    .width(Size::Fixed(220.0)),
+            )
+        }
+        "integer" => {
+            let min = schema.get("minimum").and_then(|m| m.as_i64()).unwrap_or(0) as i64;
+            let max = schema.get("maximum").and_then(|m| m.as_i64()).unwrap_or(100) as i64;
+            let default = schema.get("default").and_then(|d| d.as_i64()).unwrap_or(0);
+            let value = settings.get(key).and_then(|v| v.as_i64()).unwrap_or(default);
+            let span = (max - min).max(1) as f32;
+            let normalized = ((value - min) as f32 / span).clamp(0.0, 1.0);
+            field_row(
+                format!("{title} ({value})"),
+                slider(normalized, tokens::PRIMARY)
+                    .key(&route)
+                    .width(Size::Fixed(220.0)),
+            )
+        }
+        "boolean" => {
+            let default = schema.get("default").and_then(|d| d.as_bool()).unwrap_or(false);
+            let value = settings.get(key).and_then(|v| v.as_bool()).unwrap_or(default);
+            field_row(title, switch(value).key(&route))
+        }
+        _ => {
+            let default = schema.get("default").and_then(|d| d.as_str()).unwrap_or("");
+            let value = settings
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or(default)
+                .to_string();
+            field_row(title, text_input(&value, selection, &route).width(Size::Fixed(220.0)))
+        }
+    }
+}
+
+/// Mumble-style VU meter that splits at the VAD threshold. Below the
+/// threshold the bar paints in red ("won't transmit"); above the
+/// threshold in green ("will transmit"). The break in colour follows
+/// the threshold position, so dragging the threshold slider is
+/// reflected immediately on the bar — that's the visual aid Mumble
+/// users tune against.
+///
+/// When the VAD processor is disabled there's no threshold to break
+/// against, so the meter falls back to a plain green/yellow/red
+/// loudness display via [`progress`].
+fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
+    const MIN_DB: f32 = -60.0;
+    const MAX_DB: f32 = 0.0;
+    const SPAN_DB: f32 = MAX_DB - MIN_DB;
+    const BAR_W: f32 = 280.0;
+    const BAR_H: f32 = 14.0;
+
+    let level_db = audio.input_level_db;
+    let normalize = |db: f32| ((db - MIN_DB) / SPAN_DB).clamp(0.0, 1.0);
+    let value_n = level_db.map(normalize).unwrap_or(0.0);
+
+    let vad_threshold_db = pipeline
+        .processors
+        .iter()
+        .find(|p| p.type_id == "builtin.vad" && p.enabled)
+        .and_then(|p| p.settings.get("threshold_db"))
+        .and_then(|v| v.as_f64())
+        .map(|t| t as f32);
+
+    let level_label = match level_db {
+        Some(db) => format!("{db:.0} dB"),
+        None => "—".to_string(),
+    };
+    let threshold_label = match vad_threshold_db {
+        Some(db) => format!("VAD threshold: {db:.0} dB"),
+        None => "VAD disabled — bar shows mic loudness only".to_string(),
+    };
+
+    let bar = match vad_threshold_db {
+        Some(t_db) => threshold_bar(value_n, normalize(t_db), BAR_W, BAR_H),
+        None => {
+            // No threshold to break against — fall back to a plain
+            // loudness meter coloured by current level.
+            let color = match level_db {
+                Some(db) if db > -3.0 => tokens::DESTRUCTIVE,
+                Some(db) if db > -12.0 => tokens::WARNING,
+                Some(_) => tokens::SUCCESS,
+                None => tokens::BG_MUTED,
+            };
+            progress(value_n, color)
+                .width(Size::Fixed(BAR_W))
+                .height(Size::Fixed(BAR_H))
+        }
+    };
+
+    column([
+        row([bar.into(), text(level_label).mono().font_size(tokens::FONT_SM)])
+            .gap(tokens::SPACE_SM)
+            .align(Align::Center),
+        text(threshold_label).muted().font_size(tokens::FONT_SM),
+    ])
+    .gap(tokens::SPACE_XS)
+    .width(Size::Fill(1.0))
+}
+
+/// Four-segment bar mirroring `Mumble::AudioBar`: a darkened "won't
+/// transmit" track from `0..threshold`, a darkened "will transmit"
+/// track from `threshold..max`, plus brighter fills painted on top
+/// proportional to the current level. The colour change at the
+/// threshold position is the user's main visual cue when tuning the
+/// VAD.
+fn threshold_bar(value_n: f32, threshold_n: f32, bar_w: f32, bar_h: f32) -> El {
+    let value_n = value_n.clamp(0.0, 1.0);
+    let threshold_n = threshold_n.clamp(0.0, 1.0);
+
+    let below_color = tokens::DESTRUCTIVE;
+    let above_color = tokens::SUCCESS;
+    // Mumble darkens unfilled segments to ~1/3 brightness via Qt's
+    // `darker(300)`; matching that with `darken(0.7)` keeps a hint of
+    // the zone's hue on the unfilled portion so the threshold position
+    // is visible even when the level is silent.
+    let below_track = below_color.darken(0.7);
+    let above_track = above_color.darken(0.7);
+
+    let layout = move |ctx: LayoutCtx| {
+        let r = ctx.container;
+        let value_x = r.w * value_n;
+        let threshold_x = r.w * threshold_n;
+        let below_fill_w = value_x.min(threshold_x).max(0.0);
+        let above_fill_w = (value_x - threshold_x).max(0.0);
+        vec![
+            Rect::new(r.x, r.y, threshold_x, r.h),
+            Rect::new(r.x + threshold_x, r.y, (r.w - threshold_x).max(0.0), r.h),
+            Rect::new(r.x, r.y, below_fill_w, r.h),
+            Rect::new(r.x + threshold_x, r.y, above_fill_w, r.h),
+        ]
+    };
+
+    stack([
+        El::new(Kind::Custom("vu-below-track")).fill(below_track),
+        El::new(Kind::Custom("vu-above-track")).fill(above_track),
+        El::new(Kind::Custom("vu-below-fill")).fill(below_color),
+        El::new(Kind::Custom("vu-above-fill")).fill(above_color),
+    ])
+    .layout(layout)
+    .width(Size::Fixed(bar_w))
+    .height(Size::Fixed(bar_h))
 }
 
 fn render_sounds(pending: &PendingSettings) -> El {
@@ -755,7 +1061,12 @@ fn parse_bitrate(slug: &str) -> Option<i32> {
 // Event handling
 // ============================================================
 
-pub fn handle_event(state: &mut SettingsState, event: &UiEvent) -> SettingsOutcome {
+pub fn handle_event(
+    state: &mut SettingsState,
+    event: &UiEvent,
+    selection: &mut Selection,
+    processor_registry: &ProcessorRegistry,
+) -> SettingsOutcome {
     if !state.open {
         return SettingsOutcome::Ignored;
     }
@@ -815,7 +1126,7 @@ pub fn handle_event(state: &mut SettingsState, event: &UiEvent) -> SettingsOutco
 
     // Username text input.
     if event.target_key() == Some(KEY_USERNAME) {
-        text_input::apply_event(&mut pending.username, &mut pending.username_sel, event);
+        text_input::apply_event(&mut pending.username, selection, KEY_USERNAME, event);
         return SettingsOutcome::Handled;
     }
 
@@ -1005,5 +1316,171 @@ pub fn handle_event(state: &mut SettingsState, event: &UiEvent) -> SettingsOutco
         return SettingsOutcome::Handled;
     }
 
+    // ---------- Processing tab: dynamic per-processor controls ----------
+    //
+    // Routes here are built at render time as `settings:proc:<idx>:enabled`
+    // (the per-processor switch) or `settings:proc:<idx>:f:<field>` (a
+    // schema-defined property). We dispatch text/switch/slider events
+    // against whichever shape the schema picked, so the keyboard +
+    // pointer codepaths converge into a single update of `pending.tx_pipeline`.
+
+    // Text-input events arrive on `target_key` rather than `route`, so
+    // check this before the generic `route()`-driven handlers.
+    if let Some(target) = event.target_key()
+        && let Some((idx, Some(field))) = parse_proc_route(target)
+    {
+        if let Some(proc_config) = pending.tx_pipeline.processors.get_mut(idx)
+            && schema_field_type(processor_registry, &proc_config.type_id, field) == Some("string")
+        {
+            let route = proc_field_key(idx, field);
+            let mut value = proc_config
+                .settings
+                .get(field)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            text_input::apply_event(&mut value, selection, &route, event);
+            ensure_object(&mut proc_config.settings)[field] = JsonValue::String(value);
+            return SettingsOutcome::Handled;
+        }
+    }
+
+    if let Some(route) = event.route()
+        && let Some((idx, slot)) = parse_proc_route(route)
+    {
+        let Some(proc_config) = pending.tx_pipeline.processors.get_mut(idx) else {
+            return SettingsOutcome::Ignored;
+        };
+
+        match slot {
+            // Per-processor enable switch.
+            None => {
+                if switch::apply_event(&mut proc_config.enabled, event, route) {
+                    return SettingsOutcome::Handled;
+                }
+            }
+            // Schema-driven field. The schema lookup is the source of
+            // truth for "what control type was rendered" — the event
+            // codepaths can't peek at the rendered tree.
+            Some(field) => {
+                let prop_type = schema_field_type(processor_registry, &proc_config.type_id, field);
+                let prop_schema = processor_registry
+                    .settings_schema(&proc_config.type_id)
+                    .and_then(|s| s.get("properties").cloned())
+                    .and_then(|p| p.get(field).cloned());
+
+                match prop_type {
+                    Some("boolean") => {
+                        let mut value = proc_config
+                            .settings
+                            .get(field)
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if switch::apply_event(&mut value, event, route) {
+                            ensure_object(&mut proc_config.settings)[field] = JsonValue::Bool(value);
+                            return SettingsOutcome::Handled;
+                        }
+                    }
+                    Some("number") => {
+                        if let Some(schema) = prop_schema.as_ref() {
+                            let min = schema.get("minimum").and_then(|m| m.as_f64()).unwrap_or(-100.0) as f32;
+                            let max = schema.get("maximum").and_then(|m| m.as_f64()).unwrap_or(100.0) as f32;
+                            let span = (max - min).max(f32::EPSILON);
+
+                            // Pointer drag.
+                            if matches!(
+                                event.kind,
+                                UiEventKind::PointerDown | UiEventKind::Drag | UiEventKind::Click
+                            ) && let (Some(rect), Some(x)) = (event.target_rect(), event.pointer_x())
+                            {
+                                let n = slider::normalized_from_event(rect, x);
+                                let value = (min + n * span).clamp(min, max);
+                                ensure_object(&mut proc_config.settings)[field] = serde_json::json!(value as f64);
+                                return SettingsOutcome::Handled;
+                            }
+
+                            // Keyboard nudge.
+                            let current = proc_config
+                                .settings
+                                .get(field)
+                                .and_then(|v| v.as_f64())
+                                .map(|v| v as f32)
+                                .unwrap_or(min);
+                            let mut n = ((current - min) / span).clamp(0.0, 1.0);
+                            if slider::apply_event(&mut n, event, route, 0.05, 0.25) {
+                                let value = (min + n.clamp(0.0, 1.0) * span).clamp(min, max);
+                                ensure_object(&mut proc_config.settings)[field] = serde_json::json!(value as f64);
+                                return SettingsOutcome::Handled;
+                            }
+                        }
+                    }
+                    Some("integer") => {
+                        if let Some(schema) = prop_schema.as_ref() {
+                            let min = schema.get("minimum").and_then(|m| m.as_i64()).unwrap_or(0);
+                            let max = schema.get("maximum").and_then(|m| m.as_i64()).unwrap_or(100);
+                            let span = (max - min).max(1) as f32;
+
+                            if matches!(
+                                event.kind,
+                                UiEventKind::PointerDown | UiEventKind::Drag | UiEventKind::Click
+                            ) && let (Some(rect), Some(x)) = (event.target_rect(), event.pointer_x())
+                            {
+                                let n = slider::normalized_from_event(rect, x);
+                                let value = (min as f32 + n * span).round().clamp(min as f32, max as f32) as i64;
+                                ensure_object(&mut proc_config.settings)[field] = serde_json::json!(value);
+                                return SettingsOutcome::Handled;
+                            }
+
+                            let current = proc_config.settings.get(field).and_then(|v| v.as_i64()).unwrap_or(min);
+                            let mut n = ((current - min) as f32 / span).clamp(0.0, 1.0);
+                            if slider::apply_event(&mut n, event, route, 0.05, 0.25) {
+                                let value = (min as f32 + n.clamp(0.0, 1.0) * span)
+                                    .round()
+                                    .clamp(min as f32, max as f32) as i64;
+                                ensure_object(&mut proc_config.settings)[field] = serde_json::json!(value);
+                                return SettingsOutcome::Handled;
+                            }
+                        }
+                    }
+                    _ => {
+                        // String / unknown — text-input branch handles
+                        // those above via `target_key`.
+                    }
+                }
+            }
+        }
+    }
+
     SettingsOutcome::Ignored
+}
+
+/// Look up the JSON-Schema `type` for a single property of the named
+/// processor. Returns `None` when the processor or property is unknown
+/// — callers fall through to "ignore the event" in that case.
+fn schema_field_type<'a>(registry: &'a ProcessorRegistry, type_id: &str, field: &str) -> Option<&'static str> {
+    let schema = registry.settings_schema(type_id)?;
+    let properties = schema.get("properties")?.as_object()?;
+    let prop = properties.get(field)?;
+    let ty = prop.get("type")?.as_str()?;
+    // `serde_json::Value` strings are `&str` borrowed from the value
+    // itself, not `&'static`. The set of types we care about is small
+    // and known, so map them to `'static` literals to avoid leaking
+    // the borrow into the caller's lifetime.
+    Some(match ty {
+        "number" => "number",
+        "integer" => "integer",
+        "boolean" => "boolean",
+        "string" => "string",
+        _ => return None,
+    })
+}
+
+/// `serde_json::Value::object_mut` doesn't exist on stable; this helper
+/// makes sure `value` is an object so we can index into it. Replaces a
+/// non-object `value` with an empty object as a side effect.
+fn ensure_object(value: &mut JsonValue) -> &mut JsonValue {
+    if !value.is_object() {
+        *value = JsonValue::Object(serde_json::Map::new());
+    }
+    value
 }

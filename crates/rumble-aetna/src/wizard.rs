@@ -21,9 +21,7 @@ pub enum WizardState {
     /// Local-key generator with optional password.
     GenerateLocal {
         password: String,
-        password_sel: TextSelection,
         confirm: String,
-        confirm_sel: TextSelection,
         error: Option<String>,
     },
     /// Awaiting `connect_and_list_keys` to return.
@@ -35,10 +33,7 @@ pub enum WizardState {
         error: Option<String>,
     },
     /// Generate-and-add-to-agent comment input.
-    GenerateAgentKey {
-        comment: String,
-        comment_sel: TextSelection,
-    },
+    GenerateAgentKey { comment: String },
     /// Terminal error screen; user can rewind to `SelectMethod`.
     Error { message: String },
     /// Wizard finished successfully — caller should clear.
@@ -48,7 +43,6 @@ pub enum WizardState {
 #[derive(Default)]
 pub struct UnlockState {
     pub password: String,
-    pub password_sel: TextSelection,
     pub error: Option<String>,
 }
 
@@ -104,30 +98,20 @@ pub fn parse_agent_row_key(key: &str) -> Option<usize> {
     key.strip_prefix("wizard:agent-row:").and_then(|s| s.parse().ok())
 }
 
-pub fn render(state: &WizardState, agent_busy: bool) -> Option<El> {
+pub fn render(state: &WizardState, agent_busy: bool, selection: &Selection) -> Option<El> {
     match state {
         WizardState::NotNeeded | WizardState::Complete => None,
         WizardState::SelectMethod => Some(render_select_method()),
         WizardState::GenerateLocal {
             password,
-            password_sel,
             confirm,
-            confirm_sel,
             error,
-        } => Some(render_generate_local(
-            password,
-            *password_sel,
-            confirm,
-            *confirm_sel,
-            error.as_deref(),
-        )),
+        } => Some(render_generate_local(password, confirm, error.as_deref(), selection)),
         WizardState::ConnectingAgent => Some(render_connecting_agent()),
         WizardState::SelectAgentKey { keys, selected, error } => {
             Some(render_select_agent_key(keys, *selected, error.as_deref()))
         }
-        WizardState::GenerateAgentKey { comment, comment_sel } => {
-            Some(render_generate_agent_key(comment, *comment_sel, agent_busy))
-        }
+        WizardState::GenerateAgentKey { comment } => Some(render_generate_agent_key(comment, agent_busy, selection)),
         WizardState::Error { message } => Some(render_error(message)),
     }
 }
@@ -170,13 +154,7 @@ fn agent_warning(available: bool) -> El {
     }
 }
 
-fn render_generate_local(
-    password: &str,
-    password_sel: TextSelection,
-    confirm: &str,
-    confirm_sel: TextSelection,
-    error: Option<&str>,
-) -> El {
+fn render_generate_local(password: &str, confirm: &str, error: Option<&str>, selection: &Selection) -> El {
     let mismatch = !password.is_empty() && !confirm.is_empty() && password != confirm;
     let can_generate = password.is_empty() || password == confirm;
 
@@ -187,9 +165,9 @@ fn render_generate_local(
         )
         .muted(),
         text("Password").muted(),
-        password_input::password_input(password, password_sel).key(KEY_PWD),
+        password_input::password_input(password, selection, KEY_PWD),
         text("Confirm").muted(),
-        password_input::password_input(confirm, confirm_sel).key(KEY_CONFIRM),
+        password_input::password_input(confirm, selection, KEY_CONFIRM),
     ];
 
     if mismatch {
@@ -292,7 +270,7 @@ fn agent_key_row(idx: usize, key: &KeyInfo, selected: bool) -> El {
     if selected { row_el.selected() } else { row_el }
 }
 
-fn render_generate_agent_key(comment: &str, comment_sel: TextSelection, busy: bool) -> El {
+fn render_generate_agent_key(comment: &str, busy: bool, selection: &Selection) -> El {
     let submit = if busy {
         button("Generating…").key(KEY_SUBMIT).disabled()
     } else {
@@ -305,7 +283,7 @@ fn render_generate_agent_key(comment: &str, comment_sel: TextSelection, busy: bo
         [
             paragraph("A new Ed25519 key will be generated and added to your ssh-agent.").muted(),
             text("Comment").muted(),
-            text_input(comment, comment_sel).key(KEY_AGENT_COMMENT),
+            text_input(comment, selection, KEY_AGENT_COMMENT),
             row([button("Back").key(KEY_BACK), spacer(), submit])
                 .gap(tokens::SPACE_SM)
                 .width(Size::Fill(1.0))
@@ -327,10 +305,10 @@ fn render_error(message: &str) -> El {
     )
 }
 
-pub fn render_unlock(state: &UnlockState) -> El {
+pub fn render_unlock(state: &UnlockState, selection: &Selection) -> El {
     let mut body: Vec<El> = vec![
         paragraph("Enter the password for your encrypted Rumble identity.").muted(),
-        password_input::password_input(&state.password, state.password_sel).key(KEY_UNLOCK_PWD),
+        password_input::password_input(&state.password, selection, KEY_UNLOCK_PWD),
     ];
     if let Some(err) = &state.error {
         body.push(
@@ -352,16 +330,14 @@ pub fn render_unlock(state: &UnlockState) -> El {
 // Event handling
 // ============================================================
 
-pub fn handle_event(state: &mut WizardState, event: &UiEvent) -> WizardOutcome {
+pub fn handle_event(state: &mut WizardState, event: &UiEvent, selection: &mut Selection) -> WizardOutcome {
     match state {
         WizardState::NotNeeded | WizardState::Complete => return WizardOutcome::Ignored,
         WizardState::SelectMethod => {
             if event.is_click_or_activate(KEY_GEN_LOCAL) {
                 *state = WizardState::GenerateLocal {
                     password: String::new(),
-                    password_sel: TextSelection::default(),
                     confirm: String::new(),
-                    confirm_sel: TextSelection::default(),
                     error: None,
                 };
                 return WizardOutcome::Handled;
@@ -373,17 +349,15 @@ pub fn handle_event(state: &mut WizardState, event: &UiEvent) -> WizardOutcome {
         }
         WizardState::GenerateLocal {
             password,
-            password_sel,
             confirm,
-            confirm_sel,
             error,
         } => {
             if event.target_key() == Some(KEY_PWD) {
-                password_input::apply_event(password, password_sel, event);
+                password_input::apply_event(password, selection, KEY_PWD, event);
                 return WizardOutcome::Handled;
             }
             if event.target_key() == Some(KEY_CONFIRM) {
-                password_input::apply_event(confirm, confirm_sel, event);
+                password_input::apply_event(confirm, selection, KEY_CONFIRM, event);
                 return WizardOutcome::Handled;
             }
             if event.is_click_or_activate(KEY_BACK) {
@@ -413,7 +387,6 @@ pub fn handle_event(state: &mut WizardState, event: &UiEvent) -> WizardOutcome {
             if event.is_click_or_activate(KEY_GEN_AGENT_KEY) {
                 *state = WizardState::GenerateAgentKey {
                     comment: "rumble-identity".to_string(),
-                    comment_sel: TextSelection::default(),
                 };
                 return WizardOutcome::Handled;
             }
@@ -433,9 +406,9 @@ pub fn handle_event(state: &mut WizardState, event: &UiEvent) -> WizardOutcome {
                 return WizardOutcome::Handled;
             }
         }
-        WizardState::GenerateAgentKey { comment, comment_sel } => {
+        WizardState::GenerateAgentKey { comment } => {
             if event.target_key() == Some(KEY_AGENT_COMMENT) {
-                text_input::apply_event(comment, comment_sel, event);
+                text_input::apply_event(comment, selection, KEY_AGENT_COMMENT, event);
                 return WizardOutcome::Handled;
             }
             if event.is_click_or_activate(KEY_BACK) {
@@ -457,7 +430,7 @@ pub fn handle_event(state: &mut WizardState, event: &UiEvent) -> WizardOutcome {
     WizardOutcome::Ignored
 }
 
-pub fn handle_unlock_event(state: &mut UnlockState, event: &UiEvent) -> WizardOutcome {
+pub fn handle_unlock_event(state: &mut UnlockState, event: &UiEvent, selection: &mut Selection) -> WizardOutcome {
     if event.target_key() == Some(KEY_UNLOCK_PWD) {
         // Submit on bare Enter (no shift) — matches rumble-next's UX.
         if let UiEventKind::KeyDown = event.kind
@@ -470,7 +443,7 @@ pub fn handle_unlock_event(state: &mut UnlockState, event: &UiEvent) -> WizardOu
                 password: state.password.clone(),
             };
         }
-        password_input::apply_event(&mut state.password, &mut state.password_sel, event);
+        password_input::apply_event(&mut state.password, selection, KEY_UNLOCK_PWD, event);
         return WizardOutcome::Handled;
     }
     if event.is_click_or_activate(KEY_UNLOCK_SUBMIT) && !state.password.is_empty() {
